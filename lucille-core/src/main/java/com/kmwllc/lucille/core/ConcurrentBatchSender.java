@@ -72,13 +72,16 @@ class ConcurrentBatchSender {
     });
   }
 
-  /** Submits the batch once it may run alongside those in flight, completing the oldest in-flight batches until it can. */
+  /**
+   * Submits the batch. Generational: once a generation of maxConcurrentBatches is in flight (or the batch conflicts with
+   * one in flight), waits for the whole generation to finish before starting the next.
+   */
   void dispatch(List<Document> batchedDocs) {
     Set<String> ids = destinationIds.apply(batchedDocs);
     boolean barrier = batchedDocs.stream().anyMatch(isBarrier);
 
-    while (!inFlight.isEmpty() && (barrier || inFlight.size() >= maxConcurrentBatches || overlapsInFlight(ids))) {
-      completeOldest();
+    if (!inFlight.isEmpty() && (barrier || inFlight.size() >= maxConcurrentBatches || overlapsInFlight(ids))) {
+      completeAll();
     }
 
     Map<String, String> mdc = MDC.getCopyOfContextMap();
@@ -100,10 +103,10 @@ class ConcurrentBatchSender {
     }
   }
 
-  /** Completes in-flight batches whose sends have finished, stopping at the first that hasn't, to keep dispatch order. */
+  /** Completes the current generation once every batch in it has finished, so no slot is refilled on its own. */
   void completeFinished() {
-    while (!inFlight.isEmpty() && inFlight.peekFirst().outcome().isDone()) {
-      completeOldest();
+    if (!inFlight.isEmpty() && inFlight.stream().allMatch(b -> b.outcome().isDone())) {
+      completeAll();
     }
   }
 
