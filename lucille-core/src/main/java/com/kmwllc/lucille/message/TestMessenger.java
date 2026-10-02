@@ -14,6 +14,7 @@ import java.util.List;
 public class TestMessenger implements IndexerMessenger, PublisherMessenger,
     WorkerMessenger {
 
+  // Thread-safe as LocalMessenger is: the saved-message lists are synchronized.
   private final LocalMessenger messenger;
 
   private List<Event> savedEventMessages = Collections.synchronizedList(new ArrayList<Event>());

@@ -38,6 +38,10 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class KafkaIndexerMessenger implements IndexerMessenger {
 
+  // Thread-safety (completion on a dispatcher thread, polls on the indexer thread): the consumer is used only by
+  // pollDocToIndex and close, on the indexer thread; batchComplete only records offsets in the commit policy's
+  // ConcurrentHashMap, which the indexer thread commits at its next poll. KafkaProducer is thread-safe.
+
   private static final Logger log = LoggerFactory.getLogger(KafkaIndexerMessenger.class);
   private final Consumer<String, KafkaDocument> destConsumer;
   private final KafkaCommitPolicy commitPolicy;

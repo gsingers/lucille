@@ -22,6 +22,10 @@ import org.slf4j.LoggerFactory;
 
 public class HybridIndexerMessenger implements IndexerMessenger {
 
+  // Thread-safety (completion on a dispatcher thread, polls on the indexer thread): pipelineDest and offsets are
+  // LinkedBlockingQueues, idSet is documented thread-safe (it is already shared by every indexer in the JVM), and
+  // KafkaProducer is thread-safe. No other mutable state.
+
   private static final Logger log = LoggerFactory.getLogger(HybridIndexerMessenger.class);
 
   private final LinkedBlockingQueue<Document> pipelineDest;

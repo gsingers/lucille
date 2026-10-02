@@ -6,14 +6,15 @@ import java.util.List;
  * How an {@link Indexer} sends its flushed batches to the destination and completes them (sends their events and calls
  * {@link com.kmwllc.lucille.message.IndexerMessenger#batchComplete(List)}). The Indexer holds one, chosen by
  * indexer.maxConcurrentBatches, and calls it the same way whatever the implementation:
- * {@link SynchronousBatchSender} when it is 1, {@link ConcurrentBatchSender} otherwise.
+ * {@link SynchronousBatchSender} when it is 1, {@link BarrierBatchSender} otherwise. ({@link ConcurrentBatchSender}, the
+ * sliding window, is kept for comparison but unused.)
  *
  * <p> Contract, for every implementation:
  * <ul>
- *   <li>All methods are called on the indexer thread, and every batch is completed on that thread.</li>
+ *   <li>All methods are called on the indexer thread. Batches are completed on the indexer thread
+ *   (SynchronousBatchSender, ConcurrentBatchSender) or on a single dispatcher thread (BarrierBatchSender).</li>
  *   <li>Every batch passed to {@link #send(List)} is completed exactly once, in the order the batches were sent.</li>
- *   <li>A batch is completed during a call to send (its own or a later one), {@link #completeFinished()}, or
- *   {@link #completeAll()}. After completeAll returns, every batch sent so far has been completed.</li>
+ *   <li>After {@link #completeAll()} returns, every batch sent so far has been completed.</li>
  *   <li>No method throws because a send failed: failures are reported through the batch's completion.</li>
  * </ul>
  */

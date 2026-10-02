@@ -40,11 +40,17 @@ import org.junit.Test;
  * Tests indexer.maxConcurrentBatches: ordered completion, the dispatch gates (capacity, ID overlap, delete-by-query
  * barrier), retries, shutdown draining, and error propagation. Each batch's send blocks on a latch keyed by the "tag" of
  * its first document, so the tests control the order in which sends finish.
+ *
+ * <p> Adapted to BarrierBatchSender (the generational design): a generation is formed from whatever is queued when the
+ * dispatcher takes its head, so a test that needs several batches in one generation first sends a gated delete-by-query
+ * batch "w" (always a generation of its own), waits until the batches behind it are queued, then releases it. The
+ * RecordingMessenger hides that warm-up batch from completed() and events().
  */
 public class IndexerConcurrencyTest {
 
   private static final long TIMEOUT_MS = 10000;
   private static final AtomicInteger RUN_IDS = new AtomicInteger();
+  private static final String WARMUP = "w";
 
   private Thread indexerThread;
   private ControlledIndexer indexer;
@@ -63,8 +69,9 @@ public class IndexerConcurrencyTest {
   @Test
   public void testCompletionFollowsDispatchOrder() throws Exception {
     RecordingMessenger messenger = new RecordingMessenger();
-    start(new ControlledIndexer(config(2), messenger), "a", "b");
-    indexer.gate("a", "b");
+    ControlledIndexer controlled = new ControlledIndexer(config(2), messenger);
+    controlled.gate("a", "b");
+    startWarm(controlled, 2, "a", "b");
     awaitTrue(() -> indexer.started.containsAll(List.of("a", "b")));
 
     indexer.release("b");
@@ -84,17 +91,19 @@ public class IndexerConcurrencyTest {
     RecordingMessenger messenger = new RecordingMessenger();
     ControlledIndexer controlled = new ControlledIndexer(config(2), messenger);
     controlled.gate("a", "b", "c");
-    start(controlled, "a", "b", "c", "d", "e");
+    startWarm(controlled, 2, "a", "b", "c", "d", "e");
     awaitTrue(() -> indexer.started.containsAll(List.of("a", "b")));
-    awaitIndexerWaitingForBatch();
+    awaitDispatcherWaitingForSends();
     assertFalse(indexer.started.contains("c"));
-    // The indexer thread is blocked dispatching c (d sits in its partly filled batch), so it stops polling: e is still
-    // waiting in the messenger's queue.
-    assertEquals(1, messenger.queue.size());
 
+    // Barrier: unlike a sliding window, a's slot is not refilled until the whole generation (a, b) has finished.
     indexer.release("a");
+    awaitTrue(() -> indexer.finished.contains("a"));
+    awaitDispatcherWaitingForSends();
+    assertFalse("c must wait for the whole generation", indexer.started.contains("c"));
+    indexer.release("b");
     awaitTrue(() -> indexer.started.contains("c"));
-    indexer.release("b", "c");
+    indexer.release("c");
     awaitTrue(() -> messenger.completed().size() == 5);
     assertEquals(List.of("a", "b", "c", "d", "e"), messenger.completed());
     assertEquals(2, indexer.maxConcurrent.get());
@@ -107,15 +116,19 @@ public class IndexerConcurrencyTest {
     controlled.gate("a1", "c", "a2");
     indexer = controlled;
     // a1 and a2 share the id "a"; c is disjoint.
-    startWith(controlled, messenger, doc("a", "a1"), doc("c", "c"), doc("a", "a2"));
+    startWithWarm(controlled, messenger, 3, doc("a", "a1"), doc("c", "c"), doc("a", "a2"));
 
     awaitTrue(() -> indexer.started.containsAll(List.of("a1", "c")));
-    awaitIndexerWaitingForBatch();
+    awaitDispatcherWaitingForSends();
     assertFalse("a2 must wait for a1, which writes the same id", indexer.started.contains("a2"));
 
     indexer.release("a1");
+    awaitTrue(() -> indexer.finished.contains("a1"));
+    awaitDispatcherWaitingForSends();
+    assertFalse("a2 leads the next generation, after c too", indexer.started.contains("a2"));
+    indexer.release("c");
     awaitTrue(() -> indexer.started.contains("a2"));
-    indexer.release("c", "a2");
+    indexer.release("a2");
     awaitTrue(() -> messenger.completed().size() == 3);
     assertEquals(List.of("a1", "c", "a2"), messenger.completed());
   }
@@ -131,10 +144,10 @@ public class IndexerConcurrencyTest {
     x.setField("destId", "same");
     Document y = doc("y", "y");
     y.setField("destId", "same");
-    startWith(controlled, messenger, x, y);
+    startWithWarm(controlled, messenger, 2, x, y);
 
     awaitTrue(() -> indexer.started.contains("x"));
-    awaitIndexerWaitingForBatch();
+    awaitDispatcherWaitingForSends();
     assertFalse("y is written under the same destination id as x", indexer.started.contains("y"));
     indexer.release("x");
     awaitTrue(() -> indexer.started.contains("y"));
@@ -151,15 +164,15 @@ public class IndexerConcurrencyTest {
     p1.addChild(Document.create("shared"));
     Document p2 = doc("p2", "p2");
     p2.addChild(Document.create("shared"));
-    startWith(controlled, messenger, p1, doc("q", "q"), p2);
+    startWithWarm(controlled, messenger, 3, p1, doc("q", "q"), p2);
 
     awaitTrue(() -> indexer.started.containsAll(List.of("p1", "q")));
-    awaitIndexerWaitingForBatch();
+    awaitDispatcherWaitingForSends();
     assertFalse("p2 writes the child id shared, which p1 also writes", indexer.started.contains("p2"));
 
-    indexer.release("p1");
+    indexer.release("p1", "q");
     awaitTrue(() -> indexer.started.contains("p2"));
-    indexer.release("q", "p2");
+    indexer.release("p2");
     awaitTrue(() -> messenger.completed().size() == 3);
     assertEquals(List.of("p1", "q", "p2"), messenger.completed());
   }
@@ -174,10 +187,10 @@ public class IndexerConcurrencyTest {
     Document child = Document.create("child");
     child.addChild(Document.create("deep"));
     p1.addChild(child);
-    startWith(controlled, messenger, p1, doc("deep", "p2"));
+    startWithWarm(controlled, messenger, 2, p1, doc("deep", "p2"));
 
     awaitTrue(() -> indexer.started.contains("p1"));
-    awaitIndexerWaitingForBatch();
+    awaitDispatcherWaitingForSends();
     assertFalse("p2 is written under p1's grandchild id", indexer.started.contains("p2"));
     indexer.release("p1");
     awaitTrue(() -> indexer.started.contains("p2"));
@@ -186,26 +199,23 @@ public class IndexerConcurrencyTest {
   @Test
   public void testDeleteByQueryIsABarrier() throws Exception {
     RecordingMessenger messenger = new RecordingMessenger();
-    Map<String, Object> deletion = Map.of(
-        "indexer.deletionMarkerField", "deleted", "indexer.deletionMarkerFieldValue", "true",
-        "indexer.deleteByFieldField", "dbqField", "indexer.deleteByFieldValue", "dbqValue");
-    ControlledIndexer controlled = new ControlledIndexer(config(3, deletion), messenger);
+    ControlledIndexer controlled = new ControlledIndexer(config(3), messenger);
     controlled.gate("x", "d", "y");
     indexer = controlled;
     Document d = doc("d", "d");
     d.setField("deleted", "true");
     d.setField("dbqField", "category");
     d.setField("dbqValue", "obsolete");
-    startWith(controlled, messenger, doc("x", "x"), d, doc("y", "y"));
+    startWithWarm(controlled, messenger, 3, doc("x", "x"), d, doc("y", "y"));
 
     awaitTrue(() -> indexer.started.contains("x"));
-    awaitIndexerWaitingForBatch();
+    awaitDispatcherWaitingForSends();
     assertFalse("delete-by-query must wait for zero in flight", indexer.started.contains("d"));
 
     indexer.release("x");
     awaitTrue(() -> indexer.started.contains("d"));
-    // d has been dispatched, so the indexer thread is now waiting for d itself.
-    awaitIndexerWaitingForBatch();
+    // d is a generation of its own, so the dispatcher is now waiting for d itself.
+    awaitDispatcherWaitingForSends();
     assertFalse("nothing may be dispatched behind a delete-by-query", indexer.started.contains("y"));
 
     indexer.release("d");
@@ -219,15 +229,12 @@ public class IndexerConcurrencyTest {
   @Test
   public void testDeleteByIdIsNotABarrier() throws Exception {
     RecordingMessenger messenger = new RecordingMessenger();
-    Map<String, Object> deletion = Map.of(
-        "indexer.deletionMarkerField", "deleted", "indexer.deletionMarkerFieldValue", "true",
-        "indexer.deleteByFieldField", "dbqField", "indexer.deleteByFieldValue", "dbqValue");
-    ControlledIndexer controlled = new ControlledIndexer(config(3, deletion), messenger);
+    ControlledIndexer controlled = new ControlledIndexer(config(3), messenger);
     controlled.gate("x", "d");
     indexer = controlled;
     Document d = doc("d", "d");
     d.setField("deleted", "true");
-    startWith(controlled, messenger, doc("x", "x"), d);
+    startWithWarm(controlled, messenger, 2, doc("x", "x"), d);
 
     awaitTrue(() -> indexer.started.containsAll(List.of("x", "d")));
   }
@@ -239,7 +246,7 @@ public class IndexerConcurrencyTest {
     ControlledIndexer controlled = new ControlledIndexer(config(2, retry), messenger);
     controlled.failNextAttempt("a", new IndexerRetryableException(503, "unavailable", null));
     controlled.gate("a");
-    start(controlled, "a", "b");
+    startWarm(controlled, 2, "a", "b");
 
     awaitTrue(() -> indexer.finished.contains("b"));
     awaitPollCycle(messenger.polls);
@@ -258,7 +265,7 @@ public class IndexerConcurrencyTest {
     ControlledIndexer controlled = new ControlledIndexer(config(2), messenger);
     controlled.failNextAttempt("b", new IndexerException("bad request"));
     controlled.gate("a");
-    start(controlled, "a", "b");
+    startWarm(controlled, 2, "a", "b");
 
     awaitTrue(() -> indexer.finished.contains("b"));
     indexer.release("a");
@@ -282,12 +289,12 @@ public class IndexerConcurrencyTest {
     RecordingMessenger messenger = new RecordingMessenger();
     ControlledIndexer controlled = new ControlledIndexer(config(3), messenger);
     controlled.gate("a", "b", "c");
-    start(controlled, "a", "b", "c");
+    startWarm(controlled, 3, "a", "b", "c");
     awaitTrue(() -> indexer.started.containsAll(List.of("a", "b", "c")));
 
     indexer.terminate();
-    // run() is draining: it waits for a rather than returning with batches in flight.
-    awaitIndexerWaitingForBatch();
+    // run() is draining: it waits in completeAll rather than returning with batches in flight.
+    awaitIndexerParkedIn("completeAll");
     assertTrue("run() must not return with batches in flight", indexerThread.isAlive());
 
     indexer.release("c", "b", "a");
@@ -330,22 +337,30 @@ public class IndexerConcurrencyTest {
     RecordingMessenger messenger = new RecordingMessenger();
     ControlledIndexer controlled = new ControlledIndexer(config(2), messenger);
     controlled.failNextAttempt("a", new StackOverflowError("boom"));
-    controlled.gate("a", "b");
+    controlled.gate("a", "b", WARMUP);
+    messenger.queue.add(warmupDoc());
     messenger.queue.add(doc("a", "a"));
     messenger.queue.add(doc("b", "b"));
     AtomicReference<Throwable> thrown = new AtomicReference<>();
     Thread runner = new Thread(() -> {
       try {
-        controlled.run(2);
+        controlled.run(3);
       } catch (Throwable t) {
         thrown.set(t);
       }
     });
     runner.start();
+    indexer = controlled;
+    releaseWarmup(controlled, 2);
     awaitTrue(() -> controlled.started.containsAll(List.of("a", "b")));
 
-    // a's Error surfaces while b is still blocked in its send; the pool is shut down with b abandoned.
+    // Barrier: a's Error cannot surface until b, in the same generation, finishes its send. Then a's completion throws,
+    // the dispatcher stops, and b (sent but not completed) is abandoned.
     controlled.release("a");
+    awaitTrue(() -> controlled.finished.contains("a"));
+    awaitDispatcherWaitingForSends();
+    assertTrue(runner.isAlive());
+    controlled.release("b");
     runner.join(TIMEOUT_MS);
     assertFalse(runner.isAlive());
     assertTrue(String.valueOf(thrown.get()), thrown.get() instanceof StackOverflowError);
@@ -359,27 +374,28 @@ public class IndexerConcurrencyTest {
     RecordingMessenger messenger = new RecordingMessenger();
     ControlledIndexer controlled = new ControlledIndexer(config(2), messenger);
     controlled.gate("a");
-    start(controlled, "a", "b", "c", "d");
-    // With a and b in flight, the indexer thread blocks dispatching c until a completes.
-    awaitTrue(() -> indexer.started.containsAll(List.of("a", "b")));
-    awaitIndexerWaitingForBatch();
+    start(controlled, "a", "b", "c", "d", "e");
+    // a blocks the first generation; the ready queue (capacity 2) fills and the indexer thread blocks enqueuing.
+    awaitTrue(() -> indexer.started.contains("a"));
+    awaitIndexerParkedIn("send");
 
     indexerThread.interrupt();
-    // The wait absorbs the interrupt (clearing the flag) and goes back to waiting for a.
+    // The wait absorbs the interrupt (clearing the flag) and keeps trying to enqueue.
     awaitTrue(() -> !indexerThread.isInterrupted());
-    awaitIndexerWaitingForBatch();
-    assertFalse("an interrupt must not abandon an in-flight batch", indexer.started.contains("c"));
+    awaitIndexerParkedIn("send");
+    assertFalse("an interrupt must not abandon a batch", indexer.started.contains("c"));
 
     indexer.release("a");
     indexerThread.join(TIMEOUT_MS);
     assertFalse(indexerThread.isAlive());
     // The restored interrupt makes the next poll fail, which terminates the indexer after it drains what it holds.
-    assertEquals(List.of("a", "b", "c"), messenger.completed().subList(0, 3));
+    assertEquals(List.of("a", "b", "c", "d", "e"), messenger.completed());
   }
 
   /**
-   * An interrupt that arrives while the indexer waits for an in-flight batch must not reach the messenger calls that
-   * complete it: HybridIndexerMessenger.batchComplete uses a blocking put, which would throw at once and lose the offset.
+   * An interrupt of the indexer thread must not lose any batch's offset: HybridIndexerMessenger.batchComplete uses a
+   * blocking put, which would throw at once if interrupted. With the barrier design completion runs on the dispatcher, so
+   * the interrupt can only hit the indexer thread's enqueue, which must hold it.
    */
   @Test
   public void testInterruptWhileWaitingStillQueuesOffsets() throws Exception {
@@ -389,13 +405,13 @@ public class IndexerConcurrencyTest {
     HybridIndexerMessenger messenger = new HybridIndexerMessenger(config, dest, offsets, null, "pipeline1");
     ControlledIndexer controlled = new ControlledIndexer(config, messenger);
     controlled.gate("k0");
-    addKafkaDocs(dest, 3);
+    addKafkaDocs(dest, 5);
     indexer = controlled;
     indexerThread = new Thread(controlled);
     indexerThread.start();
-    // k0 and k1 are in flight; the indexer thread waits for k0 before it can dispatch k2.
-    awaitTrue(() -> controlled.started.containsAll(List.of("k0", "k1")));
-    awaitIndexerWaitingForBatch();
+    // k0 blocks the first generation; the ready queue fills and the indexer thread blocks enqueuing.
+    awaitTrue(() -> controlled.started.contains("k0"));
+    awaitIndexerParkedIn("send");
 
     indexerThread.interrupt();
     awaitTrue(() -> !indexerThread.isInterrupted());
@@ -408,7 +424,7 @@ public class IndexerConcurrencyTest {
     while ((next = offsets.poll()) != null) {
       committed.add(next.get(new TopicPartition("source", 0)).offset());
     }
-    assertEquals(List.of(1L, 2L, 3L), committed);
+    assertEquals(List.of(1L, 2L, 3L, 4L, 5L), committed);
   }
 
   @Test
@@ -495,7 +511,7 @@ public class IndexerConcurrencyTest {
     assertTrue(new ControlledIndexer(config(1), new RecordingMessenger()).getBatchSender()
         instanceof SynchronousBatchSender);
     assertTrue(new ControlledIndexer(config(2), new RecordingMessenger()).getBatchSender()
-        instanceof ConcurrentBatchSender);
+        instanceof BarrierBatchSender);
   }
 
   @Test
@@ -522,11 +538,13 @@ public class IndexerConcurrencyTest {
       }
     };
     ControlledIndexer controlled = new ControlledIndexer(config, messenger);
-    controlled.gate("k0", "k1", "k2");
+    controlled.gate("k0", "k1", "k2", WARMUP);
+    dest.add(warmupDoc());
     addKafkaDocs(dest, 3);
     indexer = controlled;
     indexerThread = new Thread(controlled);
     indexerThread.start();
+    releaseWarmup(controlled, 3);
     awaitTrue(() -> controlled.started.containsAll(List.of("k0", "k1", "k2")));
 
     controlled.release("k2", "k1");
@@ -576,7 +594,9 @@ public class IndexerConcurrencyTest {
 
   private static Config config(int maxConcurrentBatches, Map<String, Object> extra) {
     Map<String, Object> settings = new HashMap<>(Map.of(
-        "indexer.batchSize", 1, "indexer.batchTimeout", 20, "indexer.maxConcurrentBatches", maxConcurrentBatches));
+        "indexer.batchSize", 1, "indexer.batchTimeout", 20, "indexer.maxConcurrentBatches", maxConcurrentBatches,
+        "indexer.deletionMarkerField", "deleted", "indexer.deletionMarkerFieldValue", "true",
+        "indexer.deleteByFieldField", "dbqField", "indexer.deleteByFieldValue", "dbqValue"));
     settings.putAll(extra);
     return ConfigFactory.parseMap(settings);
   }
@@ -602,6 +622,40 @@ public class IndexerConcurrencyTest {
     }
   }
 
+  // A delete-by-query batch, which is always a generation of its own.
+  private static Document warmupDoc() {
+    Document d = doc(WARMUP, WARMUP);
+    d.setField("deleted", "true");
+    d.setField("dbqField", "category");
+    d.setField("dbqValue", "warmup");
+    return d;
+  }
+
+  private void startWarm(ControlledIndexer controlled, int queued, String... tags) throws InterruptedException {
+    Document[] docs = new Document[tags.length];
+    for (int i = 0; i < tags.length; i++) {
+      docs[i] = doc(tags[i], tags[i]);
+    }
+    startWithWarm(controlled, (RecordingMessenger) controlled.messenger, queued, docs);
+  }
+
+  // Starts the indexer behind a gated warm-up batch and releases it once `queued` batches wait in the ready queue, so the
+  // next generation is formed from exactly those batches.
+  private void startWithWarm(ControlledIndexer controlled, RecordingMessenger messenger, int queued, Document... docs)
+      throws InterruptedException {
+    controlled.gate(WARMUP);
+    messenger.queue.add(warmupDoc());
+    startWith(controlled, messenger, docs);
+    releaseWarmup(controlled, queued);
+  }
+
+  private static void releaseWarmup(ControlledIndexer controlled, int queued) throws InterruptedException {
+    awaitTrue(() -> controlled.started.contains(WARMUP));
+    BarrierBatchSender sender = (BarrierBatchSender) controlled.getBatchSender();
+    awaitTrue(() -> sender.queued() == queued);
+    controlled.release(WARMUP);
+  }
+
   private void startWith(ControlledIndexer controlled, RecordingMessenger messenger, Document... docs) {
     Collections.addAll(messenger.queue, docs);
     indexer = controlled;
@@ -620,27 +674,33 @@ public class IndexerConcurrencyTest {
   }
 
   /**
-   * Waits until the indexer thread is blocked waiting for an in-flight batch's send to finish. From then until that send
-   * finishes, the indexer provably dispatches nothing more, so asserting that a batch has not started is meaningful.
+   * Waits until the dispatcher thread is blocked waiting for its generation's sends to finish. From then until they all
+   * finish, it provably dispatches nothing more, so asserting that a batch has not started is meaningful.
    */
-  private void awaitIndexerWaitingForBatch() throws InterruptedException {
-    awaitTrue(() -> isWaitingForBatch(indexerThread));
+  private void awaitDispatcherWaitingForSends() throws InterruptedException {
+    String name = "Lucille-" + indexer.runId + "-IndexerDispatch";
+    awaitTrue(() -> Thread.getAllStackTraces().keySet().stream()
+        .anyMatch(t -> t.getName().startsWith(name) && isParkedIn(t, "await")));
   }
 
-  private static boolean isWaitingForBatch(Thread thread) {
+  /** Waits until the indexer thread is parked in the given BarrierBatchSender method. */
+  private void awaitIndexerParkedIn(String method) throws InterruptedException {
+    awaitTrue(() -> isParkedIn(indexerThread, method));
+  }
+
+  private static boolean isParkedIn(Thread thread, String method) {
     if (!isParked(thread)) {
       return false;
     }
-    boolean inAwaitOutcome = false;
+    boolean inMethod = false;
     for (StackTraceElement frame : thread.getStackTrace()) {
-      if (frame.getClassName().equals(ConcurrentBatchSender.class.getName())
-          && frame.getMethodName().equals("awaitOutcome")) {
-        inAwaitOutcome = true;
+      if (frame.getClassName().equals(BarrierBatchSender.class.getName()) && frame.getMethodName().equals(method)) {
+        inMethod = true;
         break;
       }
     }
     // Check the state again, so the stack was sampled while the thread was parked.
-    return inAwaitOutcome && isParked(thread);
+    return inMethod && isParked(thread);
   }
 
   private static boolean isParked(Thread thread) {
@@ -661,11 +721,12 @@ public class IndexerConcurrencyTest {
     return "IndexerConcurrencyTest" + RUN_IDS.incrementAndGet();
   }
 
-  // Whether any send pool thread of the given indexer's run is still alive.
+  // Whether any send pool or dispatcher thread of the given indexer's run is still alive.
   private static boolean sendThreadsAlive(ControlledIndexer controlled) {
-    String prefix = "Lucille-" + controlled.runId + "-IndexerSend";
+    String send = "Lucille-" + controlled.runId + "-IndexerSend";
+    String dispatch = "Lucille-" + controlled.runId + "-IndexerDispatch";
     return Thread.getAllStackTraces().keySet().stream()
-        .anyMatch(t -> t.isAlive() && t.getName().startsWith(prefix));
+        .anyMatch(t -> t.isAlive() && (t.getName().startsWith(send) || t.getName().startsWith(dispatch)));
   }
 
   private static String tag(Document doc) {
@@ -797,12 +858,13 @@ public class IndexerConcurrencyTest {
     private final List<String> completed = Collections.synchronizedList(new ArrayList<>());
     volatile boolean closed;
 
+    // Both omit the warm-up batch.
     List<String> events() {
-      return new ArrayList<>(events);
+      return new ArrayList<>(events).stream().filter(e -> !e.endsWith(":" + WARMUP)).collect(Collectors.toList());
     }
 
     List<String> completed() {
-      return new ArrayList<>(completed);
+      return new ArrayList<>(completed).stream().filter(c -> !c.equals(WARMUP)).collect(Collectors.toList());
     }
 
     @Override

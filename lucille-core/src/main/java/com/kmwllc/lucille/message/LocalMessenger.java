@@ -19,6 +19,8 @@ public class LocalMessenger implements IndexerMessenger, PublisherMessenger, Wor
 
   private static final Logger log = LoggerFactory.getLogger(LocalMessenger.class);
 
+  // Thread-safe: every queue is a LinkedBlockingQueue, so indexer polls and completion on another thread do not race.
+  // runId and pipelineName are set once by initialize, before any indexer runs.
   public static final int POLL_TIMEOUT_MS = 50;
   public static final int DEFAULT_QUEUE_CAPACITY = 10000;
 

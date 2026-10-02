@@ -13,6 +13,11 @@ import java.util.List;
  *
  * An Indexer also needs to communicate with a destination system like Solr or Elasticsearch but
  * that communication is not included in this interface.
+ *
+ * <p> Threading: {@link #pollDocToIndex()} and {@link #close()} are called on the indexer thread. When
+ * indexer.maxConcurrentBatches is greater than 1, sendEvent, sendEvents and batchComplete are called on a single
+ * dispatcher thread (see com.kmwllc.lucille.core.BarrierBatchSender), concurrently with polls, so implementations must
+ * tolerate that split. close() is called after the dispatcher has stopped.
  */
 public interface IndexerMessenger {
 

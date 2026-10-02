@@ -101,8 +101,8 @@ import sun.misc.Signal;
  *   <li>indexer.versionField (String, Optional) : The field name to use for versioning. This field must be present in the document and must be of a type that supports versioning with that specific indexer implementation (e.g., numeric, string).</li>
  *   <li>indexer.maxConcurrentBatches (Integer, Optional) : Maximum number of batches that may be in flight to the destination
  *   at once. Defaults to 1, which sends each batch on the indexer thread. Greater values run {@link #sendToIndex(List)}
- *   (with retries) on a pool of that many threads; batches still complete in the order they were sent, on the indexer
- *   thread, with all in-flight batches completed before {@link #run()} returns. See {@link ConcurrentBatchSender} for the
+ *   (with retries) on a pool of that many threads; batches still complete in the order they were sent, on a dispatcher
+ *   thread, with all in-flight batches completed before {@link #run()} returns. See {@link BarrierBatchSender} for the
  *   rules. Only accepted by implementations whose {@link #supportsConcurrentSends()} returns true.</li>
  * </ul>
  */
@@ -153,7 +153,7 @@ public abstract class Indexer implements Runnable {
   // Empty when retries are disabled; otherwise the set of HTTP status codes (and -1 for no-status) that trigger a retry.
   private final List<Integer> retryableStatusCodes;
 
-  // Sends and completes flushed batches: a SynchronousBatchSender or a ConcurrentBatchSender, per maxConcurrentBatches.
+  // Sends and completes flushed batches: a SynchronousBatchSender or a BarrierBatchSender, per maxConcurrentBatches.
   private final BatchSender batchSender;
 
   // The outcome of one sendToIndex call (with retries): exactly one of failedDocPairs and error is meaningful.
@@ -316,7 +316,7 @@ public abstract class Indexer implements Runnable {
 
     this.batchSender = maxConcurrentBatches == 1
         ? new SynchronousBatchSender(this::sendWithRetry, this::completeBatch)
-        : new ConcurrentBatchSender(maxConcurrentBatches, localRunId, this::sendWithRetry, this::completeBatch,
+        : new BarrierBatchSender(maxConcurrentBatches, localRunId, this::sendWithRetry, this::completeBatch,
             this::destinationIds, this::isDeleteByQuery);
   }
 
@@ -477,7 +477,7 @@ public abstract class Indexer implements Runnable {
   /**
    * Sends the batch to the destination, applying the retry policy. Runs on the indexer thread, or on the send pool when
    * maxConcurrentBatches is greater than 1. Never throws: any Throwable is captured in the outcome so that
-   * {@link #completeBatch} can handle it on the indexer thread.
+   * {@link #completeBatch} can handle it.
    */
   private SendOutcome sendWithRetry(List<Document> batchedDocs) {
     long start = System.nanoTime();
@@ -499,8 +499,10 @@ public abstract class Indexer implements Runnable {
   }
 
   /**
-   * Records metrics and sends FAIL / FINISH events for a sent batch, then marks it complete. Always runs on the indexer
-   * thread, in the order batches were sent.
+   * Records metrics and sends FAIL / FINISH events for a sent batch, then marks it complete. Runs in the order batches
+   * were sent: on the indexer thread when maxConcurrentBatches is 1, otherwise on BarrierBatchSender's dispatcher thread.
+   * Safe there: the Meter and Histogram are thread-safe, MDC is thread-local (the dispatcher installs the indexer
+   * thread's MDC per batch), and it touches no other indexer-thread state.
    */
   private void completeBatch(List<Document> batchedDocs, SendOutcome outcome) {
     try {
