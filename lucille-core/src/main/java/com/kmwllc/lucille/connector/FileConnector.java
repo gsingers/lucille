@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -28,7 +29,10 @@ import com.kmwllc.lucille.connector.storageclient.StorageClient;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams.PublishMode;
 import com.kmwllc.lucille.core.ConnectorException;
+import com.kmwllc.lucille.core.PartitionableConnector;
 import com.kmwllc.lucille.core.Publisher;
+import com.kmwllc.lucille.core.WorkUnit;
+import com.kmwllc.lucille.core.WorkUnitSink;
 import com.kmwllc.lucille.core.spec.Spec;
 import com.kmwllc.lucille.core.spec.SpecBuilder;
 import com.typesafe.config.Config;
@@ -76,6 +80,11 @@ import com.typesafe.config.Config;
  *   <li>state.runsBeforeExpiration (Int, Optional) : After a file is not encountered for this number of runs, it will be marked
  *   as expired. Must be at least 1. Defaults to 1.</li>
  *   <li>state.pathLength (Int, Optional) : Max length for stored file paths when Lucille creates the table. Defaults to 200.</li>
+ *   <li>partitioning.depth (Int, Optional) : In a distributed crawl, split each path into one work unit per directory this
+ *   many levels below it, plus one for the files directly in each directory above that level. Local paths and S3 are split;
+ *   paths in other providers become one unit each. Defaults to 1. Without a partitioning block, a distributed crawl
+ *   traverses all paths as a single unit. A partitioned connector that uses state needs state.connectionString to name a
+ *   database every Crawler can reach, and applies expiry and sendTombstones once, after all units are done.</li>
  *   <li>gcp.pathToServiceKey (String, Required) : Path to the Google Cloud service key JSON.</li>
  *   <li>gcp.maxNumOfPages (Int, Optional) : Maximum number of file references to hold in memory. Defaults to 100.</li>
  *   <li>s3.accessKeyId (String, Optional) : AWS access key ID (omit to use default credentials).</li>
@@ -94,7 +103,11 @@ import com.typesafe.config.Config;
  *   each handler's config as needed.</li>
  * </ul>
  */
-public class FileConnector extends AbstractConnector {
+public class FileConnector extends AbstractConnector implements PartitionableConnector {
+
+  // keys of a work unit's payload
+  private static final String UNIT_PATH = "path";
+  private static final String UNIT_RECURSIVE = "recursive";
 
   public static final String FILE_PATH = "file_path";
   public static final String MODIFIED = "file_modification_date";
@@ -153,6 +166,8 @@ public class FileConnector extends AbstractConnector {
               .optionalString("driver", "connectionString", "jdbcUser", "jdbcPassword", "tableName")
               .optionalBoolean("performDeletions", "enabled")
               .optionalNumber("pathLength", "runsBeforeExpiration").build(),
+          SpecBuilder.parent("partitioning")
+              .optionalNumber("depth").build(),
           GCP_PARENT_SPEC,
           AZURE_PARENT_SPEC,
           S3_PARENT_SPEC)
@@ -164,6 +179,9 @@ public class FileConnector extends AbstractConnector {
   private final FileConnectorStateManager stateManager;
 
   private final boolean concurrent;
+
+  // Set once this instance has executed a work unit, and so has seen only part of the traversal.
+  private boolean executedUnit = false;
 
   public FileConnector(Config config) throws ConnectorException {
     super(config);
@@ -221,6 +239,145 @@ public class FileConnector extends AbstractConnector {
 
     if (config.hasPath("filterOptions.lastPublishedCutoff") && !config.hasPath("state")) {
       log.warn("filterOptions.lastPublishedCutoff was specified, but no state configuration was provided. It will not be enforced.");
+    }
+
+    if (isPartitioningEnabled() && ConfigUtils.getOrDefault(config, "partitioning.depth", 1) < 1) {
+      throw new IllegalArgumentException("partitioning.depth must be at least 1.");
+    }
+  }
+
+  @Override
+  public boolean isPartitioningEnabled() {
+    return config.hasPath("partitioning");
+  }
+
+  /**
+   * Marks every file in the state database as not yet encountered, ahead of the units marking the files they find.
+   */
+  @Override
+  public void prepareRun(String runId) throws ConnectorException {
+    // Units run on different Crawlers, which could not share the embedded database that state defaults to.
+    if (stateManager != null && !config.hasPath("state.connectionString")) {
+      throw new ConnectorException("A partitioned FileConnector that uses state requires state.connectionString.");
+    }
+
+    initialize();
+  }
+
+  /**
+   * Splits each path into units: one for each directory <code>partitioning.depth</code> levels down, to be traversed
+   * recursively, and one for the files directly in each directory above that level.
+   */
+  @Override
+  public void plan(String runId, WorkUnitSink sink) throws ConnectorException {
+    initializeStorageClients();
+    int depth = ConfigUtils.getOrDefault(config, "partitioning.depth", 1);
+
+    for (URI resource : storageURIs) {
+      planPath(resource, buildTraversalParams(resource), depth, sink);
+    }
+  }
+
+  private void planPath(URI path, TraversalParams params, int depth, WorkUnitSink sink) throws ConnectorException {
+    List<URI> subdirectories = null;
+
+    if (depth > 0) {
+      try {
+        subdirectories = getStorageClient(path).listSubdirectories(path, params);
+      } catch (UnsupportedOperationException e) {
+        log.info("Path {} will be traversed as a single unit: {}", path, e.getMessage());
+      } catch (IOException e) {
+        throw new ConnectorException("Error listing the directories under " + path, e);
+      }
+    }
+
+    if (subdirectories == null) {
+      sink.emit(path.toString(), WorkUnit.newPayload().put(UNIT_PATH, path.toString()).put(UNIT_RECURSIVE, true));
+      return;
+    }
+
+    sink.emit(path + "#files", WorkUnit.newPayload().put(UNIT_PATH, path.toString()).put(UNIT_RECURSIVE, false));
+    for (URI subdirectory : subdirectories) {
+      planPath(subdirectory, params, depth - 1, sink);
+    }
+  }
+
+  @Override
+  public void executeUnit(WorkUnit unit, Publisher publisher) throws ConnectorException {
+    URI unitPath = parseUnitPath(unit);
+    boolean recursive = unit.payload().path(UNIT_RECURSIVE).asBoolean(true);
+    executedUnit = true;
+
+    initializeStorageClients();
+
+    try {
+      if (stateManager != null) {
+        stateManager.openForPartialTraversal();
+      }
+      traverseStoragePath(publisher, unitPath, recursive);
+    } catch (ClassNotFoundException | SQLException e) {
+      throw new ConnectorException("Error connecting to the state database.", e);
+    } finally {
+      if (stateManager != null) {
+        stateManager.closeStateForThread();
+      }
+    }
+  }
+
+  /**
+   * Returns the path a unit asks to have traversed. Units arrive over the network, so a path is only accepted if it
+   * lies within one of this connector's configured paths.
+   */
+  private URI parseUnitPath(WorkUnit unit) throws ConnectorException {
+    URI unitPath;
+    try {
+      unitPath = new URI(unit.payload().path(UNIT_PATH).asText()).normalize();
+    } catch (URISyntaxException e) {
+      throw new ConnectorException("Work unit " + unit.unitId() + " has an invalid path.", e);
+    }
+
+    for (URI configured : storageURIs) {
+      StorageClient client = storageClientMap.get(clientKeyFor(configured));
+
+      if (client != null && clientKeyFor(configured).equals(clientKeyFor(unitPath)) && isWithin(client, configured, unitPath)) {
+        return unitPath;
+      }
+    }
+
+    throw new ConnectorException("Work unit " + unit.unitId() + " has a path outside this connector's configured paths.");
+  }
+
+  // Object storage paths are key prefixes, which a traversal extends without regard to '/'. A traversal of
+  // s3://bucket/data also covers s3://bucket/data-old/, so the planner emits it and it has to be accepted here.
+  private static boolean isWithin(StorageClient client, URI configured, URI unitPath) {
+    if ("file".equals(clientKeyFor(configured))) {
+      return client.containsPath(configured, unitPath);
+    }
+
+    return Objects.equals(configured.getAuthority(), unitPath.getAuthority())
+        && unitPath.getPath().startsWith(configured.normalize().getPath());
+  }
+
+  /**
+   * Applies the parts of a traversal that need to know every file that was encountered: files that no unit saw
+   * move a step closer to expiring, and tombstones are published for those that have expired.
+   */
+  @Override
+  public void finalizeRun(String runId, Publisher publisher) throws ConnectorException {
+    if (stateManager == null) {
+      return;
+    }
+
+    try {
+      // a Coordinator that resumed the run has not connected yet
+      stateManager.connect();
+      stateManager.incrementRunsNotEncountered();
+    } catch (ClassNotFoundException | SQLException e) {
+      throw new ConnectorException("Error finalizing state after traversal.", e);
+    }
+
+    if (config.hasPath("filterOptions.sendTombstones") && config.getBoolean("filterOptions.sendTombstones")) {
+      sendExpiredFileTombstones(publisher);
     }
   }
 
@@ -293,7 +450,7 @@ public class FileConnector extends AbstractConnector {
 
   }
 
-  private void initialize() throws ConnectorException {
+  private void initializeStorageClients() throws ConnectorException {
     try {
       for (StorageClient client : storageClientMap.values()) {
         client.init();
@@ -301,6 +458,10 @@ public class FileConnector extends AbstractConnector {
     } catch (IOException e) {
       throw new ConnectorException("Error initializing a StorageClient.", e);
     }
+  }
+
+  private void initialize() throws ConnectorException {
+    initializeStorageClients();
     if (stateManager != null) {
       try {
         stateManager.init();
@@ -312,7 +473,10 @@ public class FileConnector extends AbstractConnector {
 
   @Override
   public void close() {
-    if (stateManager != null) {
+    if (stateManager != null && executedUnit) {
+      // other units of the traversal ran elsewhere, so this instance cannot tell which files have expired
+      stateManager.closeForPartialTraversal();
+    } else if (stateManager != null) {
       try {
         stateManager.shutdown();
       } catch (SQLException e) {
@@ -429,14 +593,23 @@ public class FileConnector extends AbstractConnector {
   }
 
   private void traverseStoragePath(Publisher publisher, URI pathToTraverse) throws ConnectorException {
-    StorageClient storageClient = storageClientMap.get(clientKeyFor(pathToTraverse));
+    traverseStoragePath(publisher, pathToTraverse, true);
+  }
+
+  private StorageClient getStorageClient(URI path) throws ConnectorException {
+    StorageClient storageClient = storageClientMap.get(clientKeyFor(path));
 
     if (storageClient == null) {
-      throw new ConnectorException("No StorageClient was available for (" + pathToTraverse +
+      throw new ConnectorException("No StorageClient was available for (" + path +
           "). Did you include the necessary configuration?");
     }
 
-    TraversalParams params = buildTraversalParams(pathToTraverse);
+    return storageClient;
+  }
+
+  private void traverseStoragePath(Publisher publisher, URI pathToTraverse, boolean recursive) throws ConnectorException {
+    StorageClient storageClient = getStorageClient(pathToTraverse);
+    TraversalParams params = new TraversalParams(config, pathToTraverse, getDocIdPrefix(), recursive);
 
     try {
       storageClient.traverse(publisher, params, stateManager);

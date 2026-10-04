@@ -300,15 +300,7 @@ public class KafkaUtils {
     // could mean that child creation events arrive after parent completion events, which could
     // interfere with the publisher's logic for determining when the run is complete
 
-    Properties adminProps;
-    if (config.hasPath("kafka.adminPropertyFile")) {
-      adminProps = loadExternalProps(config.getString("kafka.adminPropertyFile"), config);
-    } else {
-      adminProps = new Properties();
-      adminProps.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, config.getString("kafka.bootstrapServers"));
-    }
-
-    mergeConfigProps(adminProps, config, "kafka.admin");
+    Properties adminProps = createAdminProps(config);
 
     try (Admin kafkaAdminClient = Admin.create(adminProps)) {
       NewTopic eventTopic = new NewTopic(eventTopicName, 1, (short) 1);
@@ -324,5 +316,49 @@ public class KafkaUtils {
     }
 
     return true;
+  }
+
+  private static Properties createAdminProps(Config config) {
+    Properties adminProps;
+    if (config.hasPath("kafka.adminPropertyFile")) {
+      adminProps = loadExternalProps(config.getString("kafka.adminPropertyFile"), config);
+    } else {
+      adminProps = new Properties();
+      adminProps.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, config.getString("kafka.bootstrapServers"));
+    }
+
+    mergeConfigProps(adminProps, config, "kafka.admin");
+    return adminProps;
+  }
+
+  /**
+   * Creates the given topic unless it already exists.
+   *
+   * @return true if the topic was created; false if the topic already existed, so no action was taken
+   */
+  public static boolean createTopicIfAbsent(Config config, NewTopic topic) throws ExecutionException, InterruptedException {
+    try (Admin kafkaAdminClient = Admin.create(createAdminProps(config))) {
+      kafkaAdminClient.createTopics(List.of(topic)).all().get();
+    } catch (ExecutionException e) {
+      if (e.getCause() instanceof TopicExistsException) {
+        return false;
+      }
+      throw e;
+    }
+
+    return true;
+  }
+
+  /**
+   * Creates a consumer of String records that is not part of a consumer group. The caller assigns its partitions
+   * and positions; offsets are never committed.
+   */
+  public static KafkaConsumer<String, String> createUngroupedConsumer(Config config, String clientId, int maxPollRecords) {
+    Properties consumerProps = createConsumerProps(config, clientId);
+    consumerProps.remove(ConsumerConfig.GROUP_ID_CONFIG);
+    consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+    consumerProps.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPollRecords);
+    consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    return new KafkaConsumer<>(consumerProps);
   }
 }

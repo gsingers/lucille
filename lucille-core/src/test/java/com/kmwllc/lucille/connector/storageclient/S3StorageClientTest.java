@@ -50,6 +50,7 @@ import org.mockito.MockedStatic;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.core.pagination.sync.SdkIterable;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
@@ -119,6 +120,71 @@ public class S3StorageClientTest {
     assertThrows(IllegalArgumentException.class,
         () -> new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_ANONYMOUS, true, S3_ACCESS_KEY_ID, "accessKey",
             S3_SECRET_ACCESS_KEY, "secretKey"))));
+  }
+
+  // A bucket with one object and two prefixes at its root, and one object under each prefix.
+  private S3Client mockClientWithPrefixes() {
+    S3Client mockClient = mock(S3Client.class, RETURNS_DEEP_STUBS);
+
+    when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenAnswer(invocation -> {
+      String prefix = ((ListObjectsV2Request) invocation.getArgument(0)).prefix();
+      ListObjectsV2Response page = mock(ListObjectsV2Response.class);
+
+      if (prefix.isEmpty()) {
+        when(page.contents()).thenReturn(List.of(S3Object.builder().key("root.txt").lastModified(Instant.ofEpochMilli(1)).size(1L).build()));
+        when(page.commonPrefixes()).thenReturn(
+            List.of(CommonPrefix.builder().prefix("a/").build(), CommonPrefix.builder().prefix("b/").build()));
+      } else {
+        when(page.contents()).thenReturn(
+            List.of(S3Object.builder().key(prefix + "file.txt").lastModified(Instant.ofEpochMilli(1)).size(1L).build()));
+        when(page.commonPrefixes()).thenReturn(List.of());
+      }
+
+      ListObjectsV2Iterable response = mock(ListObjectsV2Iterable.class);
+      when(response.stream()).thenAnswer(i -> Stream.of(page));
+      when(response.commonPrefixes()).thenAnswer(i -> (SdkIterable<CommonPrefix>) () -> page.commonPrefixes().iterator());
+      return response;
+    });
+
+    when(mockClient.getObjectAsBytes(any(GetObjectRequest.class)))
+        .thenReturn(ResponseBytes.fromByteArray(GetObjectResponse.builder().build(), new byte[]{1}));
+    return mockClient;
+  }
+
+  private List<String> traversePrefixBucket(boolean recursive) throws Exception {
+    TestMessenger messenger = new TestMessenger();
+    Publisher publisher = new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1");
+    S3StorageClient s3StorageClient = new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_REGION, "us-east-1")));
+    s3StorageClient.setS3ClientForTesting(mockClientWithPrefixes());
+    s3StorageClient.initializeForTesting();
+
+    s3StorageClient.traverse(publisher, new TraversalParams(ConfigFactory.empty(), URI.create("s3://bucket/"), "", recursive));
+    return messenger.getDocsSentForProcessing().stream().map(doc -> doc.getString(FILE_PATH)).toList();
+  }
+
+  // A traversal that is not recursive publishes the objects directly under the prefix and does not list the prefixes below it.
+  @Test
+  public void testTraverseWithoutRecursion() throws Exception {
+    assertEquals(List.of("s3://bucket/root.txt", "s3://bucket/a/file.txt", "s3://bucket/b/file.txt"), traversePrefixBucket(true));
+    assertEquals(List.of("s3://bucket/root.txt"), traversePrefixBucket(false));
+  }
+
+  @Test
+  public void testListSubdirectories() throws Exception {
+    S3StorageClient s3StorageClient = new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_REGION, "us-east-1")));
+    s3StorageClient.setS3ClientForTesting(mockClientWithPrefixes());
+    s3StorageClient.initializeForTesting();
+    URI root = URI.create("s3://bucket/");
+
+    assertEquals(List.of(URI.create("s3://bucket/a/"), URI.create("s3://bucket/b/")),
+        s3StorageClient.listSubdirectories(root, new TraversalParams(ConfigFactory.empty(), root, "")));
+    assertEquals(List.of(),
+        s3StorageClient.listSubdirectories(URI.create("s3://bucket/a/"), new TraversalParams(ConfigFactory.empty(), root, "")));
+
+    // prefixes that the traversal would skip are left out
+    Config skipA = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("pathsToSkip", List.of("s3://bucket/a/"))));
+    assertEquals(List.of(URI.create("s3://bucket/b/")),
+        s3StorageClient.listSubdirectories(root, new TraversalParams(skipA, root, "")));
   }
 
   @Test

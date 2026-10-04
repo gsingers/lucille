@@ -1,0 +1,338 @@
+package com.kmwllc.lucille.message;
+
+import com.kmwllc.lucille.core.CrawlConfig;
+import com.kmwllc.lucille.core.Document;
+import com.kmwllc.lucille.core.Event;
+import com.kmwllc.lucille.core.RunControlTracker;
+import com.kmwllc.lucille.core.WorkUnit;
+import com.kmwllc.lucille.util.ThreadNameUtils;
+import com.typesafe.config.Config;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.commons.lang3.RandomStringUtils;
+import org.apache.commons.lang3.concurrent.BasicThreadFactory;
+import org.apache.kafka.clients.admin.NewTopic;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.CooperativeStickyAssignor;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.RebalanceInProgressException;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A CrawlerMessenger that uses Kafka.
+ *
+ * Work units are received from the work topic as a member of the Crawlers' consumer group. Receiving a unit is
+ * claiming it: its offset is committed only when the unit is acknowledged, so a unit whose Crawler dies is delivered
+ * to another member of the group.
+ *
+ * A unit can take far longer to execute than <code>max.poll.interval.ms</code>, and a consumer that does not poll
+ * for that long is removed from its group. So while a unit is held, the consumer is paused and a separate thread
+ * keeps polling it. A paused consumer returns no records but remains a live member of the group.
+ *
+ * Documents are sent without waiting for each to be accepted. The CREATE Event for a Document is sent only after the
+ * Document has been accepted, so the Coordinator is never told of a Document that did not reach the source topic.
+ */
+public class KafkaCrawlerMessenger implements CrawlerMessenger {
+
+  private static final long KEEP_ALIVE_PERIOD_MILLIS = 1000;
+  private static final long COMMIT_TIMEOUT_MILLIS = 30_000;
+
+  private static final Logger log = LoggerFactory.getLogger(KafkaCrawlerMessenger.class);
+
+  private final Config config;
+  private final RunControlTracker tracker;
+  private final KafkaProducer<String, Document> documentProducer;
+  private final KafkaProducer<String, String> eventProducer;
+  private final ScheduledExecutorService keepAlive;
+
+  // A KafkaConsumer must not be used by two threads at once. Guards the consumer and the fields describing the held unit.
+  private final Object consumerLock = new Object();
+  private final KafkaConsumer<String, String> workConsumer;
+  private ConsumerRecord<String, String> heldRecord;
+  private volatile boolean unitLost;
+
+  // Documents the source topic has accepted, each awaiting its CREATE Event. Filled by the producer's callback thread.
+  private final ConcurrentLinkedQueue<Event> pendingCreates = new ConcurrentLinkedQueue<>();
+  private final AtomicReference<Exception> sendException = new AtomicReference<>();
+
+  public KafkaCrawlerMessenger(Config config, CrawlConfig crawlConfig, RunControlTracker tracker) {
+    this.config = config;
+    this.tracker = tracker;
+
+    this.documentProducer = KafkaUtils.createDocumentProducer(config);
+    this.eventProducer = KafkaUtils.createEventProducer(config);
+    if (eventProducer == null) {
+      throw new IllegalArgumentException("A distributed crawl requires Events; kafka.events cannot be false.");
+    }
+
+    try {
+      // a Crawler can be started before any Coordinator has created the topic
+      KafkaUtils.createTopicIfAbsent(config,
+          new NewTopic(crawlConfig.workTopic, crawlConfig.workTopicPartitions, crawlConfig.topicReplicationFactor));
+    } catch (Exception e) {
+      throw new IllegalStateException("Could not create work topic " + crawlConfig.workTopic, e);
+    }
+
+    this.workConsumer = new KafkaConsumer<>(createWorkConsumerProps(config, crawlConfig));
+    this.workConsumer.subscribe(Collections.singletonList(crawlConfig.workTopic), new RebalanceListener());
+
+    BasicThreadFactory threadFactory = new BasicThreadFactory.Builder()
+        .namingPattern(ThreadNameUtils.createName("CrawlerKeepAlive")).daemon(true).build();
+    this.keepAlive = Executors.newSingleThreadScheduledExecutor(threadFactory);
+    this.keepAlive.scheduleWithFixedDelay(this::pollWhileHolding, KEEP_ALIVE_PERIOD_MILLIS, KEEP_ALIVE_PERIOD_MILLIS,
+        TimeUnit.MILLISECONDS);
+  }
+
+  // package access so unit tests can validate the properties without initializing a Consumer
+  static Properties createWorkConsumerProps(Config config, CrawlConfig crawlConfig) {
+    // append random string to kafka client ID to prevent kafka from issuing a warning when multiple consumers
+    // with the same client ID are started in separate crawler threads
+    String clientId = "com.kmwllc.lucille-crawler-" + RandomStringUtils.randomAlphanumeric(8);
+    Properties props = KafkaUtils.createConsumerProps(config, clientId);
+
+    // Crawlers must not share a group with Workers or Indexers: a member joining or leaving any role would then
+    // rebalance all of them.
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, crawlConfig.consumerGroupId);
+    props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+    props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 1);
+    // When a Crawler joins or leaves, only the partitions that move are taken from their owners. With the default
+    // assignor every Crawler would give up its partition, and with it the unit it is executing.
+    props.put(ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG, CooperativeStickyAssignor.class.getName());
+    return props;
+  }
+
+  @Override
+  public WorkUnit pollWorkUnit() throws Exception {
+    synchronized (consumerLock) {
+      if (heldRecord != null) {
+        throw new IllegalStateException("A work unit is already held; it must be acknowledged first.");
+      }
+
+      ConsumerRecords<String, String> records = workConsumer.poll(KafkaUtils.POLL_INTERVAL);
+      KafkaUtils.validateAtMostOneRecord(records);
+      if (records.isEmpty()) {
+        return null;
+      }
+
+      ConsumerRecord<String, String> record = records.iterator().next();
+      WorkUnit unit;
+      try {
+        unit = WorkUnit.fromJson(record.value());
+      } catch (Exception e) {
+        // an unreadable record would otherwise be redelivered forever
+        log.error("Discarding unreadable work unit at {}-{} offset {}.", record.topic(), record.partition(), record.offset(), e);
+        workConsumer.commitSync(offsetAfter(record));
+        return null;
+      }
+
+      heldRecord = record;
+      unitLost = false;
+      sendException.set(null);
+      pendingCreates.clear();
+      workConsumer.pause(workConsumer.assignment());
+      return unit;
+    }
+  }
+
+  private static Map<TopicPartition, OffsetAndMetadata> offsetAfter(ConsumerRecord<String, String> record) {
+    return Map.of(new TopicPartition(record.topic(), record.partition()), new OffsetAndMetadata(record.offset() + 1));
+  }
+
+  /**
+   * Keeps the consumer in its group while a unit is held. Does nothing otherwise, as the Crawler is then polling.
+   */
+  private void pollWhileHolding() {
+    synchronized (consumerLock) {
+      if (heldRecord == null) {
+        return;
+      }
+
+      try {
+        // Partitions assigned by a rebalance during this call are paused by the RebalanceListener. The poll is given a
+        // little time because a rebalance of the group cannot finish until every member has taken part in it.
+        ConsumerRecords<String, String> records = workConsumer.poll(Duration.ofMillis(100));
+        for (ConsumerRecord<String, String> record : records) {
+          // not expected while paused; put the record back so that it is delivered once the held unit is acknowledged
+          workConsumer.seek(new TopicPartition(record.topic(), record.partition()), record.offset());
+        }
+      } catch (Exception e) {
+        log.error("Error polling to keep the Crawler in its consumer group.", e);
+      }
+    }
+  }
+
+  @Override
+  public void ackWorkUnit() {
+    synchronized (consumerLock) {
+      if (heldRecord == null) {
+        throw new IllegalStateException("No work unit is held.");
+      }
+
+      try {
+        if (unitLost) {
+          log.warn("Not committing the held unit: its partition was reassigned, so it will be delivered again.");
+        } else {
+          commitHeldRecord();
+        }
+      } finally {
+        heldRecord = null;
+        workConsumer.resume(workConsumer.assignment());
+      }
+    }
+  }
+
+  // A commit that fails leaves the unit to be delivered again, which the Coordinator tolerates, so it is not an error.
+  private void commitHeldRecord() {
+    long deadline = System.currentTimeMillis() + COMMIT_TIMEOUT_MILLIS;
+
+    while (!unitLost && System.currentTimeMillis() < deadline) {
+      try {
+        workConsumer.commitSync(offsetAfter(heldRecord));
+        return;
+      } catch (RebalanceInProgressException e) {
+        // The commit can succeed once the rebalance is over, provided the unit's partition stays with this consumer.
+        // Polling is what moves the rebalance along; the consumer is paused, so no record is returned.
+        workConsumer.poll(Duration.ofMillis(200));
+      } catch (Exception e) {
+        log.warn("Could not commit the held unit; it will be delivered again.", e);
+        return;
+      }
+    }
+    log.warn("Could not commit the held unit during a rebalance; it will be delivered again.");
+  }
+
+  @Override
+  public void releaseWorkUnit() {
+    synchronized (consumerLock) {
+      if (heldRecord == null) {
+        return;
+      }
+
+      try {
+        TopicPartition partition = new TopicPartition(heldRecord.topic(), heldRecord.partition());
+        if (!unitLost && workConsumer.assignment().contains(partition)) {
+          workConsumer.seek(partition, heldRecord.offset());
+        }
+      } finally {
+        heldRecord = null;
+        workConsumer.resume(workConsumer.assignment());
+      }
+    }
+  }
+
+  @Override
+  public boolean isUnitLost() {
+    return unitLost;
+  }
+
+  @Override
+  public void sendForProcessing(Document document, String pipelineName) throws Exception {
+    checkException();
+    sendPendingCreates(pipelineName);
+
+    Event create = new Event(document, null, Event.Type.CREATE);
+    documentProducer.send(
+        new ProducerRecord<>(KafkaUtils.getSourceTopicName(pipelineName, config), document.getId(), document),
+        (metadata, exception) -> {
+          if (exception != null) {
+            log.error("Kafka send failed for document: {}", create.getDocumentId(), exception);
+            sendException.compareAndSet(null, exception);
+          } else {
+            pendingCreates.add(create);
+          }
+        });
+  }
+
+  private void sendPendingCreates(String pipelineName) {
+    Event create;
+    while ((create = pendingCreates.poll()) != null) {
+      String eventTopic = KafkaUtils.getEventTopicName(config, pipelineName, create.getRunId());
+      String docId = create.getDocumentId();
+      eventProducer.send(new ProducerRecord<>(eventTopic, docId, create.toString()), (metadata, exception) -> {
+        if (exception != null) {
+          log.error("Kafka send failed for CREATE event of document: {}", docId, exception);
+          sendException.compareAndSet(null, exception);
+        }
+      });
+    }
+  }
+
+  @Override
+  public void flush(String pipelineName) throws Exception {
+    documentProducer.flush();
+    sendPendingCreates(pipelineName);
+    eventProducer.flush();
+    checkException();
+  }
+
+  private void checkException() throws Exception {
+    Exception e = sendException.get();
+    if (e != null) {
+      throw new Exception("Kafka send failed", e);
+    }
+  }
+
+  @Override
+  public void sendEvent(Event event, String pipelineName) throws Exception {
+    String eventTopic = KafkaUtils.getEventTopicName(config, pipelineName, event.getRunId());
+    eventProducer.send(new ProducerRecord<>(eventTopic, event.getDocumentId(), event.toString())).get();
+  }
+
+  @Override
+  public RunControlTracker getRunControlTracker() {
+    return tracker;
+  }
+
+  @Override
+  public void close() {
+    keepAlive.shutdownNow();
+    synchronized (consumerLock) {
+      KafkaCoordinatorMessenger.closeQuietly(workConsumer, "work consumer");
+    }
+    KafkaCoordinatorMessenger.closeQuietly(documentProducer, "document producer");
+    KafkaCoordinatorMessenger.closeQuietly(eventProducer, "event producer");
+  }
+
+  /**
+   * Called from within poll(), on whichever thread is polling, with consumerLock held.
+   */
+  private class RebalanceListener implements ConsumerRebalanceListener {
+
+    @Override
+    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+      if (heldRecord != null) {
+        workConsumer.pause(partitions);
+      }
+    }
+
+    @Override
+    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+      if (heldRecord != null && partitions.contains(new TopicPartition(heldRecord.topic(), heldRecord.partition()))) {
+        unitLost = true;
+      }
+    }
+
+    @Override
+    public void onPartitionsLost(Collection<TopicPartition> partitions) {
+      onPartitionsRevoked(partitions);
+    }
+  }
+}

@@ -859,6 +859,43 @@ public class RunnerTest {
 
     assertEquals(Runner.RunType.EXTERNAL, runTypeForArgs("-external"));
     assertEquals(Runner.RunType.EXTERNAL, runTypeForArgs("-EXTERNAL"));
+
+    assertEquals(Runner.RunType.DISTRIBUTED_CRAWL, runTypeForArgs("-distributedCrawl"));
+  }
+
+  /**
+   * Verifies that -runId passes the given run ID through unchanged, for any run type.
+   */
+  @Test
+  public void testRunIdCliFlag() throws Exception {
+    runMainWithMockedRunner(new String[] {"-distributedCrawl", "-runId", "Nightly-42"}, mockedRunner ->
+        mockedRunner.verify(() -> Runner.runAndLogResult(any(), eq(Runner.RunType.DISTRIBUTED_CRAWL), eq("Nightly-42"), eq(true))));
+
+    runMainWithMockedRunner(new String[] {"-RUNID", "Nightly-42"}, mockedRunner ->
+        mockedRunner.verify(() -> Runner.runAndLogResult(any(), eq(Runner.RunType.LOCAL), eq("Nightly-42"), eq(true))));
+  }
+
+  /**
+   * Verifies that -resume continues a distributed crawl rather than starting a run, and that -force is passed along.
+   */
+  @Test
+  public void testResumeCliFlags() throws Exception {
+    runMainWithMockedRunner(new String[] {"-resume", "Nightly-42"}, mockedRunner -> {
+      mockedRunner.verify(() -> Runner.resumeAndLogResult(any(), eq("Nightly-42"), eq(false), eq(true)));
+      mockedRunner.verify(() -> Runner.runAndLogResult(any(), any(), anyBoolean()), never());
+    });
+
+    runMainWithMockedRunner(new String[] {"-distributedCrawl", "-resume", "Nightly-42", "-force"}, mockedRunner ->
+        mockedRunner.verify(() -> Runner.resumeAndLogResult(any(), eq("Nightly-42"), eq(true), eq(true))));
+  }
+
+  /**
+   * Verifies that a distributed crawl is refused, before anything is started, when the config is invalid.
+   */
+  @Test
+  public void testResumeWithInvalidConfig() throws Exception {
+    RunResult result = Runner.resumeAndLogResult(ConfigFactory.load("RunnerTest/allBadOtherParents.conf"), "run1", false, false);
+    assertFalse(result.getStatus());
   }
 
   /**
@@ -959,6 +996,7 @@ public class RunnerTest {
         MockedStatic<Runner> mockedRunner = mockStatic(Runner.class, invocation -> {
           switch (invocation.getMethod().getName()) {
             case "runAndLogResult":
+            case "resumeAndLogResult":
               return mockResult;
             case "runInValidationMode":
               return Collections.emptyMap();

@@ -35,6 +35,9 @@ public class TraversalParams {
   // The path to storage to traverse through.
   private final URI uri;
 
+  // Whether to traverse the directories under the path as well.
+  private final boolean recursive;
+
   // FileOptions
   private final boolean getFileContent;
   private final boolean handleArchivedFiles;
@@ -55,8 +58,17 @@ public class TraversalParams {
   private final Map<String, FileHandler> fileHandlers;
 
   public TraversalParams(Config config, URI pathToStorage, String docIdPrefix) {
+    this(config, pathToStorage, docIdPrefix, true);
+  }
+
+  /**
+   * @param recursive Whether the traversal should descend into the directories under the path. When false, only
+   *                  the files directly under the path are visited.
+   */
+  public TraversalParams(Config config, URI pathToStorage, String docIdPrefix, boolean recursive) {
     this.uri = pathToStorage;
     this.docIdPrefix = docIdPrefix;
+    this.recursive = recursive;
 
     Config fileOptions = config.hasPath("fileOptions") ? config.getConfig("fileOptions") : ConfigFactory.empty();
     // file options / derived params
@@ -189,6 +201,10 @@ public class TraversalParams {
 
   public URI getURI() {
     return uri;
+  }
+
+  public boolean isRecursive() {
+    return recursive;
   }
 
   public String getDocIdPrefix() {

@@ -587,4 +587,42 @@ public class LocalStorageClientTest {
 
     localStorageClient.shutdown();
   }
+
+  // A traversal that is not recursive publishes the files directly under the path and nothing below them.
+  @Test
+  public void testTraverseWithoutRecursion() throws Exception {
+    TestMessenger messenger = new TestMessenger();
+    Publisher publisher = new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1");
+    Config connectorConfig = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("excludes", List.of(".*\\.DS_Store$"))));
+
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    TraversalParams params = new TraversalParams(connectorConfig,
+        URI.create("src/test/resources/StorageClientTest/testPublishFilesDefault"), "", false);
+    localStorageClient.init();
+    localStorageClient.traverse(publisher, params);
+
+    List<Document> docs = messenger.getDocsSentForProcessing();
+    assertEquals(4, docs.size());
+    assertTrue(docs.stream().noneMatch(d -> d.getString(FileConnector.FILE_PATH).contains("subdir1")));
+
+    localStorageClient.shutdown();
+  }
+
+  @Test
+  public void testListSubdirectories() throws Exception {
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    URI root = URI.create("src/test/resources/StorageClientTest/testPublishFilesDefault");
+    URI subdir1 = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault/subdir1").toAbsolutePath().toUri();
+
+    TraversalParams params = new TraversalParams(ConfigFactory.empty(), root, "");
+    assertEquals(List.of(subdir1), localStorageClient.listSubdirectories(root, params));
+
+    // a directory with no directories in it, and a file, have no subdirectories
+    assertEquals(List.of(), localStorageClient.listSubdirectories(subdir1, params));
+    assertEquals(List.of(), localStorageClient.listSubdirectories(URI.create(root + "/a.json"), params));
+
+    // directories that the traversal would skip are left out
+    Config skipSubdir1 = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("pathsToSkip", List.of(subdir1.toString()))));
+    assertEquals(List.of(), localStorageClient.listSubdirectories(root, new TraversalParams(skipSubdir1, root, "")));
+  }
 }

@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.List;
 import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -118,6 +119,10 @@ public class S3StorageClient extends BaseStorageClient {
         processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
       });
 
+      if (!params.isRecursive()) {
+        return;
+      }
+
       resp.commonPrefixes().forEach(cp -> {
         URI prefixUri = uriForDirectory(cp.prefix(), params);
         if (!isSkippedDirectory(prefixUri, params)) {
@@ -125,6 +130,22 @@ public class S3StorageClient extends BaseStorageClient {
         }
       });
     });
+  }
+
+  @Override
+  public List<URI> listSubdirectories(URI path, TraversalParams params) {
+    ListObjectsV2Request request = ListObjectsV2Request.builder()
+        .bucket(path.getAuthority())
+        .prefix(startingDirectory(path))
+        .delimiter("/")
+        .maxKeys(maxNumOfPages)
+        .build();
+
+    // the path is in the same bucket as the traversal being split, so its prefixes resolve against the same URI
+    return s3.listObjectsV2Paginator(request).commonPrefixes().stream()
+        .map(cp -> uriForDirectory(cp.prefix(), params))
+        .filter(prefixUri -> !isSkippedDirectory(prefixUri, params))
+        .toList();
   }
 
   private URI uriForDirectory(String prefix, TraversalParams params) {
@@ -167,7 +188,10 @@ public class S3StorageClient extends BaseStorageClient {
   }
 
   private String getStartingDirectory(TraversalParams params) {
-    URI pathURI = params.getURI();
+    return startingDirectory(params.getURI());
+  }
+
+  private static String startingDirectory(URI pathURI) {
     String startingDirectory = Objects.equals(pathURI.getPath(), "/") ? "" : pathURI.getPath();
     if (startingDirectory.startsWith("/")) {
       return startingDirectory.substring(1);

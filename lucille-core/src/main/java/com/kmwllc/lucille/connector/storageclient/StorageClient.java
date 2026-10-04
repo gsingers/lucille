@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -44,6 +45,20 @@ public interface StorageClient {
    * @throws Exception If an error occurs during traversal.
    */
   void traverse(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr) throws Exception;
+
+  /**
+   * Lists the directories directly under the given path, leaving out any that <code>params</code> says to skip.
+   * A traversal of the path that is not recursive, followed by a recursive traversal of each directory returned,
+   * visits the same files as a recursive traversal of the path. Used to split a traversal into parts.
+   *
+   * @param path A URI to a path in storage.
+   * @param params Parameters for the traversal that is being split.
+   * @return URIs of the directories directly under the path. Empty if there are none, or the path is a file.
+   * @throws UnsupportedOperationException If this client cannot list directories or cannot traverse without recursion.
+   */
+  default List<URI> listSubdirectories(URI path, TraversalParams params) throws IOException {
+    throw new UnsupportedOperationException(getClass().getSimpleName() + " cannot list subdirectories.");
+  }
 
   /**
    * Returns whether a traversal of the given parent would also visit the files under the given child, based on this
