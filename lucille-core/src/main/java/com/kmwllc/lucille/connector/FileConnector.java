@@ -5,6 +5,8 @@ import com.kmwllc.lucille.core.Document;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -339,7 +341,8 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     for (URI configured : storageURIs) {
       StorageClient client = storageClientMap.get(clientKeyFor(configured));
 
-      if (client != null && clientKeyFor(configured).equals(clientKeyFor(unitPath)) && isWithin(client, configured, unitPath)) {
+      if (client != null && clientKeyFor(configured).equals(clientKeyFor(unitPath)) && isWithin(client, configured, unitPath)
+          && !isSkipped(client, configured, unitPath)) {
         return unitPath;
       }
     }
@@ -347,15 +350,55 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     throw new ConnectorException("Work unit " + unit.unitId() + " has a path outside this connector's configured paths.");
   }
 
-  // Object storage paths are key prefixes, which a traversal extends without regard to '/'. A traversal of
-  // s3://bucket/data also covers s3://bucket/data-old/, so the planner emits it and it has to be accepted here.
+  // Whether a traversal of the configured path could have been split into a unit for the given path.
   private static boolean isWithin(StorageClient client, URI configured, URI unitPath) {
-    if ("file".equals(clientKeyFor(configured))) {
-      return client.containsPath(configured, unitPath);
+    switch (clientKeyFor(configured)) {
+      case "file":
+        return client.containsPath(configured, unitPath) && isReallyWithin(configured, unitPath);
+      case "s3":
+        // Keys are extended as prefixes, without regard to '/'. A traversal of s3://bucket/data also covers
+        // s3://bucket/data-old/, so the planner emits a unit for it and it has to be accepted here.
+        return Objects.equals(configured.getAuthority(), unitPath.getAuthority())
+            && unitPath.getPath().startsWith(configured.normalize().getPath());
+      default:
+        // paths in other providers are not split, so the only unit there can be is for the configured path itself
+        return unitPath.equals(configured.normalize());
+    }
+  }
+
+  // A path can sit inside the configured one as written and still lead out of it, if one of its directories is a
+  // symbolic link. A traversal does not follow links, so no unit is planned for such a path. Compares where the two
+  // paths actually are; a path that does not exist is not within anything.
+  private static boolean isReallyWithin(URI configured, URI unitPath) {
+    try {
+      return toLocalPath(unitPath).toRealPath().startsWith(toLocalPath(configured).toRealPath());
+    } catch (IOException | RuntimeException e) {
+      return false;
+    }
+  }
+
+  private static Path toLocalPath(URI uri) {
+    return uri.isAbsolute() ? Paths.get(uri) : Paths.get(uri.getPath());
+  }
+
+  // Whether the path is, or lies under, a directory that filterOptions.pathsToSkip excludes from the traversal.
+  // The planner never emits such a path, since a traversal turns back at a skipped directory.
+  private boolean isSkipped(StorageClient client, URI configured, URI unitPath) {
+    for (URI skipped : buildTraversalParams(configured).getPathsToSkip()) {
+      boolean under = "file".equals(clientKeyFor(unitPath))
+          ? "file".equals(clientKeyFor(skipped)) && client.containsPath(skipped, unitPath)
+          : withTrailingSlash(unitPath.toString()).startsWith(withTrailingSlash(skipped.toString()));
+
+      if (under) {
+        return true;
+      }
     }
 
-    return Objects.equals(configured.getAuthority(), unitPath.getAuthority())
-        && unitPath.getPath().startsWith(configured.normalize().getPath());
+    return false;
+  }
+
+  private static String withTrailingSlash(String s) {
+    return s.endsWith("/") ? s : s + "/";
   }
 
   /**

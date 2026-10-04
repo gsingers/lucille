@@ -115,6 +115,11 @@ class KafkaRunControlListener implements Runnable {
   }
 
   private void apply(ConsumerRecord<String, String> record, long seenAtMillis) {
+    // no Coordinator writes a record under such a key, and the tracker should not be made to remember it
+    if (!CrawlConfig.isValidRunId(record.key())) {
+      return;
+    }
+
     try {
       Event event = Event.fromJsonString(record.value());
       int epoch = CrawlConfig.parseMessage(event.getMessage()).path(KafkaRunControl.EPOCH).asInt();

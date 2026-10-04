@@ -205,6 +205,27 @@ public class CoordinatorPublisherTest {
   }
 
   @Test
+  public void testMalformedEventsAreIgnored() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // none of these may throw: an exception here would end the run, and would end every attempt to resume it
+    publisher.handleEvent(new Event("doc1", RUN_ID, null, null));
+    publisher.handleEvent(new Event(null, RUN_ID, null, Event.Type.CREATE));
+    publisher.handleEvent(new Event("connector1", RUN_ID, null, Event.Type.HOOK_DONE));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, null, Event.Type.UNIT_DONE));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, "not json", Event.Type.UNIT_DONE));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, "[1, 2]", Event.Type.UNIT_FAILED));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, "{}", Event.Type.UNIT_DONE));
+    publisher.handleEvent(new Event("connector1/u9", RUN_ID, "not a unit", Event.Type.UNIT_CREATED));
+
+    assertEquals(List.of("connector1/u0"), publisher.outstandingUnitIds());
+    assertFalse(publisher.hasPending());
+    assertNull(publisher.failureReason());
+    assertFalse(publisher.isHookDone(CoordinatorPublisher.HOOK_POST_EXECUTE));
+  }
+
+  @Test
   public void testDocumentsPublishedByCrawlersAreTracked() throws Exception {
     CoordinatorPublisher publisher = publisher(1);
 

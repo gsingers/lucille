@@ -1,12 +1,16 @@
 package com.kmwllc.lucille.core;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import java.io.File;
+import java.nio.file.Files;
 import org.junit.Test;
 
 public class CrawlConfigTest {
@@ -68,13 +72,48 @@ public class CrawlConfigTest {
   @Test
   public void testConnectorConfigHashLeavesOutCredentials() {
     Config one = ConfigFactory.parseString(
-        "name: c1, s3 { accessKeyId: id, secretAccessKey: one }, state { jdbcPassword: one, connectionString: one }");
+        "name: c1, s3 { accessKeyId: one, secretAccessKey: one }, state { jdbcPassword: one, connectionString: one }, "
+            + "apiKey: one, sasToken: one, authHeader: one");
     Config other = ConfigFactory.parseString(
-        "name: c1, s3 { accessKeyId: id, secretAccessKey: other }, state { jdbcPassword: other, connectionString: other }");
+        "name: c1, s3 { accessKeyId: other, secretAccessKey: other }, state { jdbcPassword: other, connectionString: other }, "
+            + "apiKey: other, sasToken: other, authHeader: other");
 
     // Crawlers may be given different credentials than the Coordinator, and a hash that is sent over the network
     // should not let anyone confirm a guess at one
     assertEquals(CrawlConfig.connectorConfigHash(one), CrawlConfig.connectorConfigHash(other));
+  }
+
+  @Test
+  public void testConnectorConfigHashDoesNotDependOnWhereTheConfigWasLoadedFrom() throws Exception {
+    // the same connector, read from files with different names and with the connector on different lines
+    File one = File.createTempFile("one", ".conf");
+    File other = File.createTempFile("other", ".conf");
+    String connector = "name: c1, class: a, paths: [\"s3://bucket/a\", \"s3://bucket/b\"], filterOptions { includes: [\"x\"] }";
+    Files.writeString(one.toPath(), connector);
+    Files.writeString(other.toPath(), "\n\n# moved down\n" + connector);
+
+    assertEquals(CrawlConfig.connectorConfigHash(ConfigFactory.parseFile(one)),
+        CrawlConfig.connectorConfigHash(ConfigFactory.parseFile(other)));
+    one.delete();
+    other.delete();
+  }
+
+  @Test
+  public void testCrawlersNeedTheirOwnConsumerGroup() {
+    assertThrows(IllegalArgumentException.class, () -> new CrawlConfig(ConfigFactory.parseString(
+        "kafka.consumerGroupId: shared, crawl.consumerGroupId: shared")));
+  }
+
+  @Test
+  public void testRunIdValidation() {
+    assertTrue(CrawlConfig.isValidRunId("550e8400-e29b-41d4-a716-446655440000"));
+    assertTrue(CrawlConfig.isValidRunId("Nightly_2026.10.04"));
+    assertFalse(CrawlConfig.isValidRunId(null));
+    assertFalse(CrawlConfig.isValidRunId(""));
+    assertFalse(CrawlConfig.isValidRunId("a/b"));
+    assertFalse(CrawlConfig.isValidRunId("a b"));
+    assertFalse(CrawlConfig.isValidRunId("a\nb"));
+    assertFalse(CrawlConfig.isValidRunId("x".repeat(129)));
   }
 
   @Test

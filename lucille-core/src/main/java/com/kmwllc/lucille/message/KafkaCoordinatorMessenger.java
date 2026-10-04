@@ -148,8 +148,17 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
       eventConsumer.poll(KafkaUtils.POLL_INTERVAL).forEach(polledEvents::add);
     }
 
-    ConsumerRecord<String, String> record = polledEvents.poll();
-    return record == null ? null : Event.fromJsonString(record.value());
+    // A record that cannot be read is skipped. If it were allowed to fail the run, the run could never be resumed
+    // either, since every replay of the topic would meet the same record.
+    ConsumerRecord<String, String> record;
+    while ((record = polledEvents.poll()) != null) {
+      try {
+        return Event.fromJsonString(record.value());
+      } catch (Exception e) {
+        log.warn("Skipping unreadable event at offset {} of {}.", record.offset(), record.topic(), e);
+      }
+    }
+    return null;
   }
 
   @Override

@@ -73,7 +73,9 @@ java -Dconfig.file=<CONFIG> -cp '...' com.kmwllc.lucille.core.Runner -resume <ru
 
 Everything the Coordinator decides is written to the run's event topic before it takes effect, so the new Coordinator rebuilds its state by reading that topic from the beginning. Connectors that had completed are skipped, lifecycle methods that had returned are not called again, and units that were done are not executed again. Units that were outstanding are dispatched again.
 
-Each Coordinator of a run has an **epoch**, one higher than the last, which it stamps on its units and heartbeats. Crawlers discard units from an older epoch than the newest they have heard from. This is what makes it safe to dispatch the outstanding units again without knowing what became of the earlier copies, and it means a Coordinator that was wrongly presumed dead cannot keep work alive once another has taken over. `-resume` refuses to take over a run whose heartbeat is recent unless `-force` is given.
+Each Coordinator of a run has an **epoch**, one higher than the last, which it stamps on its units and heartbeats. Crawlers discard units from an older epoch than the newest they have heard from. This is what makes it safe to dispatch the outstanding units again without knowing what became of the earlier copies, and it means a Coordinator that was wrongly presumed dead cannot keep work alive once another has taken over. Such a Coordinator notices the newer epoch at its next heartbeat and stops, reporting its run as failed. `-resume` refuses to take over a run whose heartbeat is recent unless `-force` is given.
+
+A run can be resumed for a week after its last heartbeat. After that its record is removed from the control topic.
 
 A lifecycle method that was interrupted part way is called again by the resuming Coordinator, so `preExecute()` and `postExecute()` should be safe to repeat.
 
@@ -126,10 +128,25 @@ crawl {
 - **Units should take minutes, not hours.** A unit is the smallest thing that can be retried or moved to another Crawler. Choose a `depth` that yields many more units than Crawler threads, so that one unusually large directory does not leave the rest idle.
 - **Crawlers have their own consumer group.** `crawl.consumerGroupId` must differ from `kafka.consumerGroupId`. Sharing a group would make every Crawler that joins or leaves interrupt the Workers.
 
+## Security
+
+A distributed crawl adds two shared topics, and what is written to them directs what Crawlers read. Treat write access to them as you would treat access to the Crawlers' credentials.
+
+- **Restrict who can write to the work and control topics.** With Kafka ACLs, only Coordinators need to write to `crawl.workTopic` and `crawl.controlTopic`; Crawlers only read them. Anyone who can write to the control topic can stop any run, by cancelling it or by announcing a higher epoch for it. The run's Coordinator reports the run as failed when that happens.
+- **A unit cannot widen what a Crawler reads.** A Crawler builds Connectors only from its own config file. The unit supplies a location. `FileConnector` accepts it only if it lies inside the paths that Connector was configured with, is not under a directory in `pathsToSkip`, and is not reached through a symbolic link. `SequenceConnector` accepts only a range inside the configured sequence.
+- **Units that do not belong to a live run are discarded.** That covers a unit whose run no Coordinator has announced, one that names a pipeline the Crawler does not have, and one whose run ID could not be part of a topic name. A Crawler reports nothing about such a unit, so it cannot be made to write to a topic of someone else's choosing.
+- **A run's event topic is as sensitive as it already was.** Anyone who can write to it can make a run finish early, in any mode, by reporting Documents or units as done. Because `FileConnector` expires files that no unit reported seeing, a run that is made to finish early can publish tombstones for files that were never reached. The event topic should be writable only by Lucille's own components.
+- **A unit's failure message is shared.** When a unit fails, the exception's class and message, cut to 500 characters, are sent to the Coordinator and appear in its log and in the run summary. A Connector whose exceptions quote credentials would expose them there.
+- **Credentials stay in config.** Units, Events and control records carry no credentials. The config hash carried by each unit leaves out any setting whose name suggests a credential.
+- **Run IDs** given with `-runId` may contain letters, digits, `.`, `_` and `-`, up to 128 characters.
+
 ## Things to Know
 
 - **Document IDs must be stable.** A unit can be executed more than once. A Connector that generates random IDs would index a second copy each time.
 - **Adding or removing a Crawler can repeat a unit.** When Crawlers join or leave, Kafka may move a partition from one Crawler to another. A unit that was executing on it is abandoned by the first Crawler and executed from the start by the second.
+- **A dead Crawler's unit waits for Kafka to notice.** A Crawler that is killed outright is removed from its consumer group only when its session times out, 45 seconds by default (`session.timeout.ms`, settable under `kafka.consumer`). Its unit is delivered to another Crawler after that. A Crawler that is stopped with SIGINT or SIGTERM finishes its unit and leaves the group at once.
+- **The work and control topics are created with one replica.** Set `crawl.topicReplicationFactor`, or create the topics yourself, for a cluster where losing a broker should not lose them.
+- **Start Crawlers before the run.** A Crawler receives nothing until it has joined its consumer group, which can take tens of seconds when other members have recently come or gone.
 - **A unit that hangs is not detected.** A Crawler that is alive but stuck on a unit keeps it. The run then waits until `runner.connectorTimeout`.
 - **`FileConnector` state needs a shared database.** A partitioned `FileConnector` with `state` enabled requires `state.connectionString` to name a database that every Crawler and the Coordinator can reach; the embedded default is a file in one process's working directory. Expiry and `sendTombstones` are applied by the Coordinator after all units are done, since no single unit sees every file.
 - **Crawlers and the Coordinator must have the same Connector config.** Each unit carries a hash of the Connector's config, and a Crawler whose own config hashes differently fails the unit rather than crawl something other than what was planned. Credentials are left out of the hash, so they may differ between machines.

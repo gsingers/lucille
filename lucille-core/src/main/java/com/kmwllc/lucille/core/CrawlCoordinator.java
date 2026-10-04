@@ -43,6 +43,7 @@ public class CrawlCoordinator {
   private int epoch;
   // true from when this Coordinator takes charge of the run until it announces the end of the run
   private volatile boolean runActive = false;
+  private volatile CoordinatorPublisher currentPublisher;
 
   /**
    * Creates a Coordinator that communicates through Kafka.
@@ -109,6 +110,10 @@ public class CrawlCoordinator {
    * Decides the epoch for this Coordinator, or returns a message explaining why it must not handle the run.
    */
   private String claimRun(boolean resume, boolean force) throws Exception {
+    if (!CrawlConfig.isValidRunId(runId)) {
+      return "Run ID " + runId + " cannot be used: it may contain only letters, digits, '.', '_' and '-', up to 128 of them.";
+    }
+
     RunControl.Status previous = runControl.latest(runId);
 
     if (!resume) {
@@ -128,6 +133,10 @@ public class CrawlCoordinator {
           + " ms ago and may still be running. Use -force to resume regardless.";
     }
 
+    if (previous.epoch() < 1 || previous.epoch() == Integer.MAX_VALUE) {
+      return "Cannot resume run " + runId + ": its last control record has the impossible epoch " + previous.epoch() + ".";
+    }
+
     epoch = previous.epoch() + 1;
     log.info("Resuming run {} as epoch {}.", runId, epoch);
     return null;
@@ -140,7 +149,7 @@ public class CrawlCoordinator {
 
     executor.scheduleAtFixedRate(() -> {
       try {
-        if (runActive) {
+        if (runActive && !supersededOrCancelled()) {
           runControl.heartbeat(runId, epoch, configHash);
         }
       } catch (Exception e) {
@@ -149,6 +158,30 @@ public class CrawlCoordinator {
     }, crawlConfig.heartbeatSecs, crawlConfig.heartbeatSecs, TimeUnit.SECONDS);
 
     return executor;
+  }
+
+  /**
+   * Checks whether the run has been cancelled, or resumed by another Coordinator, since this one took charge of it.
+   * If so, Crawlers are already discarding this Coordinator's units, so it stops instead of waiting for them.
+   */
+  private boolean supersededOrCancelled() throws Exception {
+    RunControl.Status latest = runControl.latest(runId);
+    if (latest == null || latest.epoch() < epoch || (latest.epoch() == epoch && !latest.cancelled())) {
+      return false;
+    }
+
+    String reason = latest.epoch() > epoch
+        ? "Run was taken over by another Coordinator (epoch " + latest.epoch() + ")."
+        : "Run was cancelled.";
+    log.error(reason);
+    // nothing more is announced for the run: it now belongs to whoever cancelled it or took it over
+    runActive = false;
+
+    CoordinatorPublisher publisher = currentPublisher;
+    if (publisher != null) {
+      publisher.fail(reason);
+    }
+    return true;
   }
 
   // Tells Crawlers to discard whatever units of this run they still hold or receive. A later resume starts a new epoch.
@@ -187,11 +220,16 @@ public class CrawlCoordinator {
     try {
       String metricsPrefix = runId + "." + connector.getName() + "." + connector.getPipelineName();
       publisher = new CoordinatorPublisher(config, messengerFactory.get(), runId, connector, metricsPrefix, epoch);
+      currentPublisher = publisher;
+      if (!runActive) {
+        return new ConnectorResult(connector, publisher, false, "Run was cancelled or taken over by another Coordinator.");
+      }
       return runConnector(SingleUnitAdapter.wrap(connector), publisher, resume);
     } catch (Exception e) {
       log.error("Connector " + connector.getName() + " failed.", e);
       return new ConnectorResult(connector, publisher, false, String.valueOf(e.getMessage()));
     } finally {
+      currentPublisher = null;
       close(connector, "connector");
       close(publisher, "publisher");
     }

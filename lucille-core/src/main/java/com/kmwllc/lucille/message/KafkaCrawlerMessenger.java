@@ -143,6 +143,9 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
         return null;
       }
 
+      // A unit that failed or was abandoned can leave sends in flight. They are allowed to finish first, so that
+      // their outcome is not taken for this unit's.
+      documentProducer.flush();
       heldRecord = record;
       unitLost = false;
       sendException.set(null);

@@ -14,6 +14,7 @@ import com.kmwllc.lucille.message.TestMessenger;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -23,6 +24,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
@@ -219,6 +221,8 @@ public class PartitionedFileConnectorTest {
         outside.toUri().toString(),
         // a path that begins inside the configured path and climbs out of it
         root.toUri() + "../outside/",
+        // the same, with the dots written so that normalizing the URI does not remove them
+        root.toUri() + "%2e%2e/outside/",
         // a different storage provider than the configured path
         "s3://bucket/key",
         "not a uri");
@@ -231,6 +235,54 @@ public class PartitionedFileConnectorTest {
       assertThrows(badPath, ConnectorException.class,
           () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1")));
       assertTrue(badPath, messenger.getDocsSentForProcessing().isEmpty());
+      connector.close();
+    }
+  }
+
+  @Test
+  public void testUnitUnderSkippedDirectoryIsRefused() throws Exception {
+    Config config = config("""
+        partitioning { depth: 1 }
+        filterOptions { pathsToSkip: ["%s"] }
+        """.formatted(root.resolve("a").toUri()));
+
+    // the traversal turns back at a/, so nothing under it is ever planned, however deep
+    for (Path skipped : List.of(root.resolve("a"), root.resolve("a/deep"), root.resolve("a/a1.txt"))) {
+      TestMessenger messenger = new TestMessenger();
+      FileConnector connector = new FileConnector(config);
+      WorkUnit unit = unit("bad", WorkUnit.newPayload().put("path", skipped.toUri().toString()).put("recursive", true));
+
+      assertThrows(skipped.toString(), ConnectorException.class,
+          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1")));
+      assertTrue(messenger.getDocsSentForProcessing().isEmpty());
+      connector.close();
+    }
+  }
+
+  @Test
+  public void testUnitReachedThroughSymbolicLinkIsRefused() throws Exception {
+    Config config = config("partitioning { depth: 1 }");
+    Path outside = temp.newFolder("elsewhere").toPath().toRealPath();
+    Files.createDirectories(outside.resolve("sub"));
+    Files.writeString(outside.resolve("sub/secret.txt"), "not to be crawled");
+    try {
+      Files.createSymbolicLink(root.resolve("link"), outside);
+    } catch (UnsupportedOperationException | IOException e) {
+      Assume.assumeNoException("symbolic links are not available here", e);
+    }
+
+    // a traversal does not follow root/link, so the planner offers no unit for anything beyond it
+    assertTrue(plan(config).keySet().stream().noneMatch(key -> key.contains("link")));
+
+    // root/link/sub is inside the configured path as written, but not in fact
+    for (String beyondLink : List.of("link/sub", "link/sub/secret.txt", "link")) {
+      TestMessenger messenger = new TestMessenger();
+      FileConnector connector = new FileConnector(config);
+      WorkUnit unit = unit("bad", WorkUnit.newPayload().put("path", root.toUri() + beyondLink).put("recursive", true));
+
+      assertThrows(beyondLink, ConnectorException.class,
+          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1")));
+      assertTrue(messenger.getDocsSentForProcessing().isEmpty());
       connector.close();
     }
   }

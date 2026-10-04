@@ -37,8 +37,8 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
   public static final Set<String> failOnce = ConcurrentHashMap.newKeySet();
   /** Units that throw an exception every time they are executed. */
   public static final Set<String> failAlways = ConcurrentHashMap.newKeySet();
-  /** Units that, the first time they are executed, kill the thread executing them after publishing one Document. */
-  public static final Set<String> dieOnce = ConcurrentHashMap.newKeySet();
+  /** Units that, the first time they are executed, throw an Error after publishing one Document. */
+  public static final Set<String> errorOnce = ConcurrentHashMap.newKeySet();
   /**
    * Once this many units have been started, each unit started after them waits for {@link #gate} to open before
    * publishing anything. Negative for no limit. Counted across units rather than naming them, because which units
@@ -68,7 +68,7 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     executions.clear();
     failOnce.clear();
     failAlways.clear();
-    dieOnce.clear();
+    errorOnce.clear();
     gateAfter = -1;
     gate = new CountDownLatch(0);
     started.set(0);
@@ -122,9 +122,9 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       for (int i = 0; i < docsPerUnit; i++) {
         publisher.publish(Document.create(createDocId(unitKey + "-" + i)));
 
-        if (execution == 1 && dieOnce.contains(unitKey)) {
-          // an Error, so that nothing between here and the top of the Crawler's thread catches it
-          throw new Error("Scripted death while executing " + unitKey);
+        if (execution == 1 && errorOnce.contains(unitKey)) {
+          // an Error rather than an Exception, as a missing class or a stack overflow in a connector would be
+          throw new NoClassDefFoundError("Scripted error while executing " + unitKey);
         }
       }
       completed.add(unitKey);

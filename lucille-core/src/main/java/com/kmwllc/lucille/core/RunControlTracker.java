@@ -77,7 +77,7 @@ public class RunControlTracker {
 
   /**
    * Like {@link #decide}, but gives a heartbeat that has not arrived yet up to the given time to do so. A unit can
-   * reach a Crawler before the Crawler has read its run's first heartbeat. Returns ORPHANED if none arrives.
+   * reach a Crawler before the Crawler has read its run's first heartbeat. Returns UNKNOWN if none arrives.
    */
   public Decision awaitDecision(String runId, int unitEpoch, long timeoutMillis) throws InterruptedException {
     long deadline = System.currentTimeMillis() + timeoutMillis;
@@ -88,7 +88,7 @@ public class RunControlTracker {
       decision = decide(runId, unitEpoch);
     }
 
-    return decision == Decision.UNKNOWN ? Decision.ORPHANED : decision;
+    return decision;
   }
 
   /** Forgets runs that have been cancelled or silent for longer than the given age. */

@@ -83,7 +83,7 @@ public class RunControlTrackerTest {
 
   @Test
   public void testAwaitDecisionGivesUpOnUnknownRun() throws Exception {
-    assertEquals(Decision.ORPHANED, tracker.awaitDecision("run1", 1, 150));
+    assertEquals(Decision.UNKNOWN, tracker.awaitDecision("run1", 1, 150));
 
     tracker.onHeartbeat("run1", 1, clock.get());
     assertEquals(Decision.RUN, tracker.awaitDecision("run1", 1, 150));

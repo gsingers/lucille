@@ -120,13 +120,16 @@ public class LocalCrawlMessenger implements CoordinatorMessenger, CrawlerMesseng
 
   @Override
   public void heartbeat(String runId, int epoch, String configHash) {
-    latestControl.put(runId, new Status(false, epoch, configHash, 0));
+    // as on the control topic, the highest epoch counts, and a cancellation is final within its epoch
+    latestControl.merge(runId, new Status(false, epoch, configHash, 0), (current, update) ->
+        update.epoch() > current.epoch() || (update.epoch() == current.epoch() && !current.cancelled()) ? update : current);
     tracker.onHeartbeat(runId, epoch, System.currentTimeMillis());
   }
 
   @Override
   public void cancel(String runId, int epoch, String configHash, String reason) {
-    latestControl.put(runId, new Status(true, epoch, configHash, 0));
+    latestControl.merge(runId, new Status(true, epoch, configHash, 0),
+        (current, update) -> update.epoch() >= current.epoch() ? update : current);
     tracker.onCancel(runId, epoch);
   }
 

@@ -7,6 +7,9 @@ import com.typesafe.config.Config;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -25,9 +28,15 @@ public class KafkaRunControl implements RunControl {
   static final String CONFIG_HASH = "configHash";
   static final String REASON = "reason";
 
+  private static final Logger log = LoggerFactory.getLogger(KafkaRunControl.class);
+
   private final Config config;
   private final String controlTopic;
   private final KafkaProducer<String, String> producer;
+
+  // An instance serves one run, so what has been read about that run is kept between calls to latest().
+  private KafkaConsumer<String, String> reader;
+  private Status latestRecord;
 
   public KafkaRunControl(Config config) throws Exception {
     CrawlConfig crawlConfig = new CrawlConfig(config);
@@ -44,44 +53,64 @@ public class KafkaRunControl implements RunControl {
 
   /**
    * Describes the control topic. Segments are rolled often so that compaction, which skips the newest segment, keeps
-   * the topic down to roughly one record per run.
+   * the topic down to roughly one record per run. Records are also deleted after a week, so that the topic does not
+   * keep a record of every run there has ever been; a run that has been silent for that long can no longer be resumed.
    */
   static NewTopic newControlTopic(CrawlConfig crawlConfig) {
     return new NewTopic(crawlConfig.controlTopic, 1, crawlConfig.topicReplicationFactor)
         .configs(Map.of(
-            TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT,
+            TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT + "," + TopicConfig.CLEANUP_POLICY_DELETE,
+            TopicConfig.RETENTION_MS_CONFIG, String.valueOf(TimeUnit.DAYS.toMillis(7)),
             TopicConfig.SEGMENT_MS_CONFIG, "600000",
             TopicConfig.MIN_CLEANABLE_DIRTY_RATIO_CONFIG, "0.1"));
   }
 
+  /**
+   * Reads whatever has been added to the control topic since the last call and returns what it now says about the
+   * run. The record that counts is the one from the highest epoch, so a Coordinator that has been superseded cannot
+   * make the run appear to be its own again; within an epoch, a cancellation is final.
+   */
   @Override
-  public Status latest(String runId) throws Exception {
-    ConsumerRecord<String, String> latest = null;
+  public synchronized Status latest(String runId) throws Exception {
+    TopicPartition partition = new TopicPartition(controlTopic, 0);
 
-    try (KafkaConsumer<String, String> consumer =
-        KafkaUtils.createUngroupedConsumer(config, "com.kmwllc.lucille-run-control-reader", 500)) {
-      List<TopicPartition> partitions = List.of(new TopicPartition(controlTopic, 0));
-      consumer.assign(partitions);
-      consumer.seekToBeginning(partitions);
-      long end = consumer.endOffsets(partitions).get(partitions.get(0));
+    if (reader == null) {
+      reader = KafkaUtils.createUngroupedConsumer(config, "com.kmwllc.lucille-run-control-reader", 500);
+      reader.assign(List.of(partition));
+      reader.seekToBeginning(List.of(partition));
+    }
 
-      while (consumer.position(partitions.get(0)) < end) {
-        for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(1))) {
-          if (runId.equals(record.key())) {
-            latest = record;
-          }
+    long end = reader.endOffsets(List.of(partition)).get(partition);
+    while (reader.position(partition) < end) {
+      for (ConsumerRecord<String, String> record : reader.poll(Duration.ofSeconds(1))) {
+        if (runId.equals(record.key())) {
+          apply(record);
         }
       }
     }
 
-    if (latest == null) {
-      return null;
+    return latestRecord == null ? null : new Status(latestRecord.cancelled(), latestRecord.epoch(),
+        latestRecord.configHash(), System.currentTimeMillis() - latestRecord.ageMillis());
+  }
+
+  // latestRecord holds the time the record was written in place of its age
+  private void apply(ConsumerRecord<String, String> record) {
+    Status status;
+    try {
+      Event event = Event.fromJsonString(record.value());
+      ObjectNode message = CrawlConfig.parseMessage(event.getMessage());
+      status = new Status(Event.Type.CANCEL.equals(event.getType()), message.path(EPOCH).asInt(),
+          message.path(CONFIG_HASH).asText(), record.timestamp());
+    } catch (Exception e) {
+      log.warn("Ignoring unreadable record on control topic at offset {}.", record.offset(), e);
+      return;
     }
 
-    Event event = Event.fromJsonString(latest.value());
-    ObjectNode message = CrawlConfig.parseMessage(event.getMessage());
-    return new Status(Event.Type.CANCEL.equals(event.getType()), message.path(EPOCH).asInt(),
-        message.path(CONFIG_HASH).asText(), System.currentTimeMillis() - latest.timestamp());
+    boolean supersedes = latestRecord == null || status.epoch() > latestRecord.epoch()
+        || (status.epoch() == latestRecord.epoch() && !latestRecord.cancelled());
+    if (supersedes) {
+      latestRecord = status;
+    }
   }
 
   @Override
@@ -101,7 +130,8 @@ public class KafkaRunControl implements RunControl {
   }
 
   @Override
-  public void close() {
+  public synchronized void close() {
     KafkaCoordinatorMessenger.closeQuietly(producer, "control producer");
+    KafkaCoordinatorMessenger.closeQuietly(reader, "control reader");
   }
 }

@@ -13,7 +13,9 @@ import com.kmwllc.lucille.util.LogUtils;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.lang.reflect.Constructor;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -31,11 +33,13 @@ class Crawler implements Runnable {
 
   private static final Logger log = LoggerFactory.getLogger(Crawler.class);
   private static final long ERROR_PAUSE_MILLIS = 1000;
+  private static final int MAX_ERROR_LENGTH = 500;
 
   private final Config config;
   private final CrawlerMessenger messenger;
   private final String crawlerName;
-  private final long orphanTimeoutMillis;
+  private final long heartbeatWaitMillis;
+  private final Set<String> pipelineNames;
 
   private final Timer unitTimer;
   private final com.codahale.metrics.Meter docMeter;
@@ -53,7 +57,13 @@ class Crawler implements Runnable {
     this.config = config;
     this.messenger = messenger;
     this.crawlerName = crawlerName;
-    this.orphanTimeoutMillis = TimeUnit.SECONDS.toMillis(new CrawlConfig(config).orphanTimeoutSecs);
+    // A unit can arrive just ahead of the first heartbeat of its run or epoch, so the heartbeat is given a few periods
+    // to turn up. No longer: a unit for a run that does not exist would hold up the units behind it for that time.
+    CrawlConfig crawlConfig = new CrawlConfig(config);
+    this.heartbeatWaitMillis =
+        TimeUnit.SECONDS.toMillis(Math.min(crawlConfig.orphanTimeoutSecs, 3L * crawlConfig.heartbeatSecs));
+    this.pipelineNames = config.getConfigList("pipelines").stream()
+        .map(pipeline -> pipeline.getString("name")).collect(Collectors.toSet());
 
     MetricRegistry metrics = SharedMetricRegistries.getOrCreate(LogUtils.METRICS_REG);
     this.unitTimer = metrics.timer(METRICS_PREFIX + ".unit.duration");
@@ -122,7 +132,17 @@ class Crawler implements Runnable {
    * Executes the unit if its run is alive, tells the Coordinator how it went, and acknowledges it.
    */
   private void handleUnit(WorkUnit unit) throws Exception {
-    Decision decision = messenger.getRunControlTracker().awaitDecision(unit.runId(), unit.epoch(), orphanTimeoutMillis);
+    // The unit's run ID and pipeline name decide which topic this Crawler reports to. Units arrive over the network,
+    // so both are checked before anything is sent anywhere on the unit's behalf.
+    if (!CrawlConfig.isValidRunId(unit.runId()) || !pipelineNames.contains(unit.pipelineName())) {
+      log.error("Discarding unit {}: its run ID is malformed or its pipeline {} is not in this Crawler's config.",
+          unit.unitId(), unit.pipelineName());
+      abandonedUnits.inc();
+      messenger.ackWorkUnit();
+      return;
+    }
+
+    Decision decision = messenger.getRunControlTracker().awaitDecision(unit.runId(), unit.epoch(), heartbeatWaitMillis);
 
     if (decision != Decision.RUN) {
       abandon(unit, decision);
@@ -133,15 +153,19 @@ class Crawler implements Runnable {
     Timer.Context timing = unitTimer.time();
     CrawlerPublisher publisher = null;
     String error = null;
+    VirtualMachineError fatal = null;
 
     try {
       PartitionableConnector connector = connectorFor(unit);
       publisher = new CrawlerPublisher(messenger, unit, connector.getPipelineName(), connector.requiresCollapsingPublisher());
       connector.executeUnit(unit, publisher);
       publisher.flush();
-    } catch (Exception e) {
-      log.error("Unit {} failed.", unit.unitId(), e);
-      error = String.valueOf(e.getMessage());
+    } catch (Throwable t) {
+      // Errors are caught as well as Exceptions so that the failure is reported and counted against the unit's
+      // attempts. A unit that killed its Crawler without a report would be delivered to the next one, and the next.
+      log.error("Unit {} failed.", unit.unitId(), t);
+      error = describe(t);
+      fatal = t instanceof VirtualMachineError ? (VirtualMachineError) t : null;
       // a connector that failed part way through may be in no state to execute another unit
       closeCachedConnector();
     }
@@ -167,6 +191,21 @@ class Crawler implements Runnable {
     }
 
     messenger.ackWorkUnit();
+
+    // the JVM is out of memory or otherwise broken; this thread should not take another unit
+    if (fatal != null) {
+      throw fatal;
+    }
+  }
+
+  /**
+   * Describes a failure for the Coordinator. The text is written to Kafka and to the Coordinator's log, so it is
+   * kept short and on one line; the full exception is in this Crawler's own log.
+   */
+  private static String describe(Throwable t) {
+    String text = t.getClass().getSimpleName() + ": " + t.getMessage();
+    text = text.replaceAll("\\p{Cntrl}", " ");
+    return text.length() > MAX_ERROR_LENGTH ? text.substring(0, MAX_ERROR_LENGTH) + "..." : text;
   }
 
   /**
@@ -178,9 +217,16 @@ class Crawler implements Runnable {
     log.info("Abandoning unit {}: run is {}.", unit.unitId(), reason);
     abandonedUnits.inc();
 
+    // Nothing is reported for a run this Crawler has never heard from: there may be no such run, and no topic to
+    // report to. And if the report cannot be sent, the unit is given up all the same. Holding on to it would block
+    // every unit behind it, and a Coordinator that resumes the run dispatches its outstanding units again anyway.
     if (reason == Decision.ORPHANED) {
-      ObjectNode message = unitMessage(unit).put("error", "Abandoned: no heartbeat from the run's Coordinator.");
-      sendUnitEvent(unit, message, Event.Type.UNIT_FAILED);
+      try {
+        ObjectNode message = unitMessage(unit).put("error", "Abandoned: no heartbeat from the run's Coordinator.");
+        sendUnitEvent(unit, message, Event.Type.UNIT_FAILED);
+      } catch (Exception e) {
+        log.warn("Could not report that unit {} was abandoned.", unit.unitId(), e);
+      }
     }
 
     messenger.ackWorkUnit();
@@ -242,15 +288,19 @@ class Crawler implements Runnable {
     CrawlerPool crawlerPool = new CrawlerPool(config, CrawlerMessengerFactory.getKafkaFactory(config));
     crawlerPool.start();
 
-    Signal.handle(new Signal("INT"), signal -> {
-      crawlerPool.stop();
-      log.info("Crawlers shutting down");
-      try {
-        crawlerPool.join();
-      } catch (InterruptedException e) {
-        log.error("Interrupted", e);
-      }
-      System.exit(0);
-    });
+    // TERM is handled as well as INT because it is what a container runtime sends. A Crawler that exits without
+    // leaving its consumer group keeps its unit from other Crawlers until its session times out.
+    for (String signalName : new String[] {"INT", "TERM"}) {
+      Signal.handle(new Signal(signalName), signal -> {
+        crawlerPool.stop();
+        log.info("Crawlers shutting down");
+        try {
+          crawlerPool.join();
+        } catch (InterruptedException e) {
+          log.error("Interrupted", e);
+        }
+        System.exit(0);
+      });
+    }
   }
 }

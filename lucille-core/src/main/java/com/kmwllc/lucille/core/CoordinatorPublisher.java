@@ -32,6 +32,7 @@ public class CoordinatorPublisher extends PublisherImpl {
   public static final String HOOK_PREPARE_RUN = "prepareRun";
   public static final String HOOK_FINALIZE_RUN = "finalizeRun";
   public static final String HOOK_POST_EXECUTE = "postExecute";
+  private static final Set<String> HOOKS = Set.of(HOOK_PRE_EXECUTE, HOOK_PREPARE_RUN, HOOK_FINALIZE_RUN, HOOK_POST_EXECUTE);
 
   private static final Logger log = LoggerFactory.getLogger(CoordinatorPublisher.class);
 
@@ -205,23 +206,40 @@ public class CoordinatorPublisher extends PublisherImpl {
     return failure;
   }
 
+  /**
+   * Makes waitForCompletion() stop waiting and report the connector as failed, for a reason found outside this class.
+   */
+  public void fail(String reason) {
+    if (failure == null) {
+      failure = reason;
+    }
+  }
+
   @Override
   public void handleEvent(Event event) {
-    if (!runId.equals(event.getRunId())) {
+    // Events arrive over the network. One that is for another run, or that is missing what this method needs, is
+    // ignored instead of being allowed to end the run with an exception.
+    if (!runId.equals(event.getRunId()) || event.getType() == null || event.getDocumentId() == null) {
       return;
     }
 
     switch (event.getType()) {
-      case UNIT_CREATED -> handleUnitCreated(event);
       case UNIT_DONE -> handleUnitDone(event);
       case UNIT_FAILED -> handleUnitFailed(event);
+      // The next three record what a Coordinator decided. This Coordinator knows its own decisions, so it only takes
+      // them from the log when replaying an earlier Coordinator's. Otherwise they are its own Events coming back.
+      case UNIT_CREATED -> {
+        if (replaying) {
+          handleUnitCreated(event);
+        }
+      }
       case PLANNING_DONE -> {
-        if (connectorName.equals(event.getDocumentId())) {
+        if (replaying && connectorName.equals(event.getDocumentId())) {
           planningDone = true;
         }
       }
       case HOOK_DONE -> {
-        if (connectorName.equals(event.getDocumentId())) {
+        if (replaying && connectorName.equals(event.getDocumentId()) && HOOKS.contains(String.valueOf(event.getMessage()))) {
           hooksDone.add(event.getMessage());
         }
       }
@@ -230,8 +248,6 @@ public class CoordinatorPublisher extends PublisherImpl {
     }
   }
 
-  // The Coordinator reads back the UNIT_CREATED Events it wrote itself, which changes nothing. They matter when
-  // replaying, where they are the only record of the units an earlier Coordinator dispatched.
   private void handleUnitCreated(Event event) {
     WorkUnit unit;
     try {

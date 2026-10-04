@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kmwllc.lucille.core.spec.Spec;
 import com.kmwllc.lucille.core.spec.SpecBuilder;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigRenderOptions;
 import com.typesafe.config.ConfigValue;
 import com.typesafe.config.ConfigValueFactory;
 import java.nio.charset.StandardCharsets;
@@ -44,9 +45,20 @@ public final class CrawlConfig {
 
   // Config keys whose values are left out of the config hash, so that a hash published to Kafka cannot be used to
   // confirm a guess at a credential.
-  private static final Pattern SECRET_KEY = Pattern.compile("(?i).*(password|secret|token|accountkey|connectionstring|credential).*");
+  private static final Pattern SECRET_KEY = Pattern.compile(
+      "(?i).*(password|passphrase|pwd|secret|token|key|credential|auth|jaas|sas|connectionstring).*");
+
+  // A run ID becomes part of a Kafka topic name, which allows only these characters and at most 249 of them in all.
+  private static final Pattern RUN_ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
+
+  /**
+   * Returns whether the given run ID can be used for a distributed crawl.
+   */
+  public static boolean isValidRunId(String runId) {
+    return runId != null && RUN_ID.matcher(runId).matches();
+  }
 
   public final String workTopic;
   public final int workTopicPartitions;
@@ -73,6 +85,11 @@ public final class CrawlConfig {
 
     if (orphanTimeoutSecs <= heartbeatSecs) {
       throw new IllegalArgumentException("crawl.orphanTimeoutSecs must be greater than crawl.heartbeatSecs.");
+    }
+
+    // In one group, every Crawler that joined or left would interrupt the Workers, and the reverse.
+    if (config.hasPath("kafka.consumerGroupId") && consumerGroupId.equals(config.getString("kafka.consumerGroupId"))) {
+      throw new IllegalArgumentException("crawl.consumerGroupId must differ from kafka.consumerGroupId.");
     }
   }
 
@@ -112,7 +129,8 @@ public final class CrawlConfig {
 
     for (Map.Entry<String, ConfigValue> entry : connectorConfig.entrySet()) {
       if (!SECRET_KEY.matcher(entry.getKey()).matches()) {
-        entries.put(entry.getKey(), entry.getValue().render());
+        // rendered concisely, as the default rendering includes where in which file each value came from
+        entries.put(entry.getKey(), entry.getValue().render(ConfigRenderOptions.concise()));
       }
     }
 

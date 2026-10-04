@@ -3,6 +3,7 @@ package com.kmwllc.lucille.core;
 import static com.kmwllc.lucille.core.DistributedCrawlTest.numSucceeded;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.kmwllc.lucille.connector.ScriptedPartitionedConnector;
@@ -10,6 +11,7 @@ import com.kmwllc.lucille.indexer.IndexerFactory;
 import com.kmwllc.lucille.message.CrawlerMessengerFactory;
 import com.kmwllc.lucille.message.IndexerMessengerFactory;
 import com.kmwllc.lucille.message.KafkaCoordinatorMessenger;
+import com.kmwllc.lucille.message.KafkaCrawlerMessenger;
 import com.kmwllc.lucille.message.KafkaRunControl;
 import com.kmwllc.lucille.message.KafkaUtils;
 import java.util.List;
@@ -154,15 +156,60 @@ public class KafkaDistributedCrawlTest {
   }
 
   @Test
-  public void testUnitOfCrawlerThatDiesIsDeliveredToAnother() throws Exception {
-    ScriptedPartitionedConnector.dieOnce.add("u1");
+  public void testUnitThatThrowsAnErrorIsExecutedAgain() throws Exception {
+    ScriptedPartitionedConnector.errorOnce.add("u1");
     RunResult result = Runner.run(config, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
 
+    // the Error is reported as a failure of the unit instead of silently ending the Crawler's thread
     assertTrue(result.getStatus());
     assertEquals(2, ScriptedPartitionedConnector.executionsOf("u1"));
-    // The Document that u1 published before its Crawler died may have been indexed as well as its replacement.
+    // The Document that u1 published before the Error may have been indexed as well as its replacement.
     long succeeded = numSucceeded(result);
     assertTrue("succeeded: " + succeeded, succeeded == 18 || succeeded == 19);
+  }
+
+  @Test
+  public void testUnitOfCrawlerThatDiesIsDeliveredToAnother() throws Exception {
+    // the pool's Crawlers would take the unit themselves
+    crawlerPool.stop();
+    crawlerPool.join(10_000);
+
+    CrawlConfig crawlConfig = new CrawlConfig(config);
+    RunControlTracker tracker = new RunControlTracker(60_000);
+    WorkUnit unit = new WorkUnit("run1", "connector1", pipeline, "connector1/u0", 1, 1, "hash", WorkUnit.newPayload());
+    KafkaCoordinatorMessenger coordinator = new KafkaCoordinatorMessenger(config, false);
+    coordinator.initialize("run1", pipeline);
+    coordinator.dispatchUnit(unit);
+    coordinator.close();
+
+    // one Crawler receives the unit and goes away without acknowledging it
+    KafkaCrawlerMessenger first = new KafkaCrawlerMessenger(config, crawlConfig, tracker);
+    assertEquals(unit, pollUntilUnit(first));
+    first.close();
+
+    // so another receives it
+    KafkaCrawlerMessenger second = new KafkaCrawlerMessenger(config, crawlConfig, tracker);
+    assertEquals(unit, pollUntilUnit(second));
+    second.ackWorkUnit();
+    second.close();
+
+    // and once it has been acknowledged, nobody does
+    KafkaCrawlerMessenger third = new KafkaCrawlerMessenger(config, crawlConfig, tracker);
+    for (int i = 0; i < 5; i++) {
+      assertNull(third.pollWorkUnit());
+    }
+    third.close();
+  }
+
+  private static WorkUnit pollUntilUnit(KafkaCrawlerMessenger messenger) throws Exception {
+    long deadline = System.currentTimeMillis() + 60_000;
+    while (System.currentTimeMillis() < deadline) {
+      WorkUnit unit = messenger.pollWorkUnit();
+      if (unit != null) {
+        return unit;
+      }
+    }
+    throw new AssertionError("Timed out waiting for a work unit");
   }
 
   @Test

@@ -12,6 +12,8 @@ import com.kmwllc.lucille.message.LocalMessenger;
 import com.kmwllc.lucille.message.WorkerMessengerFactory;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.junit.After;
@@ -28,7 +30,7 @@ public class DistributedCrawlTest {
       pipelines: [{name: "pipeline1", stages: [{class: "com.kmwllc.lucille.stage.NopStage"}]}]
       solr { url: ["http://localhost:null"] }
       indexer { sendEnabled: false, type: "solr" }
-      crawl { threads: 3, maxAttempts: 2 }
+      crawl { threads: 3, maxAttempts: 2, heartbeatSecs: 1, orphanTimeoutSecs: 60 }
       """;
 
   private static final String SCRIPTED = """
@@ -195,6 +197,69 @@ public class DistributedCrawlTest {
     ScriptedPartitionedConnector.reset();
     assertFalse(run(config, "run1").getStatus());
     assertEquals(0, ScriptedPartitionedConnector.plans.get());
+  }
+
+  @Test
+  public void testRunIdMustBeUsableInATopicName() throws Exception {
+    Config config = start(SCRIPTED);
+
+    assertFalse(run(config, "run 1/../x").getStatus());
+    assertFalse(run(config, "").getStatus());
+    assertEquals(0, ScriptedPartitionedConnector.plans.get());
+  }
+
+  @Test
+  public void testCrawlerDiscardsUnitItCannotRoute() throws Exception {
+    Config config = start(SCRIPTED);
+
+    // Units that did not come from a Coordinator: one naming a pipeline the Crawlers do not have, one whose run ID
+    // could not be part of a topic name, and one for a run that no Coordinator has ever announced.
+    messenger.dispatchUnit(new WorkUnit("ghost-run", "connector1", "pipeline1", "connector1/forged3", 1, 1, "hash",
+        WorkUnit.newPayload().put("unit", 0)));
+    messenger.dispatchUnit(new WorkUnit("run1", "connector1", "other_pipeline", "connector1/forged1", 1, 1, "hash",
+        WorkUnit.newPayload().put("unit", 0)));
+    messenger.dispatchUnit(new WorkUnit("run1/../x", "connector1", "pipeline1", "connector1/forged2", 1, 1, "hash",
+        WorkUnit.newPayload().put("unit", 0)));
+    RunResult result = run(config, "run1");
+
+    // they are discarded without being executed, and the Crawlers carry on with the real units
+    assertTrue(result.getStatus());
+    assertEquals(30, numSucceeded(result));
+    assertEquals(6, ScriptedPartitionedConnector.executions.size());
+    assertEquals(1, ScriptedPartitionedConnector.executionsOf("u0"));
+  }
+
+  @Test
+  public void testRunStopsWhenTakenOverByAnotherCoordinator() throws Exception {
+    Config config = start(SCRIPTED);
+    // no unit can finish, so the run would otherwise wait for its timeout
+    ScriptedPartitionedConnector.gate = new CountDownLatch(1);
+    ScriptedPartitionedConnector.gateAfter = 0;
+
+    AtomicReference<RunResult> result = new AtomicReference<>();
+    Thread coordinator = new Thread(() -> {
+      try {
+        result.set(run(config, "run1"));
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    });
+    coordinator.start();
+
+    // a Coordinator that resumed the run announces itself under the next epoch
+    while (messenger.latest("run1") == null) {
+      Thread.sleep(50);
+    }
+    messenger.heartbeat("run1", 2, "hash");
+
+    coordinator.join(20_000);
+    ScriptedPartitionedConnector.gate.countDown();
+    assertFalse(coordinator.isAlive());
+    assertFalse(result.get().getStatus());
+    assertTrue(result.get().toString().contains("taken over by another Coordinator"));
+    // it leaves the run to its new owner rather than announcing the end of it
+    assertFalse(messenger.latest("run1").cancelled());
+    assertEquals(0, ScriptedPartitionedConnector.postExecutes.get());
   }
 
   @Test
