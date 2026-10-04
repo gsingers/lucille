@@ -113,6 +113,19 @@ java \
 
 See the [troubleshooting guide]({{< relref "docs/operations/troubleshooting" >}}) if components don't connect as expected.
 
+### Distributing the Connectors Too
+
+In distributed mode the Runner still executes each Connector itself, on one thread. When reading the source is the slow part of a run, start the Runner with `-distributedCrawl` instead and deploy one or more Crawlers, which execute the Connectors' work in parallel:
+
+```bash
+java \
+  -Dconfig.file=<PATH/TO/YOUR/CONFIG.conf> \
+  -cp 'lucille-core/target/lucille.jar:lucille-core/target/lib/*' \
+  com.kmwllc.lucille.core.Crawler
+```
+
+Workers and Indexers are started as above. See [Distributing the Crawl]({{< relref "docs/architecture/overview/distributed-crawl" >}}) for the configuration this needs and for how such a run recovers from failures.
+
 ---
 
 ## Verifying Your Run

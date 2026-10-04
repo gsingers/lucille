@@ -11,6 +11,10 @@ import com.kmwllc.lucille.message.CrawlerMessengerFactory;
 import com.kmwllc.lucille.message.IndexerMessengerFactory;
 import com.kmwllc.lucille.message.KafkaCoordinatorMessenger;
 import com.kmwllc.lucille.message.KafkaRunControl;
+import com.kmwllc.lucille.message.KafkaUtils;
+import java.util.List;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
 import com.kmwllc.lucille.message.RunControl;
 import com.kmwllc.lucille.message.WorkerMessengerFactory;
 import com.typesafe.config.Config;
@@ -136,6 +140,14 @@ public class KafkaDistributedCrawlTest {
     assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5"));
     assertEquals(1, ScriptedPartitionedConnector.preExecutes.get());
     assertEquals(1, ScriptedPartitionedConnector.postExecutes.get());
+
+    // the six units were dealt out evenly over the four partitions of the work topic
+    try (KafkaConsumer<String, String> consumer = KafkaUtils.createUngroupedConsumer(config, "test", 10)) {
+      List<TopicPartition> partitions = consumer.partitionsFor("work_" + pipeline).stream()
+          .map(info -> new TopicPartition(info.topic(), info.partition())).toList();
+      List<Long> unitsPerPartition = consumer.endOffsets(partitions).values().stream().sorted().toList();
+      assertEquals(List.of(1L, 1L, 2L, 2L), unitsPerPartition);
+    }
 
     // the run is over, so its ID cannot be used to start another
     assertFalse(Runner.run(config, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline).getStatus());

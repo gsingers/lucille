@@ -8,6 +8,7 @@ import com.typesafe.config.Config;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.Consumer;
@@ -19,8 +20,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A CoordinatorMessenger that uses Kafka. Work units go to the work topic, keyed by unit ID so that the units of a
- * run are spread over the topic's partitions. Events are read from, and written to, the run's event topic.
+ * A CoordinatorMessenger that uses Kafka. Work units go to the work topic, spread evenly over its partitions.
+ * Events are read from, and written to, the run's event topic.
  *
  * The event topic is read without a consumer group, either from its beginning, to replay a run that an earlier
  * Coordinator started, or from its current end.
@@ -42,6 +43,8 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
   private KafkaProducer<String, String> stringProducer;
   private Consumer<String, String> eventConsumer;
   private Map<TopicPartition, Long> replayEndOffsets = Map.of();
+  private final AtomicInteger nextWorkPartition = new AtomicInteger();
+  private int numWorkPartitions;
   private String runId;
   private String pipelineName;
   private String eventTopicName;
@@ -73,6 +76,9 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     if (stringProducer == null) {
       throw new IllegalArgumentException("A distributed crawl requires Events; kafka.events cannot be false.");
     }
+
+    // an existing work topic may have a different number of partitions than this config would create it with
+    this.numWorkPartitions = stringProducer.partitionsFor(crawlConfig.workTopic).size();
 
     this.eventConsumer = KafkaUtils.createUngroupedConsumer(config, "com.kmwllc.lucille-coordinator-" + pipelineName,
         EVENT_BATCH_SIZE);
@@ -125,7 +131,10 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
 
   @Override
   public void dispatchUnit(WorkUnit unit) throws Exception {
-    stringProducer.send(new ProducerRecord<>(crawlConfig.workTopic, unit.unitId(), unit.toJson())).get();
+    // Units are dealt out to the partitions in turn. Choosing the partition from a hash of the key would leave some
+    // partitions, and so some Crawlers, with several times the units of others when a run has few units.
+    int partition = Math.floorMod(nextWorkPartition.getAndIncrement(), numWorkPartitions);
+    stringProducer.send(new ProducerRecord<>(crawlConfig.workTopic, partition, unit.unitId(), unit.toJson())).get();
   }
 
   @Override
