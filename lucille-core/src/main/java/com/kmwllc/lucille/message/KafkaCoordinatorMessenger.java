@@ -15,6 +15,7 @@ import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,6 +32,10 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
   // Events are read in batches because a Coordinator receives at least two per Document, and many more when replaying.
   private static final int EVENT_BATCH_SIZE = 500;
 
+  // How long to wait for a topic that has just been created to become visible. Kafka's default.api.timeout.ms.
+  private static final long TOPIC_WAIT_MILLIS = 60_000;
+  private static final long TOPIC_RETRY_MILLIS = 100;
+
   private static final Logger log = LoggerFactory.getLogger(KafkaCoordinatorMessenger.class);
 
   private final Config config;
@@ -42,7 +47,8 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
   private KafkaProducer<String, Document> documentProducer;
   private KafkaProducer<String, String> stringProducer;
   private Consumer<String, String> eventConsumer;
-  private Map<TopicPartition, Long> replayEndOffsets = Map.of();
+  // where the event topic ended when a replay began; null until then, and always if no replay was asked for
+  private Map<TopicPartition, Long> replayEndOffsets;
   private final AtomicInteger nextWorkPartition = new AtomicInteger();
   private int numWorkPartitions;
   private String runId;
@@ -80,10 +86,14 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     // an existing work topic may have a different number of partitions than this config would create it with
     this.numWorkPartitions = stringProducer.partitionsFor(crawlConfig.workTopic).size();
 
-    this.eventConsumer = KafkaUtils.createUngroupedConsumer(config, "com.kmwllc.lucille-coordinator-" + pipelineName,
-        EVENT_BATCH_SIZE);
-    List<TopicPartition> partitions = eventConsumer.partitionsFor(eventTopicName).stream()
-        .map(info -> new TopicPartition(info.topic(), info.partition())).toList();
+    assignEventConsumer(KafkaUtils.createUngroupedConsumer(config, "com.kmwllc.lucille-coordinator-" + pipelineName,
+        EVENT_BATCH_SIZE), TOPIC_WAIT_MILLIS);
+  }
+
+  // package access so unit tests can supply a consumer
+  void assignEventConsumer(Consumer<String, String> consumer, long topicWaitMillis) throws Exception {
+    this.eventConsumer = consumer;
+    List<TopicPartition> partitions = awaitPartitions(topicWaitMillis);
     eventConsumer.assign(partitions);
 
     if (replay) {
@@ -95,6 +105,30 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     // seeks are lazy; asking for the position applies them now, before anything else is written to the topic
     for (TopicPartition partition : partitions) {
       eventConsumer.position(partition);
+    }
+  }
+
+  /**
+   * Returns the partitions of the event topic, waiting for the topic to become visible if need be. Creating a topic
+   * returns once the cluster has accepted it, which can be before every broker knows of it, and a broker that does
+   * not know of it yet reports no partitions. Carrying on with none would leave the consumer assigned to nothing.
+   */
+  private List<TopicPartition> awaitPartitions(long topicWaitMillis) throws Exception {
+    long deadline = System.currentTimeMillis() + topicWaitMillis;
+
+    while (true) {
+      List<PartitionInfo> partitions = eventConsumer.partitionsFor(eventTopicName);
+
+      if (partitions != null && !partitions.isEmpty()) {
+        return partitions.stream().map(info -> new TopicPartition(info.topic(), info.partition())).toList();
+      }
+      if (System.currentTimeMillis() >= deadline) {
+        throw new Exception("Event topic " + eventTopicName + " had no partitions visible to this consumer after "
+            + topicWaitMillis + " ms.");
+      }
+
+      log.info("Waiting for event topic {} to become visible.", eventTopicName);
+      Thread.sleep(TOPIC_RETRY_MILLIS);
     }
   }
 
@@ -197,7 +231,13 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
 
   @Override
   public boolean replayComplete() {
-    if (!polledEvents.isEmpty()) {
+    if (!replay) {
+      return true;
+    }
+
+    // Until the consumer has been attached to the topic, nothing is known about what there is to replay. Reporting
+    // the replay complete then would let a resumed run carry on as though it had no history.
+    if (replayEndOffsets == null || !polledEvents.isEmpty()) {
       return false;
     }
 
