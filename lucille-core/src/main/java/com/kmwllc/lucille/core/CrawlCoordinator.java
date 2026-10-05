@@ -45,6 +45,10 @@ public class CrawlCoordinator {
   private volatile boolean runActive = false;
   private volatile CoordinatorPublisher currentPublisher;
 
+  // the first connector that has a pipeline, and the Publisher that was set up for it before the run was announced
+  private Connector preparedConnector;
+  private CoordinatorPublisher preparedPublisher;
+
   /**
    * Creates a Coordinator that communicates through Kafka.
    *
@@ -89,6 +93,21 @@ public class CrawlCoordinator {
         return new RunResult(false, connectors, connectorResults, runId);
       }
 
+      // The first connector's Publisher is set up before the run is announced, because setting it up is what can fail
+      // for reasons outside the run: Kafka unreachable, or a topic that cannot be read. Failing here leaves no record
+      // of the run, so it can be started again under the same ID.
+      Connector first = connectors.stream().filter(c -> c.getPipelineName() != null).findFirst().orElse(null);
+      if (first != null) {
+        try {
+          preparedPublisher = newPublisher(first);
+          preparedConnector = first;
+        } catch (Exception e) {
+          log.error("Could not start run " + runId + ".", e);
+          connectorResults.add(new ConnectorResult(first, null, false, String.valueOf(e.getMessage())));
+          return new RunResult(false, connectors, connectorResults, runId);
+        }
+      }
+
       // Crawlers ignore units until they have seen a heartbeat for the unit's epoch, so send one before dispatching any.
       runControl.heartbeat(runId, epoch, configHash);
       runActive = true;
@@ -102,6 +121,8 @@ public class CrawlCoordinator {
         heartbeat.shutdownNow();
       }
       endRun(status ? "complete" : "failed");
+      // set up but never handed to its connector, if the run could not be announced
+      close(preparedPublisher, "publisher");
       runControl.close();
     }
   }
@@ -218,8 +239,12 @@ public class CrawlCoordinator {
     CoordinatorPublisher publisher = null;
 
     try {
-      String metricsPrefix = runId + "." + connector.getName() + "." + connector.getPipelineName();
-      publisher = new CoordinatorPublisher(config, messengerFactory.get(), runId, connector, metricsPrefix, epoch);
+      if (connector == preparedConnector) {
+        publisher = preparedPublisher;
+        preparedPublisher = null;
+      } else {
+        publisher = newPublisher(connector);
+      }
       currentPublisher = publisher;
       if (!runActive) {
         return new ConnectorResult(connector, publisher, false, "Run was cancelled or taken over by another Coordinator.");
@@ -233,6 +258,11 @@ public class CrawlCoordinator {
       close(connector, "connector");
       close(publisher, "publisher");
     }
+  }
+
+  private CoordinatorPublisher newPublisher(Connector connector) throws Exception {
+    String metricsPrefix = runId + "." + connector.getName() + "." + connector.getPipelineName();
+    return new CoordinatorPublisher(config, messengerFactory.get(), runId, connector, metricsPrefix, epoch);
   }
 
   private static void close(Object closeable, String description) {

@@ -2,6 +2,7 @@ package com.kmwllc.lucille.core;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import com.kmwllc.lucille.connector.ScriptedPartitionedConnector;
@@ -197,6 +198,27 @@ public class DistributedCrawlTest {
     ScriptedPartitionedConnector.reset();
     assertFalse(run(config, "run1").getStatus());
     assertEquals(0, ScriptedPartitionedConnector.plans.get());
+  }
+
+  @Test
+  public void testRunIdIsNotSpentIfTheRunCannotStart() throws Exception {
+    Config config = start(SCRIPTED);
+
+    // the Coordinator cannot attach to the run's event topic, as when Kafka does not yet show a topic just created
+    RunResult failed = new CrawlCoordinator(config, "run1", messenger, () -> {
+      throw new IllegalStateException("Event topic pipeline1_event_run1 had no partitions visible");
+    }).run(false, false);
+
+    assertFalse(failed.getStatus());
+    assertTrue(failed.toString().contains("had no partitions visible"));
+    // nothing was announced or begun for the run
+    assertNull(messenger.latest("run1"));
+    assertEquals(0, ScriptedPartitionedConnector.preExecutes.get());
+
+    // so the same run ID can simply be used again
+    RunResult result = run(config, "run1");
+    assertTrue(result.getStatus());
+    assertEquals(30, numSucceeded(result));
   }
 
   @Test
