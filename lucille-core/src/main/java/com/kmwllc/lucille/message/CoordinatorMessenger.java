@@ -24,6 +24,16 @@ public interface CoordinatorMessenger extends PublisherMessenger {
   void sendEvent(Event event) throws Exception;
 
   /**
+   * Records a UNIT_CREATED Event and then dispatches the unit it describes, in that order: the unit must not become
+   * available to Crawlers before the Event has been accepted. May return before either has happened. A failure
+   * is reported by a later call to this method, to pollEvent() or to flush().
+   */
+  default void logAndDispatchUnit(Event unitCreated, WorkUnit unit) throws Exception {
+    sendEvent(unitCreated);
+    dispatchUnit(unit);
+  }
+
+  /**
    * Returns whether pollEvent() has returned every Event that was in the run's Event log when this messenger was
    * initialized. Always true for a messenger that was not asked to replay the log.
    */

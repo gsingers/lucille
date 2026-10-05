@@ -161,12 +161,13 @@ public class CoordinatorPublisher extends PublisherImpl {
   // unit outstanding and dispatches it. In the other order, a unit could be executing that no log knows of.
   private void logAndDispatch(WorkUnit unit) throws Exception {
     outstandingUnits.put(unit.unitId(), unit);
-    messenger.sendEvent(new Event(unit.unitId(), runId, unit.toJson(), Event.Type.UNIT_CREATED));
-    messenger.dispatchUnit(unit);
+    messenger.logAndDispatchUnit(new Event(unit.unitId(), runId, unit.toJson(), Event.Type.UNIT_CREATED), unit);
     unitsDispatched.inc();
   }
 
   public void logPlanningDone() throws Exception {
+    // every unit has to have been accepted before planning is recorded as done
+    messenger.flush();
     planningDone = true;
     messenger.sendEvent(new Event(connectorName, runId, null, Event.Type.PLANNING_DONE));
   }

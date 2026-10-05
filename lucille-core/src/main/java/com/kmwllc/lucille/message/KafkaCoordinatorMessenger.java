@@ -119,6 +119,9 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
   @Override
   public void flush() throws Exception {
     documentProducer.flush();
+    // twice, because a unit is only handed to the producer once the send of its Event has completed
+    stringProducer.flush();
+    stringProducer.flush();
     checkException();
   }
 
@@ -137,6 +140,34 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     stringProducer.send(new ProducerRecord<>(crawlConfig.workTopic, partition, unit.unitId(), unit.toJson())).get();
   }
 
+  /**
+   * Neither send is waited for, since waiting on two round trips per unit limits a run to a few dozen units a
+   * second. The order is kept by sending the unit from the callback that confirms its Event was accepted.
+   */
+  @Override
+  public void logAndDispatchUnit(Event unitCreated, WorkUnit unit) throws Exception {
+    checkException();
+    int partition = Math.floorMod(nextWorkPartition.getAndIncrement(), numWorkPartitions);
+    ProducerRecord<String, String> workRecord =
+        new ProducerRecord<>(crawlConfig.workTopic, partition, unit.unitId(), unit.toJson());
+
+    stringProducer.send(new ProducerRecord<>(eventTopicName, unitCreated.getDocumentId(), unitCreated.toString()),
+        (metadata, eventException) -> {
+          if (eventException != null) {
+            log.error("Kafka send failed for UNIT_CREATED event of unit: {}", unit.unitId(), eventException);
+            sendException.compareAndSet(null, eventException);
+            return;
+          }
+
+          stringProducer.send(workRecord, (workMetadata, workException) -> {
+            if (workException != null) {
+              log.error("Kafka send failed for unit: {}", unit.unitId(), workException);
+              sendException.compareAndSet(null, workException);
+            }
+          });
+        });
+  }
+
   @Override
   public void sendEvent(Event event) throws Exception {
     stringProducer.send(new ProducerRecord<>(eventTopicName, event.getDocumentId(), event.toString())).get();
@@ -144,6 +175,9 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
 
   @Override
   public Event pollEvent() throws Exception {
+    // a unit that could not be dispatched will never be reported done, so the run fails now instead of waiting for it
+    checkException();
+
     if (polledEvents.isEmpty()) {
       eventConsumer.poll(KafkaUtils.POLL_INTERVAL).forEach(polledEvents::add);
     }

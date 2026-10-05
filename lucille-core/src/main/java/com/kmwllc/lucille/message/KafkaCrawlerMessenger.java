@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -29,6 +30,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.RebalanceInProgressException;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -296,7 +298,11 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
   @Override
   public void sendEvent(Event event, String pipelineName) throws Exception {
     String eventTopic = KafkaUtils.getEventTopicName(config, pipelineName, event.getRunId());
-    eventProducer.send(new ProducerRecord<>(eventTopic, event.getDocumentId(), event.toString())).get();
+    Future<RecordMetadata> sent = eventProducer.send(new ProducerRecord<>(eventTopic, event.getDocumentId(), event.toString()));
+    // sent at once: left to itself the producer holds a record back for linger.ms in case more follow, and this
+    // is paid once per unit
+    eventProducer.flush();
+    sent.get();
   }
 
   @Override
