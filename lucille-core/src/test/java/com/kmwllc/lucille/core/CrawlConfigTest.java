@@ -9,6 +9,7 @@ import static org.junit.Assert.assertThrows;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import org.apache.kafka.clients.admin.NewTopic;
 import java.io.File;
 import java.nio.file.Files;
 import org.junit.Test;
@@ -38,6 +39,39 @@ public class CrawlConfigTest {
     // a Crawler would treat every run as orphaned between heartbeats
     assertThrows(IllegalArgumentException.class,
         () -> new CrawlConfig(ConfigFactory.parseString("crawl { heartbeatSecs: 30, orphanTimeoutSecs: 30 }")));
+  }
+
+  @Test
+  public void testNumbersMayBeSuppliedAsStrings() {
+    // a value that comes from an environment variable substitution is a String, whatever it looks like
+    CrawlConfig crawlConfig = new CrawlConfig(ConfigFactory.parseString(
+        "crawl { threads: \"4\", workTopicPartitions: \"8\", maxOutstandingUnits: \"32\", maxAttempts: \"5\", "
+            + "heartbeatSecs: \"2\", orphanTimeoutSecs: \"20\", topicReplicationFactor: \"3\" }"));
+
+    assertEquals(4, crawlConfig.threads);
+    assertEquals(8, crawlConfig.workTopicPartitions);
+    assertEquals(32, crawlConfig.maxOutstandingUnits);
+    assertEquals(5, crawlConfig.maxAttempts);
+    assertEquals(2, crawlConfig.heartbeatSecs);
+    assertEquals(20, crawlConfig.orphanTimeoutSecs);
+    assertEquals(Short.valueOf((short) 3), crawlConfig.topicReplicationFactor);
+  }
+
+  @Test
+  public void testTopicsFollowTheClusterUnlessToldOtherwise() {
+    // with no replication factor configured, a topic is created with whatever the cluster's default is
+    CrawlConfig byDefault = new CrawlConfig(ConfigFactory.empty());
+    assertNull(byDefault.topicReplicationFactor);
+    // -1 is how a NewTopic says that no replication factor was given
+    assertEquals(-1, byDefault.newTopic("t", 4).replicationFactor());
+    assertEquals(4, byDefault.newTopic("t", 4).numPartitions());
+
+    CrawlConfig three = new CrawlConfig(ConfigFactory.parseString("crawl.topicReplicationFactor: 3"));
+    assertEquals(3, three.newTopic("t", 1).replicationFactor());
+    assertEquals(1, three.newTopic("t", 1).numPartitions());
+
+    assertThrows(IllegalArgumentException.class,
+        () -> new CrawlConfig(ConfigFactory.parseString("crawl.topicReplicationFactor: 0")));
   }
 
   @Test

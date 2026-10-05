@@ -10,10 +10,14 @@ import com.kmwllc.lucille.indexer.IndexerFactory;
 import com.kmwllc.lucille.message.CrawlerMessengerFactory;
 import com.kmwllc.lucille.message.LocalCrawlMessenger;
 import com.kmwllc.lucille.message.LocalMessenger;
+import com.kmwllc.lucille.message.RunControl;
 import com.kmwllc.lucille.message.WorkerMessengerFactory;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -79,7 +83,7 @@ public class DistributedCrawlTest {
   }
 
   private RunResult run(Config config, String runId) throws Exception {
-    return new CrawlCoordinator(config, runId, messenger, () -> messenger).run(false, false);
+    return new CrawlCoordinator(config, runId, messenger, replay -> messenger).run(false, false);
   }
 
   static long numSucceeded(RunResult result) {
@@ -205,7 +209,7 @@ public class DistributedCrawlTest {
     Config config = start(SCRIPTED);
 
     // the Coordinator cannot attach to the run's event topic, as when Kafka does not yet show a topic just created
-    RunResult failed = new CrawlCoordinator(config, "run1", messenger, () -> {
+    RunResult failed = new CrawlCoordinator(config, "run1", messenger, replay -> {
       throw new IllegalStateException("Event topic pipeline1_event_run1 had no partitions visible");
     }).run(false, false);
 
@@ -219,6 +223,122 @@ public class DistributedCrawlTest {
     RunResult result = run(config, "run1");
     assertTrue(result.getStatus());
     assertEquals(30, numSucceeded(result));
+  }
+
+  private RunResult startOrResume(Config config, String runId) throws Exception {
+    return new CrawlCoordinator(config, runId, messenger, replay -> messenger).startOrResume();
+  }
+
+  @Test
+  public void testStartOrResumeStartsARunThatIsNew() throws Exception {
+    Config config = start(SCRIPTED);
+    RunResult result = startOrResume(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(30, numSucceeded(result));
+    assertEquals(1, messenger.latest("run1").epoch());
+    assertEquals("complete", messenger.latest("run1").reason());
+  }
+
+  @Test
+  public void testStartOrResumeResumesARunWhoseCoordinatorHasGoneSilent() throws Exception {
+    // the Coordinator being started treats two seconds without a heartbeat as silence
+    Config config = ConfigFactory.parseString("crawl.orphanTimeoutSecs: 2").withFallback(start(SCRIPTED));
+
+    // an earlier Coordinator announced the run a moment ago and then died
+    messenger.heartbeat("run1", 1, CrawlConfig.runConfigHash(config));
+
+    long start = System.currentTimeMillis();
+    RunResult result = startOrResume(config, "run1");
+    long waited = System.currentTimeMillis() - start;
+
+    // it did not take the run over while the heartbeat was fresh, and did once it was not
+    assertTrue("waited " + waited + " ms", waited >= 1500);
+    assertTrue(result.getStatus());
+    assertEquals(2, messenger.latest("run1").epoch());
+  }
+
+  @Test
+  public void testStartOrResumeGivesUpIfAnotherCoordinatorIsAlive() throws Exception {
+    Config config = ConfigFactory.parseString("crawl.orphanTimeoutSecs: 2").withFallback(start(SCRIPTED));
+    String configHash = CrawlConfig.runConfigHash(config);
+
+    // another Coordinator has the run and keeps saying so
+    AtomicBoolean alive = new AtomicBoolean(true);
+    Thread other = new Thread(() -> {
+      while (alive.get()) {
+        messenger.heartbeat("run1", 1, configHash);
+        try {
+          Thread.sleep(200);
+        } catch (InterruptedException e) {
+          return;
+        }
+      }
+    });
+    other.start();
+
+    try {
+      RunResult result = startOrResume(config, "run1");
+
+      assertFalse(result.getStatus());
+      // the run is left exactly as it was
+      assertEquals(1, messenger.latest("run1").epoch());
+      assertFalse(messenger.latest("run1").cancelled());
+      assertEquals(0, ScriptedPartitionedConnector.preExecutes.get());
+    } finally {
+      alive.set(false);
+      other.join();
+    }
+  }
+
+  @Test
+  public void testStartOrResumeOfACompletedRunDoesNotRunItAgain() throws Exception {
+    Config config = start(SCRIPTED);
+    assertTrue(startOrResume(config, "run1").getStatus());
+    assertEquals(1, ScriptedPartitionedConnector.plans.get());
+
+    // A real Coordinator would learn from the run's Events that every connector had completed. This messenger
+    // keeps no Events, so the second Coordinator does the work again; what is checked here is that a run that has
+    // ended is resumed at once, without waiting, and under a new epoch.
+    long start = System.currentTimeMillis();
+    assertTrue(startOrResume(config, "run1").getStatus());
+    assertTrue(System.currentTimeMillis() - start < 30_000);
+    assertEquals(2, messenger.latest("run1").epoch());
+  }
+
+  @Test
+  public void testStartOrResumeRefusesAChangedConfig() throws Exception {
+    Config config = start(SCRIPTED);
+    assertTrue(startOrResume(config, "run1").getStatus());
+
+    Config changed = ConfigFactory.parseString(SCRIPTED.replace("numUnits: 6", "numUnits: 7") + COMMON);
+    assertFalse(startOrResume(changed, "run1").getStatus());
+    assertEquals(1, messenger.latest("run1").epoch());
+  }
+
+  @Test
+  public void testListRuns() throws Exception {
+    Config config = start(SCRIPTED);
+    assertTrue(run(config, "run1").getStatus());
+    ScriptedPartitionedConnector.failAlways.add("u0");
+    assertFalse(run(config, "run2").getStatus());
+    messenger.heartbeat("run3", 4, "hash");
+
+    Map<String, RunControl.Status> runs = messenger.list();
+    assertEquals(List.of("run1", "run2", "run3"), List.copyOf(runs.keySet()));
+    assertEquals("complete", runs.get("run1").reason());
+    assertEquals("failed", runs.get("run2").reason());
+    assertFalse(runs.get("run3").cancelled());
+    assertEquals(4, runs.get("run3").epoch());
+
+    String table = Runner.formatRuns(runs, 120);
+    assertTrue(table, table.contains("ended (complete)"));
+    assertTrue(table, table.contains("ended (failed)"));
+    assertTrue(table, table.contains("running"));
+    // a run whose Coordinator has not been heard from for longer than the orphan timeout can be resumed
+    assertTrue(Runner.formatRuns(Map.of("old", new RunControl.Status(false, 1, "hash", 300_000, null)), 120)
+        .contains("silent, resumable"));
+    assertEquals("No distributed crawls are on record.", Runner.formatRuns(Map.of(), 120));
   }
 
   @Test

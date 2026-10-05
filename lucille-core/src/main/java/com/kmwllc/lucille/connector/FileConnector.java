@@ -243,7 +243,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       log.warn("filterOptions.lastPublishedCutoff was specified, but no state configuration was provided. It will not be enforced.");
     }
 
-    if (isPartitioningEnabled() && ConfigUtils.getOrDefault(config, "partitioning.depth", 1) < 1) {
+    if (isPartitioningEnabled() && partitioningDepth() < 1) {
       throw new IllegalArgumentException("partitioning.depth must be at least 1.");
     }
   }
@@ -251,6 +251,11 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
   @Override
   public boolean isPartitioningEnabled() {
     return config.hasPath("partitioning");
+  }
+
+  // getInt accepts a number written as a String, which is what a value substituted from the environment is
+  private int partitioningDepth() {
+    return config.hasPath("partitioning.depth") ? config.getInt("partitioning.depth") : 1;
   }
 
   /**
@@ -273,7 +278,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
   @Override
   public void plan(String runId, WorkUnitSink sink) throws ConnectorException {
     initializeStorageClients();
-    int depth = ConfigUtils.getOrDefault(config, "partitioning.depth", 1);
+    int depth = partitioningDepth();
 
     for (URI resource : storageURIs) {
       planPath(resource, buildTraversalParams(resource), depth, sink);

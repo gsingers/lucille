@@ -5,6 +5,7 @@ import com.kmwllc.lucille.core.Event;
 import com.kmwllc.lucille.core.RunControlTracker;
 import com.kmwllc.lucille.core.WorkUnit;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -111,24 +112,36 @@ public class LocalCrawlMessenger implements CoordinatorMessenger, CrawlerMesseng
     return tracker;
   }
 
-  // RunControl
+  // RunControl. Each Status in latestControl holds the time it was recorded in place of its age.
 
   @Override
   public Status latest(String runId) {
-    return latestControl.get(runId);
+    return withAge(latestControl.get(runId));
+  }
+
+  @Override
+  public Map<String, Status> list() {
+    Map<String, Status> statuses = new TreeMap<>();
+    latestControl.forEach((runId, status) -> statuses.put(runId, withAge(status)));
+    return statuses;
+  }
+
+  private static Status withAge(Status status) {
+    return status == null ? null : new Status(status.cancelled(), status.epoch(), status.configHash(),
+        System.currentTimeMillis() - status.ageMillis(), status.reason());
   }
 
   @Override
   public void heartbeat(String runId, int epoch, String configHash) {
     // as on the control topic, the highest epoch counts, and a cancellation is final within its epoch
-    latestControl.merge(runId, new Status(false, epoch, configHash, 0), (current, update) ->
+    latestControl.merge(runId, new Status(false, epoch, configHash, System.currentTimeMillis(), null), (current, update) ->
         update.epoch() > current.epoch() || (update.epoch() == current.epoch() && !current.cancelled()) ? update : current);
     tracker.onHeartbeat(runId, epoch, System.currentTimeMillis());
   }
 
   @Override
   public void cancel(String runId, int epoch, String configHash, String reason) {
-    latestControl.merge(runId, new Status(true, epoch, configHash, 0),
+    latestControl.merge(runId, new Status(true, epoch, configHash, System.currentTimeMillis(), reason),
         (current, update) -> update.epoch() >= current.epoch() ? update : current);
     tracker.onCancel(runId, epoch);
   }

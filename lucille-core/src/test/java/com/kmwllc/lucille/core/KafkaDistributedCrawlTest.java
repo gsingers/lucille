@@ -15,6 +15,7 @@ import com.kmwllc.lucille.message.KafkaCrawlerMessenger;
 import com.kmwllc.lucille.message.KafkaRunControl;
 import com.kmwllc.lucille.message.KafkaUtils;
 import java.util.List;
+import java.util.Map;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.TopicPartition;
 import com.kmwllc.lucille.message.RunControl;
@@ -213,6 +214,35 @@ public class KafkaDistributedCrawlTest {
   }
 
   @Test
+  public void testStartOrResume() throws Exception {
+    String runId = "run-" + pipeline;
+
+    // there is no record of the run, so it is started
+    RunResult result = Runner.startOrResumeAndLogResult(config, runId, false);
+    assertTrue(result.getStatus());
+    assertEquals(18, numSucceeded(result));
+    assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5"));
+
+    // Now there is, so it is resumed. The run's Events show that it completed, so nothing is done again.
+    RunResult again = Runner.startOrResumeAndLogResult(config, runId, false);
+    assertTrue(again.getStatus());
+    assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5"));
+    assertEquals(1, ScriptedPartitionedConnector.preExecutes.get());
+    assertEquals(1, ScriptedPartitionedConnector.postExecutes.get());
+
+    KafkaRunControl runControl = new KafkaRunControl(config);
+    try {
+      Map<String, RunControl.Status> runs = runControl.list();
+      assertEquals(java.util.Set.of(runId), runs.keySet());
+      assertTrue(runs.get(runId).cancelled());
+      assertEquals("complete", runs.get(runId).reason());
+      assertEquals(2, runs.get(runId).epoch());
+    } finally {
+      runControl.close();
+    }
+  }
+
+  @Test
   public void testFailedUnitIsExecutedAgain() throws Exception {
     ScriptedPartitionedConnector.failOnce.add("u4");
     RunResult result = Runner.run(config, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
@@ -237,6 +267,11 @@ public class KafkaDistributedCrawlTest {
     @Override
     public Status latest(String runId) throws Exception {
       return delegate.latest(runId);
+    }
+
+    @Override
+    public Map<String, Status> list() throws Exception {
+      return delegate.list();
     }
 
     @Override
@@ -268,7 +303,7 @@ public class KafkaDistributedCrawlTest {
     ScriptedPartitionedConnector.gateAfter = 3;
 
     SilenceableRunControl firstControl = new SilenceableRunControl(new KafkaRunControl(config));
-    CrawlCoordinator first = new CrawlCoordinator(config, runId, firstControl, () -> new KafkaCoordinatorMessenger(config, false));
+    CrawlCoordinator first = new CrawlCoordinator(config, runId, firstControl, replay -> new KafkaCoordinatorMessenger(config, replay));
     AtomicReference<RunResult> firstResult = new AtomicReference<>();
     Thread firstThread = new Thread(() -> {
       try {
@@ -283,7 +318,7 @@ public class KafkaDistributedCrawlTest {
     waitFor("the first units to be executed", () -> ScriptedPartitionedConnector.completed.size() == 3);
     String[] doneBeforeDeath = ScriptedPartitionedConnector.completed.toArray(new String[0]);
     RunResult refused = new CrawlCoordinator(config, runId, new KafkaRunControl(config),
-        () -> new KafkaCoordinatorMessenger(config, true)).run(true, false);
+        replay -> new KafkaCoordinatorMessenger(config, replay)).run(true, false);
     assertFalse(refused.getStatus());
 
     // Kill the first Coordinator while half of the units are done and the rest are held up.

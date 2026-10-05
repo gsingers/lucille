@@ -77,6 +77,32 @@ Each Coordinator of a run has an **epoch**, one higher than the last, which it s
 
 A run can be resumed for a week after its last heartbeat. After that its record is removed from the control topic.
 
+### Restarting a Coordinator automatically
+
+`-resume` is for a person who knows the run stopped. A Coordinator that is restarted by something else, such as a Kubernetes Job, is started with the same arguments each time and cannot know whether it is the first. For that, give the run an ID and add `-resumeIfExists`:
+
+```bash
+java -Dconfig.file=<CONFIG> -cp '...' com.kmwllc.lucille.core.Runner -distributedCrawl -runId nightly-2026-10-05 -resumeIfExists
+```
+
+- If there is no record of the run, it is started.
+- If there is, it is resumed. A run that already completed is resumed too, finds nothing left to do, and exits successfully.
+- If the run's last heartbeat is recent, its earlier Coordinator may still be alive. The new one waits until the heartbeat has been silent for `crawl.orphanTimeoutSecs` and then takes over. If the heartbeat does not go silent, another Coordinator has the run, and the new one exits with an error after twice that time.
+
+A restart therefore takes up to `crawl.orphanTimeoutSecs` longer than the process took to come back.
+
+To see which runs are on record, and which can be resumed:
+
+```bash
+java -Dconfig.file=<CONFIG> -cp '...' com.kmwllc.lucille.core.Runner -listRuns
+```
+
+```
+RUN ID                                   STATE                  EPOCH LAST HEARD FROM
+nightly-2026-10-04                       ended (complete)           1 86012 secs ago
+nightly-2026-10-05                       silent, resumable          1 431 secs ago
+```
+
 A lifecycle method that was interrupted part way is called again by the resuming Coordinator, so `preExecute()` and `postExecute()` should be safe to repeat.
 
 ## Running a Distributed Crawl
@@ -101,6 +127,8 @@ With the Docker image, set `LUCILLE_ROLE=crawler` for a Crawler, and `LUCILLE_OP
 | `-runId <id>` | Use this run ID instead of generating one. Pass one when the Runner is restarted automatically, so the restart can `-resume` it. Works in every mode. |
 | `-resume <id>` | Continue the unfinished distributed crawl with this run ID. |
 | `-force` | With `-resume`, take over even if the run's heartbeat is recent. |
+| `-resumeIfExists` | With `-distributedCrawl` and `-runId`, start the run if it is new and continue it if it is not. For a Runner that is restarted automatically. |
+| `-listRuns` | List the distributed crawls on record, with the state of each, and exit. |
 
 A minimal config adds a `partitioning` block to the Connector. The `crawl` block is optional; see `application-example.conf` for every setting and its default.
 
@@ -124,9 +152,19 @@ crawl {
 
 ### Sizing
 
-- **Partitions bound parallelism.** Each partition of the work topic is read by one Crawler thread at a time, so no more than `crawl.workTopicPartitions` units execute at once. The topic is created with that many partitions the first time any component needs it; changing the setting later does not change an existing topic.
-- **Units should take minutes, not hours.** A unit is the smallest thing that can be retried or moved to another Crawler. Choose a `depth` that yields many more units than Crawler threads, so that one unusually large directory does not leave the rest idle.
-- **Crawlers have their own consumer group.** `crawl.consumerGroupId` must differ from `kafka.consumerGroupId`. Sharing a group would make every Crawler that joins or leaves interrupt the Workers.
+How fast a crawl goes is decided by how the work is cut into units, more than by how many Crawlers there are.
+
+- **Concurrency is the number of units in flight.** A unit is executed by one Crawler thread, which walks it alone. The number in flight is the smallest of: the total Crawler threads, `crawl.workTopicPartitions`, and `crawl.maxOutstandingUnits`.
+- **The largest unit is a floor.** No number of Crawlers finishes a run faster than its longest unit takes. Crawlers beyond `total work / largest unit` add nothing.
+- **A unit's cost is the number of directories it lists, not the number of files it finds.** A deep tree of nearly empty directories is slower than a flat one holding ten times the files.
+- **Each unit costs several milliseconds of messaging on top of its own work** (about 8 ms against a broker on the same machine): two flushes, a report, a commit and the next poll. Units should take seconds or more. A `depth` that yields thousands of units of a few hundred files each makes a crawl slower than not distributing it at all.
+- **Units cannot be moved once dealt.** They are dealt to the work topic's partitions in turn, and a partition is read by one Crawler thread, one unit at a time. A Crawler that has finished its own units does not take those queued behind another's long unit.
+- **Set `crawl.workTopicPartitions` to the number of Crawler threads you intend to run,** or a small multiple of it. The topic is created with that many partitions the first time any component needs it; changing the setting later does not change an existing topic.
+- **Crawlers have their own consumer group.** `crawl.consumerGroupId` must differ from `kafka.consumerGroupId`, or every Crawler that joins or leaves would interrupt the Workers. A config in which they are the same is rejected.
+
+In practice: choose the smallest `depth` that gives several times more units than Crawler threads, check the per-unit times that the Coordinator logs as units finish, and go one level deeper only if a few units dominate.
+
+A source that is fast to list, such as a local disk, is often traversed faster by a single connector thread than by any number of Crawlers. Distributing the crawl pays when listing the source is slow and the source can serve many listings at once.
 
 ## Security
 
@@ -145,7 +183,8 @@ A distributed crawl adds two shared topics, and what is written to them directs 
 - **Document IDs must be stable.** A unit can be executed more than once. A Connector that generates random IDs would index a second copy each time.
 - **Adding or removing a Crawler can repeat a unit.** When Crawlers join or leave, Kafka may move a partition from one Crawler to another. A unit that was executing on it is abandoned by the first Crawler and executed from the start by the second.
 - **A dead Crawler's unit waits for Kafka to notice.** A Crawler that is killed outright is removed from its consumer group only when its session times out, 45 seconds by default (`session.timeout.ms`, settable under `kafka.consumer`). Its unit is delivered to another Crawler after that. A Crawler that is stopped with SIGINT or SIGTERM finishes its unit and leaves the group at once.
-- **The work and control topics are created with one replica.** Set `crawl.topicReplicationFactor`, or create the topics yourself, for a cluster where losing a broker should not lose them.
+- **A run's topics are replicated as the cluster is configured to.** The work topic, the control topic and each run's event topic are created with the cluster's default replication factor unless `crawl.topicReplicationFactor` is set. The event topic is the only record of what a run has done, so a run whose event topic is lost cannot be resumed. In the other run modes the event topic is always created with one replica.
+- **Numbers in the `crawl` block may come from the environment.** A value substituted from an environment variable is text; `crawl.*` and `partitioning.*` settings accept a number written that way.
 - **Start Crawlers before the run.** A Crawler receives nothing until it has joined its consumer group, which can take tens of seconds when other members have recently come or gone.
 - **A unit that hangs is not detected.** A Crawler that is alive but stuck on a unit keeps it. The run then waits until `runner.connectorTimeout`.
 - **`FileConnector` state needs a shared database.** A partitioned `FileConnector` with `state` enabled requires `state.connectionString` to name a database that every Crawler and the Coordinator can reach; the embedded default is a file in one process's working directory. Expiry and `sendTombstones` are applied by the Coordinator after all units are done, since no single unit sees every file.

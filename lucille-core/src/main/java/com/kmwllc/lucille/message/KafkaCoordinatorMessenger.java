@@ -10,7 +10,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -50,7 +49,7 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
   // where the event topic ended when a replay began; null until then, and always if no replay was asked for
   private Map<TopicPartition, Long> replayEndOffsets;
   private final AtomicInteger nextWorkPartition = new AtomicInteger();
-  private int numWorkPartitions;
+  private int[] workPartitionOrder;
   private String runId;
   private String pipelineName;
   private String eventTopicName;
@@ -73,9 +72,11 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     this.pipelineName = pipelineName;
     this.eventTopicName = KafkaUtils.getEventTopicName(config, pipelineName, runId);
 
-    KafkaUtils.createEventTopic(config, pipelineName, runId);
-    KafkaUtils.createTopicIfAbsent(config,
-        new NewTopic(crawlConfig.workTopic, crawlConfig.workTopicPartitions, crawlConfig.topicReplicationFactor));
+    // One partition, so that the Events of a run are read in the order they were written. The topic is the only
+    // record of what the run has done, so it is replicated like the other topics of a crawl; KafkaUtils.createEventTopic,
+    // which the other run types use, always creates a single replica.
+    KafkaUtils.createTopicIfAbsent(config, crawlConfig.newTopic(eventTopicName, 1));
+    KafkaUtils.createTopicIfAbsent(config, crawlConfig.newTopic(crawlConfig.workTopic, crawlConfig.workTopicPartitions));
 
     this.documentProducer = KafkaUtils.createDocumentProducer(config);
     this.stringProducer = KafkaUtils.createEventProducer(config);
@@ -84,7 +85,7 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     }
 
     // an existing work topic may have a different number of partitions than this config would create it with
-    this.numWorkPartitions = stringProducer.partitionsFor(crawlConfig.workTopic).size();
+    this.workPartitionOrder = interleavedPartitionOrder(stringProducer.partitionsFor(crawlConfig.workTopic).size());
 
     assignEventConsumer(KafkaUtils.createUngroupedConsumer(config, "com.kmwllc.lucille-coordinator-" + pipelineName,
         EVENT_BATCH_SIZE), TOPIC_WAIT_MILLIS);
@@ -168,10 +169,36 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
 
   @Override
   public void dispatchUnit(WorkUnit unit) throws Exception {
-    // Units are dealt out to the partitions in turn. Choosing the partition from a hash of the key would leave some
-    // partitions, and so some Crawlers, with several times the units of others when a run has few units.
-    int partition = Math.floorMod(nextWorkPartition.getAndIncrement(), numWorkPartitions);
-    stringProducer.send(new ProducerRecord<>(crawlConfig.workTopic, partition, unit.unitId(), unit.toJson())).get();
+    stringProducer.send(new ProducerRecord<>(crawlConfig.workTopic, nextWorkPartition(), unit.unitId(), unit.toJson())).get();
+  }
+
+  // Units are dealt out to the partitions in turn rather than by a hash of their key, which would leave some
+  // partitions, and so some Crawlers, with several times the units of others when a run has few units.
+  private int nextWorkPartition() {
+    return workPartitionOrder[Math.floorMod(nextWorkPartition.getAndIncrement(), workPartitionOrder.length)];
+  }
+
+  /**
+   * Returns the partitions 0 to numPartitions - 1 in the order units should be dealt to them. Kafka gives each
+   * consumer of a topic a run of neighbouring partitions, so dealing to 0, 1, 2, ... would send every unit to one
+   * Crawler until its run of partitions was used up. This order visits partitions far apart from each other first
+   * (0, then half way, then the quarters, and so on), so that consecutive units reach different Crawlers however
+   * many of them share the topic.
+   */
+  static int[] interleavedPartitionOrder(int numPartitions) {
+    int bits = 32 - Integer.numberOfLeadingZeros(Math.max(numPartitions - 1, 0));
+    int[] order = new int[numPartitions];
+    int next = 0;
+
+    // the numbers below the next power of two, each with its bits reversed, less any that are not partitions
+    for (int i = 0; i < (1 << bits); i++) {
+      int reversed = bits == 0 ? 0 : Integer.reverse(i) >>> (32 - bits);
+      if (reversed < numPartitions) {
+        order[next++] = reversed;
+      }
+    }
+
+    return order;
   }
 
   /**
@@ -181,9 +208,8 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
   @Override
   public void logAndDispatchUnit(Event unitCreated, WorkUnit unit) throws Exception {
     checkException();
-    int partition = Math.floorMod(nextWorkPartition.getAndIncrement(), numWorkPartitions);
     ProducerRecord<String, String> workRecord =
-        new ProducerRecord<>(crawlConfig.workTopic, partition, unit.unitId(), unit.toJson());
+        new ProducerRecord<>(crawlConfig.workTopic, nextWorkPartition(), unit.unitId(), unit.toJson());
 
     stringProducer.send(new ProducerRecord<>(eventTopicName, unitCreated.getDocumentId(), unitCreated.toString()),
         (metadata, eventException) -> {

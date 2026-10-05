@@ -7,6 +7,7 @@ import com.typesafe.config.Config;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,9 +35,10 @@ public class KafkaRunControl implements RunControl {
   private final String controlTopic;
   private final KafkaProducer<String, String> producer;
 
-  // An instance serves one run, so what has been read about that run is kept between calls to latest().
+  // What has been read from the control topic so far, by run ID. Kept between calls so that each call only reads
+  // what has been added since. Each Status holds the time its record was written in place of its age.
   private KafkaConsumer<String, String> reader;
-  private Status latestRecord;
+  private final Map<String, Status> latestRecords = new TreeMap<>();
 
   public KafkaRunControl(Config config) throws Exception {
     CrawlConfig crawlConfig = new CrawlConfig(config);
@@ -57,7 +59,7 @@ public class KafkaRunControl implements RunControl {
    * keep a record of every run there has ever been; a run that has been silent for that long can no longer be resumed.
    */
   static NewTopic newControlTopic(CrawlConfig crawlConfig) {
-    return new NewTopic(crawlConfig.controlTopic, 1, crawlConfig.topicReplicationFactor)
+    return crawlConfig.newTopic(crawlConfig.controlTopic, 1)
         .configs(Map.of(
             TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_COMPACT + "," + TopicConfig.CLEANUP_POLICY_DELETE,
             TopicConfig.RETENTION_MS_CONFIG, String.valueOf(TimeUnit.DAYS.toMillis(7)),
@@ -66,12 +68,30 @@ public class KafkaRunControl implements RunControl {
   }
 
   /**
-   * Reads whatever has been added to the control topic since the last call and returns what it now says about the
-   * run. The record that counts is the one from the highest epoch, so a Coordinator that has been superseded cannot
-   * make the run appear to be its own again; within an epoch, a cancellation is final.
+   * The record that counts for a run is the one from the highest epoch, so a Coordinator that has been superseded
+   * cannot make the run appear to be its own again; within an epoch, a cancellation is final.
    */
   @Override
   public synchronized Status latest(String runId) throws Exception {
+    readNewRecords();
+    return withAge(latestRecords.get(runId));
+  }
+
+  @Override
+  public synchronized Map<String, Status> list() throws Exception {
+    readNewRecords();
+    Map<String, Status> statuses = new TreeMap<>();
+    latestRecords.forEach((runId, status) -> statuses.put(runId, withAge(status)));
+    return statuses;
+  }
+
+  private static Status withAge(Status status) {
+    return status == null ? null : new Status(status.cancelled(), status.epoch(), status.configHash(),
+        System.currentTimeMillis() - status.ageMillis(), status.reason());
+  }
+
+  // Reads whatever has been added to the control topic since the last call.
+  private void readNewRecords() {
     TopicPartition partition = new TopicPartition(controlTopic, 0);
 
     if (reader == null) {
@@ -82,35 +102,29 @@ public class KafkaRunControl implements RunControl {
 
     long end = reader.endOffsets(List.of(partition)).get(partition);
     while (reader.position(partition) < end) {
-      for (ConsumerRecord<String, String> record : reader.poll(Duration.ofSeconds(1))) {
-        if (runId.equals(record.key())) {
-          apply(record);
-        }
-      }
+      reader.poll(Duration.ofSeconds(1)).forEach(this::apply);
     }
-
-    return latestRecord == null ? null : new Status(latestRecord.cancelled(), latestRecord.epoch(),
-        latestRecord.configHash(), System.currentTimeMillis() - latestRecord.ageMillis());
   }
 
-  // latestRecord holds the time the record was written in place of its age
   private void apply(ConsumerRecord<String, String> record) {
     Status status;
     try {
       Event event = Event.fromJsonString(record.value());
       ObjectNode message = CrawlConfig.parseMessage(event.getMessage());
-      status = new Status(Event.Type.CANCEL.equals(event.getType()), message.path(EPOCH).asInt(),
-          message.path(CONFIG_HASH).asText(), record.timestamp());
+      boolean cancelled = Event.Type.CANCEL.equals(event.getType());
+      status = new Status(cancelled, message.path(EPOCH).asInt(), message.path(CONFIG_HASH).asText(), record.timestamp(),
+          cancelled ? message.path(REASON).asText(null) : null);
     } catch (Exception e) {
       log.warn("Ignoring unreadable record on control topic at offset {}.", record.offset(), e);
       return;
     }
 
-    boolean supersedes = latestRecord == null || status.epoch() > latestRecord.epoch()
-        || (status.epoch() == latestRecord.epoch() && !latestRecord.cancelled());
-    if (supersedes) {
-      latestRecord = status;
+    if (!CrawlConfig.isValidRunId(record.key())) {
+      return;
     }
+
+    latestRecords.merge(record.key(), status, (current, update) ->
+        update.epoch() > current.epoch() || (update.epoch() == current.epoch() && !current.cancelled()) ? update : current);
   }
 
   @Override

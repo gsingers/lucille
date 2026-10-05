@@ -119,6 +119,14 @@ public class PartitionedFileConnectorTest {
   }
 
   @Test
+  public void testDepthMayBeSuppliedAsString() throws Exception {
+    // as it is when it comes from an environment variable substitution
+    Config config = config("partitioning { depth: \"2\" }");
+    assertEquals(4, plan(config).size());
+    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { depth: \"0\" }")));
+  }
+
+  @Test
   public void testPlanSplitsByDirectory() throws Exception {
     Config config = config("partitioning { depth: 1 }");
     Map<String, ObjectNode> units = plan(config);

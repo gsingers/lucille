@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Supplier;
+import java.util.function.Function;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.apache.commons.lang3.time.StopWatch;
 import org.slf4j.Logger;
@@ -32,15 +32,18 @@ import org.slf4j.MDC;
 public class CrawlCoordinator {
 
   private static final Logger log = LoggerFactory.getLogger(CrawlCoordinator.class);
+  private static final long SILENCE_POLL_MILLIS = 500;
 
   private final Config config;
   private final String runId;
   private final RunControl runControl;
-  private final Supplier<CoordinatorMessenger> messengerFactory;
+  private final Function<Boolean, CoordinatorMessenger> messengerFactory;
   private final CrawlConfig crawlConfig;
   private final String configHash;
 
   private int epoch;
+  // whether this Coordinator is continuing a run that an earlier one started; decided when it claims the run
+  private boolean resuming;
   // true from when this Coordinator takes charge of the run until it announces the end of the run
   private volatile boolean runActive = false;
   private volatile CoordinatorPublisher currentPublisher;
@@ -51,20 +54,18 @@ public class CrawlCoordinator {
 
   /**
    * Creates a Coordinator that communicates through Kafka.
-   *
-   * @param resume whether the run was started by an earlier Coordinator and should be continued.
    */
-  public static CrawlCoordinator forKafka(Config config, String runId, boolean resume) throws Exception {
+  public static CrawlCoordinator forKafka(Config config, String runId) throws Exception {
     return new CrawlCoordinator(config, runId, new KafkaRunControl(config),
-        () -> new KafkaCoordinatorMessenger(config, resume));
+        replay -> new KafkaCoordinatorMessenger(config, replay));
   }
 
   /**
-   * @param messengerFactory creates the messenger for each connector. When resuming, the messengers must replay the
-   *                         run's existing Events.
+   * @param messengerFactory creates the messenger for each connector. It is given true when the run is being resumed,
+   *                         in which case the messenger must replay the run's existing Events.
    */
   public CrawlCoordinator(Config config, String runId, RunControl runControl,
-      Supplier<CoordinatorMessenger> messengerFactory) {
+      Function<Boolean, CoordinatorMessenger> messengerFactory) {
     this.config = config;
     this.runId = runId;
     this.runControl = runControl;
@@ -73,6 +74,8 @@ public class CrawlCoordinator {
     this.configHash = CrawlConfig.runConfigHash(config);
   }
 
+  private enum Mode { START, RESUME, START_OR_RESUME }
+
   /**
    * Executes the run.
    *
@@ -80,6 +83,22 @@ public class CrawlCoordinator {
    * @param force when resuming, whether to proceed even though the earlier Coordinator may still be running.
    */
   public RunResult run(boolean resume, boolean force) throws Exception {
+    return run(resume ? Mode.RESUME : Mode.START, force);
+  }
+
+  /**
+   * Executes the run, starting it if there is no record of it and continuing it if there is. Meant for a Coordinator
+   * that is restarted automatically with the same arguments, which cannot know which of the two it is doing.
+   *
+   * If the run's last heartbeat is recent, its earlier Coordinator may still be alive, so this waits for the
+   * heartbeat to go silent for <code>crawl.orphanTimeoutSecs</code> before taking over. If it does not go silent,
+   * another Coordinator has the run and this one gives up.
+   */
+  public RunResult startOrResume() throws Exception {
+    return run(Mode.START_OR_RESUME, false);
+  }
+
+  private RunResult run(Mode mode, boolean force) throws Exception {
     MDC.put(Document.RUNID_FIELD, runId);
     List<Connector> connectors = Connector.fromConfig(config);
     List<ConnectorResult> connectorResults = new ArrayList<>();
@@ -87,7 +106,7 @@ public class CrawlCoordinator {
     boolean status = false;
 
     try {
-      String refusal = claimRun(resume, force);
+      String refusal = claimRun(mode, force);
       if (refusal != null) {
         log.error(refusal);
         return new RunResult(false, connectors, connectorResults, runId);
@@ -114,7 +133,7 @@ public class CrawlCoordinator {
       heartbeat = startHeartbeat();
       Runner.onInterrupt(() -> endRun("interrupted"));
 
-      status = runConnectors(connectors, connectorResults, resume);
+      status = runConnectors(connectors, connectorResults, resuming);
       return new RunResult(status, connectors, connectorResults, runId);
     } finally {
       if (heartbeat != null) {
@@ -130,15 +149,16 @@ public class CrawlCoordinator {
   /**
    * Decides the epoch for this Coordinator, or returns a message explaining why it must not handle the run.
    */
-  private String claimRun(boolean resume, boolean force) throws Exception {
+  private String claimRun(Mode mode, boolean force) throws Exception {
     if (!CrawlConfig.isValidRunId(runId)) {
       return "Run ID " + runId + " cannot be used: it may contain only letters, digits, '.', '_' and '-', up to 128 of them.";
     }
 
     RunControl.Status previous = runControl.latest(runId);
 
-    if (!resume) {
+    if (mode == Mode.START || (mode == Mode.START_OR_RESUME && previous == null)) {
       epoch = 1;
+      resuming = false;
       return previous == null ? null
           : "Run ID " + runId + " has been used before. Use -resume to continue that run, or a different run ID.";
     }
@@ -149,7 +169,13 @@ public class CrawlCoordinator {
     if (!configHash.equals(previous.configHash())) {
       return "Cannot resume run " + runId + ": the connectors in this config differ from those it was started with.";
     }
-    if (!force && !previous.cancelled() && previous.ageMillis() < TimeUnit.SECONDS.toMillis(crawlConfig.orphanTimeoutSecs)) {
+
+    if (mode == Mode.START_OR_RESUME) {
+      previous = awaitSilence(previous);
+      if (isAlive(previous)) {
+        return "Cannot resume run " + runId + ": another Coordinator is sending heartbeats for it.";
+      }
+    } else if (!force && isAlive(previous)) {
       return "Cannot resume run " + runId + ": its Coordinator sent a heartbeat " + previous.ageMillis()
           + " ms ago and may still be running. Use -force to resume regardless.";
     }
@@ -159,8 +185,33 @@ public class CrawlCoordinator {
     }
 
     epoch = previous.epoch() + 1;
+    resuming = true;
     log.info("Resuming run {} as epoch {}.", runId, epoch);
     return null;
+  }
+
+  // Whether the run's Coordinator has been heard from recently enough that it may still be running.
+  private boolean isAlive(RunControl.Status status) {
+    return !status.cancelled() && status.ageMillis() < TimeUnit.SECONDS.toMillis(crawlConfig.orphanTimeoutSecs);
+  }
+
+  /**
+   * Waits for the run's heartbeat to have been silent for the orphan timeout, and returns the run's status then. A
+   * Coordinator that died stops sending heartbeats, so the wait ends; one that is alive keeps sending them, so the
+   * wait is given up after twice the timeout and the status returned still shows the run as alive.
+   */
+  private RunControl.Status awaitSilence(RunControl.Status status) throws Exception {
+    long deadline = System.currentTimeMillis() + 2 * TimeUnit.SECONDS.toMillis(crawlConfig.orphanTimeoutSecs);
+
+    if (isAlive(status)) {
+      log.info("Run {} had a heartbeat {} ms ago. Waiting for it to go silent before resuming.", runId, status.ageMillis());
+    }
+    while (isAlive(status) && System.currentTimeMillis() < deadline) {
+      Thread.sleep(SILENCE_POLL_MILLIS);
+      status = runControl.latest(runId);
+    }
+
+    return status;
   }
 
   private ScheduledExecutorService startHeartbeat() {
@@ -262,7 +313,7 @@ public class CrawlCoordinator {
 
   private CoordinatorPublisher newPublisher(Connector connector) throws Exception {
     String metricsPrefix = runId + "." + connector.getName() + "." + connector.getPipelineName();
-    return new CoordinatorPublisher(config, messengerFactory.get(), runId, connector, metricsPrefix, epoch);
+    return new CoordinatorPublisher(config, messengerFactory.apply(resuming), runId, connector, metricsPrefix, epoch);
   }
 
   private static void close(Object closeable, String description) {
@@ -308,7 +359,8 @@ public class CrawlCoordinator {
 
     publisher.redispatchOutstandingUnits();
 
-    int timeout = ConfigUtils.getOrDefault(config, "runner.connectorTimeout", Runner.DEFAULT_CONNECTOR_TIMEOUT);
+    int timeout = config.hasPath("runner.connectorTimeout") ? config.getInt("runner.connectorTimeout")
+        : Runner.DEFAULT_CONNECTOR_TIMEOUT;
     CoordinatorThread planner = new CoordinatorThread("Planner", () -> {
       if (!publisher.isPlanningDone()) {
         connector.plan(runId, publisher.getSink());

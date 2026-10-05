@@ -890,6 +890,37 @@ public class RunnerTest {
   }
 
   /**
+   * Verifies that -resumeIfExists starts or continues the run it is given, and is refused without a run ID to give.
+   */
+  @Test
+  public void testResumeIfExistsCliFlag() throws Exception {
+    runMainWithMockedRunner(new String[] {"-distributedCrawl", "-runId", "Nightly-42", "-resumeIfExists"}, mockedRunner -> {
+      mockedRunner.verify(() -> Runner.startOrResumeAndLogResult(any(), eq("Nightly-42"), eq(true)));
+      mockedRunner.verify(() -> Runner.runAndLogResult(any(), any(), any(), anyBoolean()), never());
+    });
+
+    // a Runner that generated its own run ID could not find the run again after a restart
+    for (String[] args : new String[][] {{"-distributedCrawl", "-resumeIfExists"}, {"-runId", "Nightly-42", "-resumeIfExists"}}) {
+      runMainWithMockedRunner(args, mockedRunner -> {
+        mockedRunner.verify(() -> Runner.startOrResumeAndLogResult(any(), any(), anyBoolean()), never());
+        mockedRunner.verify(() -> Runner.runAndLogResult(any(), any(), anyBoolean()), never());
+        mockedRunner.verify(() -> Runner.runAndLogResult(any(), any(), any(), anyBoolean()), never());
+      });
+    }
+  }
+
+  /**
+   * Verifies that -listRuns lists the runs and does not start one.
+   */
+  @Test
+  public void testListRunsCliFlag() throws Exception {
+    runMainWithMockedRunner(new String[] {"-listRuns"}, mockedRunner -> {
+      mockedRunner.verify(() -> Runner.listRuns(any()), times(1));
+      mockedRunner.verify(() -> Runner.runAndLogResult(any(), any(), anyBoolean()), never());
+    });
+  }
+
+  /**
    * Verifies that a distributed crawl is refused, before anything is started, when the config is invalid.
    */
   @Test
@@ -997,7 +1028,10 @@ public class RunnerTest {
           switch (invocation.getMethod().getName()) {
             case "runAndLogResult":
             case "resumeAndLogResult":
+            case "startOrResumeAndLogResult":
               return mockResult;
+            case "listRuns":
+              return null;
             case "runInValidationMode":
               return Collections.emptyMap();
             case "renderConfig":

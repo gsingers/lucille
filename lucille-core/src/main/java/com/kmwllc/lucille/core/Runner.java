@@ -201,6 +201,11 @@ public class Runner {
    * -resume &lt;id&gt;: continues the distributed crawl with the given run ID, which an earlier Runner started but did not
    * finish. Add -force to resume a run whose Runner appears to still be alive.
    * <p>
+   * -resumeIfExists: with -distributedCrawl and -runId, starts the run if there is no record of it and continues it if
+   * there is. For a Runner that is restarted automatically with the same arguments.
+   * <p>
+   * -listRuns: lists the distributed crawls on record, with the state of each, and exits.
+   * <p>
    * -render: prints out the effective/actual config in the exact form it will be seen by Lucille during the run
    */
   public static void main(String[] args) throws Exception {
@@ -233,6 +238,10 @@ public class Runner {
             .desc("Continue the unfinished distributed crawl with the given run ID").build())
         .addOption(Option.builder("force").hasArg(false)
             .desc("With -resume, continue the run even if its original Runner may still be alive").build())
+        .addOption(Option.builder("resumeifexists").hasArg(false)
+            .desc("With -distributedCrawl and -runId, continue the run if it was started before, else start it").build())
+        .addOption(Option.builder("listruns").hasArg(false)
+            .desc("List the distributed crawls on record and exit").build())
         .addOption(Option.builder("validate").hasArg(false)
             .desc("Validate the configuration and exit").build())
         .addOption(Option.builder("render").hasArg(false)
@@ -268,6 +277,18 @@ public class Runner {
       return;
     }
 
+    if (cli.hasOption("listruns")) {
+      listRuns(config);
+      return;
+    }
+
+    // A Runner that may be restarted has to be told its run ID: one it generated would be lost with it.
+    if (cli.hasOption("resumeifexists") && !(cli.hasOption("distributedcrawl") && cli.hasOption("runid"))) {
+      printHelp(cliOptions, "-resumeIfExists requires -distributedCrawl and -runId");
+      SystemHelper.exit(1);
+      return;
+    }
+
     // register a signal handler to attempt a clean shutdown of
     // Connector, Publisher, WorkerPool, and Indexer if an INT signal is received
     Signal.handle(new Signal("INT"), signal -> {
@@ -285,6 +306,8 @@ public class Runner {
     RunResult result;
     if (cli.hasOption("resume")) {
       result = resumeAndLogResult(config, cli.getOptionValue("resume"), cli.hasOption("force"), true);
+    } else if (cli.hasOption("resumeifexists")) {
+      result = startOrResumeAndLogResult(config, cli.getOptionValue("runid"), true);
     } else if (cli.hasOption("runid")) {
       result = runAndLogResult(config, runType, cli.getOptionValue("runid"), true);
     } else {
@@ -545,8 +568,51 @@ public class Runner {
       throws Exception {
     return logResult(config, runId, logMetrics, () -> {
       RunResult invalid = prepareRun(config, RunType.DISTRIBUTED_CRAWL, runId);
-      return invalid != null ? invalid : CrawlCoordinator.forKafka(config, runId, true).run(true, force);
+      return invalid != null ? invalid : CrawlCoordinator.forKafka(config, runId).run(true, force);
     });
+  }
+
+  /**
+   * Starts the distributed crawl with the given <code>runId</code>, or continues it if an earlier Runner started it,
+   * and logs the RunResult as {@link #runAndLogResult(Config, RunType, String, boolean)} does. For a Runner that is
+   * restarted automatically with the same arguments. If the run's earlier Runner may still be alive, waits for it
+   * to have been silent for <code>crawl.orphanTimeoutSecs</code> before taking over.
+   */
+  public static RunResult startOrResumeAndLogResult(Config config, String runId, boolean logMetrics) throws Exception {
+    return logResult(config, runId, logMetrics, () -> {
+      RunResult invalid = prepareRun(config, RunType.DISTRIBUTED_CRAWL, runId);
+      return invalid != null ? invalid : CrawlCoordinator.forKafka(config, runId).startOrResume();
+    });
+  }
+
+  /**
+   * Logs every distributed crawl there is a record of: its run ID, its state, the epoch of its latest Coordinator,
+   * and how long ago that Coordinator was last heard from. A run can be resumed by its ID for as long as it is listed.
+   */
+  public static void listRuns(Config config) throws Exception {
+    RunControl runControl = new KafkaRunControl(config);
+    try {
+      log.info(formatRuns(runControl.list(), new CrawlConfig(config).orphanTimeoutSecs));
+    } finally {
+      runControl.close();
+    }
+  }
+
+  // package access for unit test
+  static String formatRuns(Map<String, RunControl.Status> runs, int orphanTimeoutSecs) {
+    if (runs.isEmpty()) {
+      return "No distributed crawls are on record.";
+    }
+
+    StringBuilder table = new StringBuilder(String.format("%n%-40s %-22s %5s %s", "RUN ID", "STATE", "EPOCH", "LAST HEARD FROM"));
+    for (Map.Entry<String, RunControl.Status> run : runs.entrySet()) {
+      RunControl.Status status = run.getValue();
+      long ageSecs = TimeUnit.MILLISECONDS.toSeconds(status.ageMillis());
+      String state = status.cancelled() ? "ended (" + status.reason() + ")"
+          : ageSecs < orphanTimeoutSecs ? "running" : "silent, resumable";
+      table.append(String.format("%n%-40s %-22s %5d %d secs ago", run.getKey(), state, status.epoch(), ageSecs));
+    }
+    return table.toString();
   }
 
   private static RunResult logResult(Config config, String runId, boolean logMetrics, Callable<RunResult> run)
@@ -597,7 +663,7 @@ public class Runner {
     }
 
     if (type.equals(RunType.DISTRIBUTED_CRAWL)) {
-      return CrawlCoordinator.forKafka(config, runId, false).run(false, false);
+      return CrawlCoordinator.forKafka(config, runId).run(false, false);
     }
 
     List<Connector> connectors = Connector.fromConfig(config);

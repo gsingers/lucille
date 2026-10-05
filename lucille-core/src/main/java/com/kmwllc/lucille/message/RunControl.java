@@ -1,5 +1,7 @@
 package com.kmwllc.lucille.message;
 
+import java.util.Map;
+
 /**
  * API that a Coordinator uses to tell Crawlers whether a run is alive. One instance serves a whole run.
  */
@@ -12,14 +14,20 @@ public interface RunControl {
    * @param epoch the Coordinator epoch that wrote the record
    * @param configHash hash of the config the run was started with
    * @param ageMillis how long ago the record was written
+   * @param reason for a cancellation, why the run ended ("complete", "failed", "interrupted"); otherwise null
    */
-  record Status(boolean cancelled, int epoch, String configHash, long ageMillis) {
+  record Status(boolean cancelled, int epoch, String configHash, long ageMillis, String reason) {
   }
 
   /**
    * Returns the most recent control record for the given run, or null if there is none.
    */
   Status latest(String runId) throws Exception;
+
+  /**
+   * Returns the most recent control record of every run there is a record of, by run ID.
+   */
+  Map<String, Status> list() throws Exception;
 
   /**
    * Announces that the Coordinator of the given run is alive.

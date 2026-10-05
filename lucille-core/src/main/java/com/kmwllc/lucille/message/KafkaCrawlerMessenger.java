@@ -20,7 +20,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
-import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -86,8 +85,7 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
 
     try {
       // a Crawler can be started before any Coordinator has created the topic
-      KafkaUtils.createTopicIfAbsent(config,
-          new NewTopic(crawlConfig.workTopic, crawlConfig.workTopicPartitions, crawlConfig.topicReplicationFactor));
+      KafkaUtils.createTopicIfAbsent(config, crawlConfig.newTopic(crawlConfig.workTopic, crawlConfig.workTopicPartitions));
     } catch (Exception e) {
       throw new IllegalStateException("Could not create work topic " + crawlConfig.workTopic, e);
     }

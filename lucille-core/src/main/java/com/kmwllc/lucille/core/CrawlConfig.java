@@ -14,8 +14,10 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.regex.Pattern;
+import org.apache.kafka.clients.admin.NewTopic;
 
 /**
  * Settings for a distributed crawl, read from the optional <code>crawl</code> block of a Lucille config, along with
@@ -27,7 +29,8 @@ import java.util.regex.Pattern;
  *   <li>workTopicPartitions (Int, Optional) : Partitions to create the work topic with, if it does not exist. At most this
  *   many units are executed at once across all Crawlers. Defaults to 16.</li>
  *   <li>controlTopic (String, Optional) : Compacted Kafka topic carrying each run's heartbeat and cancellation. Defaults to "lucille_control".</li>
- *   <li>topicReplicationFactor (Int, Optional) : Replication factor used when creating the work and control topics. Defaults to 1.</li>
+ *   <li>topicReplicationFactor (Int, Optional) : Replication factor used when creating the work topic, the control topic and each
+ *   run's event topic. Defaults to the Kafka cluster's own default (<code>default.replication.factor</code>).</li>
  *   <li>consumerGroupId (String, Optional) : Consumer group for Crawlers. Must differ from kafka.consumerGroupId. Defaults to "lucille_crawlers".</li>
  *   <li>threads (Int, Optional) : Units executed concurrently by one Crawler process. Defaults to 1.</li>
  *   <li>maxOutstandingUnits (Int, Optional) : The Coordinator dispatches no more units while this many are incomplete. Defaults to 64.</li>
@@ -63,7 +66,8 @@ public final class CrawlConfig {
   public final String workTopic;
   public final int workTopicPartitions;
   public final String controlTopic;
-  public final short topicReplicationFactor;
+  // null when not configured, in which case topics are created with the cluster's default
+  public final Short topicReplicationFactor;
   public final String consumerGroupId;
   public final int threads;
   public final int maxOutstandingUnits;
@@ -75,7 +79,8 @@ public final class CrawlConfig {
     this.workTopic = ConfigUtils.getOrDefault(config, "crawl.workTopic", "lucille_work");
     this.workTopicPartitions = atLeastOne(config, "crawl.workTopicPartitions", 16);
     this.controlTopic = ConfigUtils.getOrDefault(config, "crawl.controlTopic", "lucille_control");
-    this.topicReplicationFactor = (short) atLeastOne(config, "crawl.topicReplicationFactor", 1);
+    this.topicReplicationFactor = config.hasPath("crawl.topicReplicationFactor")
+        ? (short) atLeastOne(config, "crawl.topicReplicationFactor", 1) : null;
     this.consumerGroupId = ConfigUtils.getOrDefault(config, "crawl.consumerGroupId", "lucille_crawlers");
     this.threads = atLeastOne(config, "crawl.threads", 1);
     this.maxOutstandingUnits = atLeastOne(config, "crawl.maxOutstandingUnits", 64);
@@ -94,11 +99,20 @@ public final class CrawlConfig {
   }
 
   private static int atLeastOne(Config config, String path, int defaultValue) {
-    int value = ConfigUtils.getOrDefault(config, path, defaultValue);
+    // getInt accepts a number written as a String, which is what a value substituted from the environment is
+    int value = config.hasPath(path) ? config.getInt(path) : defaultValue;
     if (value < 1) {
       throw new IllegalArgumentException(path + " must be at least 1.");
     }
     return value;
+  }
+
+  /**
+   * Describes a topic to be created for a distributed crawl. The work topic, the control topic and a run's event
+   * topic all hold what a run needs in order to continue or be resumed, so they share one replication setting.
+   */
+  public NewTopic newTopic(String name, int numPartitions) {
+    return new NewTopic(name, Optional.of(numPartitions), Optional.ofNullable(topicReplicationFactor));
   }
 
   /**
