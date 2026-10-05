@@ -18,6 +18,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.slf4j.Logger;
@@ -27,12 +28,18 @@ import com.kmwllc.lucille.util.ThreadNameUtils;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.kmwllc.lucille.connector.storageclient.BaseFileReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import org.apache.commons.codec.digest.DigestUtils;
 import com.kmwllc.lucille.connector.storageclient.StorageClient;
+import com.kmwllc.lucille.connector.storageclient.TraversalBudget;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams.PublishMode;
 import com.kmwllc.lucille.core.ConnectorException;
 import com.kmwllc.lucille.core.PartitionableConnector;
 import com.kmwllc.lucille.core.Publisher;
+import com.kmwllc.lucille.core.UnitContext;
 import com.kmwllc.lucille.core.WorkUnit;
 import com.kmwllc.lucille.core.WorkUnitSink;
 import com.kmwllc.lucille.core.spec.Spec;
@@ -83,10 +90,18 @@ import com.typesafe.config.Config;
  *   as expired. Must be at least 1. Defaults to 1.</li>
  *   <li>state.pathLength (Int, Optional) : Max length for stored file paths when Lucille creates the table. Defaults to 200.</li>
  *   <li>partitioning.depth (Int, Optional) : In a distributed crawl, split each path into one work unit per directory this
- *   many levels below it, plus one for the files directly in each directory above that level. Local paths and S3 are split;
- *   paths in other providers become one unit each. Defaults to 1. Without a partitioning block, a distributed crawl
- *   traverses all paths as a single unit. A partitioned connector that uses state needs state.connectionString to name a
- *   database every Crawler can reach, and applies expiry and sendTombstones once, after all units are done.</li>
+ *   many levels below it, plus one for the files directly in each directory above that level. With 0, each path is one
+ *   unit. Local paths and S3 are split; paths in other providers become one unit each. Defaults to 1. Without a
+ *   partitioning block, a distributed crawl traverses all paths as a single unit. A partitioned connector that uses
+ *   state needs state.connectionString to name a database every Crawler can reach, and applies expiry and
+ *   sendTombstones once, after all units are done.</li>
+ *   <li>partitioning.maxDirectoriesPerUnit (Int, Optional) : In a distributed crawl, the number of directories one work
+ *   unit lists before it stops descending. The directories it has found and not listed are handed back, in groups
+ *   of this many, and each group becomes a unit, so that a large subtree is shared among Crawlers instead of being
+ *   walked by one.
+ *   Local paths and S3 only. Not set by default, so a unit walks all of its subtree.</li>
+ *   <li>partitioning.maxUnitSecs (Int, Optional) : As maxDirectoriesPerUnit, but a limit on how long a unit goes on
+ *   listing directories. Either limit, when reached, ends the unit's descent.</li>
  *   <li>gcp.pathToServiceKey (String, Required) : Path to the Google Cloud service key JSON.</li>
  *   <li>gcp.maxNumOfPages (Int, Optional) : Maximum number of file references to hold in memory. Defaults to 100.</li>
  *   <li>s3.accessKeyId (String, Optional) : AWS access key ID (omit to use default credentials).</li>
@@ -109,7 +124,11 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
 
   // keys of a work unit's payload
   private static final String UNIT_PATH = "path";
+  // for a unit that covers several directories, in place of UNIT_PATH
+  private static final String UNIT_PATHS = "paths";
   private static final String UNIT_RECURSIVE = "recursive";
+  // how many directories are handed back as one unit when no limit on directories says how many a unit may list
+  private static final int DEFAULT_HAND_BACK_GROUP_SIZE = 64;
 
   public static final String FILE_PATH = "file_path";
   public static final String MODIFIED = "file_modification_date";
@@ -169,7 +188,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
               .optionalBoolean("performDeletions", "enabled")
               .optionalNumber("pathLength", "runsBeforeExpiration").build(),
           SpecBuilder.parent("partitioning")
-              .optionalNumber("depth").build(),
+              .optionalNumber("depth", "maxDirectoriesPerUnit", "maxUnitSecs").build(),
           GCP_PARENT_SPEC,
           AZURE_PARENT_SPEC,
           S3_PARENT_SPEC)
@@ -243,8 +262,15 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       log.warn("filterOptions.lastPublishedCutoff was specified, but no state configuration was provided. It will not be enforced.");
     }
 
-    if (isPartitioningEnabled() && partitioningDepth() < 1) {
-      throw new IllegalArgumentException("partitioning.depth must be at least 1.");
+    if (isPartitioningEnabled()) {
+      if (partitioningDepth() < 0) {
+        throw new IllegalArgumentException("partitioning.depth cannot be negative.");
+      }
+      for (String limit : List.of("partitioning.maxDirectoriesPerUnit", "partitioning.maxUnitSecs")) {
+        if (config.hasPath(limit) && config.getInt(limit) < 1) {
+          throw new IllegalArgumentException(limit + " must be at least 1.");
+        }
+      }
     }
   }
 
@@ -310,18 +336,22 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
   }
 
   @Override
-  public void executeUnit(WorkUnit unit, Publisher publisher) throws ConnectorException {
-    URI unitPath = parseUnitPath(unit);
+  public void executeUnit(WorkUnit unit, Publisher publisher, UnitContext context) throws ConnectorException {
+    List<URI> unitPaths = parseUnitPaths(unit);
     boolean recursive = unit.payload().path(UNIT_RECURSIVE).asBoolean(true);
     executedUnit = true;
 
     initializeStorageClients();
+    // one budget for the whole unit: once it is used up, the directories not yet reached are handed back unlisted
+    TraversalBudget budget = newUnitBudget(context);
 
     try {
       if (stateManager != null) {
         stateManager.openForPartialTraversal();
       }
-      traverseStoragePath(publisher, unitPath, recursive);
+      for (URI unitPath : unitPaths) {
+        traverseWithinBudget(publisher, unitPath, recursive, budget);
+      }
     } catch (ClassNotFoundException | SQLException e) {
       throw new ConnectorException("Error connecting to the state database.", e);
     } finally {
@@ -329,16 +359,89 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
         stateManager.closeStateForThread();
       }
     }
+
+    handBack(budget.getHandedBack(), context);
+    context.addSourceCalls(budget.getDirectoriesListed());
+  }
+
+  private void traverseWithinBudget(Publisher publisher, URI path, boolean recursive, TraversalBudget budget)
+      throws ConnectorException {
+    try {
+      TraversalParams params = new TraversalParams(config, path, getDocIdPrefix(), recursive, budget);
+      getStorageClient(path).traverse(publisher, params, stateManager);
+    } catch (ConnectorException e) {
+      throw e;
+    } catch (Exception e) {
+      throw new ConnectorException("Error occurred while traversing " + path + ".", e);
+    }
   }
 
   /**
-   * Returns the path a unit asks to have traversed. Units arrive over the network, so a path is only accepted if it
-   * lies within one of this connector's configured paths.
+   * Hands back the directories a unit found and did not walk. They are handed back in groups, each to be one unit,
+   * of as many directories as a unit may list. One unit for each directory would be simpler, but what a unit leaves
+   * over is mostly small: the siblings of the directories it was in when it stopped. Units of one small directory
+   * each cost more to dispatch than to execute.
    */
-  private URI parseUnitPath(WorkUnit unit) throws ConnectorException {
+  private void handBack(List<URI> directories, UnitContext context) {
+    int groupSize = config.hasPath("partitioning.maxDirectoriesPerUnit")
+        ? config.getInt("partitioning.maxDirectoriesPerUnit") : DEFAULT_HAND_BACK_GROUP_SIZE;
+
+    for (int from = 0; from < directories.size(); from += groupSize) {
+      List<URI> group = directories.subList(from, Math.min(from + groupSize, directories.size()));
+      String first = group.get(0).toString();
+
+      // a single directory is described as the planner would describe it, and so is the same unit as the planner's
+      if (group.size() == 1) {
+        context.handBack(first, WorkUnit.newPayload().put(UNIT_PATH, first).put(UNIT_RECURSIVE, true));
+        continue;
+      }
+
+      ObjectNode payload = WorkUnit.newPayload().put(UNIT_RECURSIVE, true);
+      ArrayNode paths = payload.putArray(UNIT_PATHS);
+      group.forEach(directory -> paths.add(directory.toString()));
+      // the key has to be the same whenever the same directories are handed back together, and different otherwise
+      String key = first + "+" + (group.size() - 1) + "~" + DigestUtils.sha256Hex(paths.toString()).substring(0, 16);
+      context.handBack(key, payload);
+    }
+  }
+
+  // The limits on one unit's traversal. With neither limit configured the budget only counts directories listed.
+  private TraversalBudget newUnitBudget(UnitContext context) {
+    Integer maxDirectories = config.hasPath("partitioning.maxDirectoriesPerUnit")
+        ? config.getInt("partitioning.maxDirectoriesPerUnit") : null;
+    Long maxMillis = config.hasPath("partitioning.maxUnitSecs")
+        ? TimeUnit.SECONDS.toMillis(config.getInt("partitioning.maxUnitSecs")) : null;
+    // a unit that has been given up on stops listing as well
+    return new TraversalBudget(maxDirectories, maxMillis, context::isCancelled);
+  }
+
+  /**
+   * Returns the paths a unit asks to have traversed: the one it names, or each of several.
+   */
+  private List<URI> parseUnitPaths(WorkUnit unit) throws ConnectorException {
+    JsonNode paths = unit.payload().path(UNIT_PATHS);
+    if (paths.isMissingNode()) {
+      return List.of(parseUnitPath(unit, unit.payload().path(UNIT_PATH).asText()));
+    }
+    if (!paths.isArray() || paths.isEmpty()) {
+      throw new ConnectorException("Work unit " + unit.unitId() + " names no paths.");
+    }
+
+    List<URI> unitPaths = new ArrayList<>();
+    for (JsonNode path : paths) {
+      unitPaths.add(parseUnitPath(unit, path.asText()));
+    }
+    return unitPaths;
+  }
+
+  /**
+   * Returns a path that a unit asks to have traversed. Units arrive over the network, so a path is only accepted if
+   * it lies within one of this connector's configured paths.
+   */
+  private URI parseUnitPath(WorkUnit unit, String path) throws ConnectorException {
     URI unitPath;
     try {
-      unitPath = new URI(unit.payload().path(UNIT_PATH).asText()).normalize();
+      unitPath = new URI(path).normalize();
     } catch (URISyntaxException e) {
       throw new ConnectorException("Work unit " + unit.unitId() + " has an invalid path.", e);
     }

@@ -47,6 +47,8 @@ public class CrawlCoordinator {
   // true from when this Coordinator takes charge of the run until it announces the end of the run
   private volatile boolean runActive = false;
   private volatile CoordinatorPublisher currentPublisher;
+  // what a Coordinator that finds itself stuck does after it stops sending heartbeats; replaced in tests
+  private Runnable stuckAction = () -> System.exit(1);
 
   // the first connector that has a pipeline, and the Publisher that was set up for it before the run was announced
   private Connector preparedConnector;
@@ -221,7 +223,7 @@ public class CrawlCoordinator {
 
     executor.scheduleAtFixedRate(() -> {
       try {
-        if (runActive && !supersededOrCancelled()) {
+        if (runActive && !stuck() && !supersededOrCancelled()) {
           runControl.heartbeat(runId, epoch, configHash);
         }
       } catch (Exception e) {
@@ -230,6 +232,34 @@ public class CrawlCoordinator {
     }, crawlConfig.heartbeatSecs, crawlConfig.heartbeatSecs, TimeUnit.SECONDS);
 
     return executor;
+  }
+
+  /**
+   * Checks whether the thread that reads the run's Events has stopped going round its loop. Heartbeats come from a
+   * thread of their own, so without this check they would go on saying the run is alive while nothing can complete,
+   * and a replacement Coordinator would be refused. A stuck Coordinator stops sending heartbeats and exits, so that
+   * Crawlers treat the run as orphaned and whatever restarts the Coordinator can resume it.
+   *
+   * Only the wait for units and Documents is watched. A connector's lifecycle methods run on the same thread and
+   * may properly take a long time.
+   */
+  private boolean stuck() {
+    CoordinatorPublisher publisher = currentPublisher;
+    long limitMillis = TimeUnit.SECONDS.toMillis(crawlConfig.orphanTimeoutSecs);
+    if (publisher == null || publisher.millisSinceWaitIteration() <= limitMillis) {
+      return false;
+    }
+
+    log.error("The Coordinator of run {} has not processed Events for {} ms and is taken to be stuck. It will stop "
+        + "sending heartbeats and exit; the run can be resumed.", runId, publisher.millisSinceWaitIteration());
+    runActive = false;
+    stuckAction.run();
+    return true;
+  }
+
+  // package access for unit tests
+  void setStuckAction(Runnable stuckAction) {
+    this.stuckAction = stuckAction;
   }
 
   /**

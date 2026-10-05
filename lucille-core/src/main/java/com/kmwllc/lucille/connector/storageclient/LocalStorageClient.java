@@ -124,9 +124,16 @@ public class LocalStorageClient extends BaseStorageClient {
 
       if (isSkippedDirectory(dirURI, params)) {
         return FileVisitResult.SKIP_SUBTREE;
-      } else {
-        return FileVisitResult.CONTINUE;
       }
+
+      // a traversal with a budget lists only as many directories as it allows, and hands the rest back unwalked
+      TraversalBudget budget = params.getBudget();
+      if (budget != null && !budget.mayList()) {
+        budget.handBack(dirURI);
+        return FileVisitResult.SKIP_SUBTREE;
+      }
+
+      return FileVisitResult.CONTINUE;
     }
 
     private static String ensureTrailingSlash(String s) {

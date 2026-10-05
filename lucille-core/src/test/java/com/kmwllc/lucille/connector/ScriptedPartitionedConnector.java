@@ -4,11 +4,13 @@ import com.kmwllc.lucille.core.ConnectorException;
 import com.kmwllc.lucille.core.Document;
 import com.kmwllc.lucille.core.PartitionableConnector;
 import com.kmwllc.lucille.core.Publisher;
+import com.kmwllc.lucille.core.UnitContext;
 import com.kmwllc.lucille.core.WorkUnit;
 import com.kmwllc.lucille.core.WorkUnitSink;
 import com.kmwllc.lucille.core.spec.Spec;
 import com.kmwllc.lucille.core.spec.SpecBuilder;
 import com.typesafe.config.Config;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -47,8 +49,24 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
   public static volatile int gateAfter = -1;
   public static volatile CountDownLatch gate = new CountDownLatch(0);
   private static final AtomicInteger started = new AtomicInteger();
+  /** Units that wait for {@link #gate} to open before publishing anything, whenever they are executed. */
+  public static final Set<String> gatedUnits = ConcurrentHashMap.newKeySet();
+  /** Units that are waiting for {@link #gate} to open, or have waited for it. */
+  public static final Set<String> reachedGate = ConcurrentHashMap.newKeySet();
   /** Units that have published all of their Documents. */
   public static final Set<String> completed = ConcurrentHashMap.newKeySet();
+  /**
+   * For a unit, the keys of the parts it hands back each time it is executed. A part is executed like a planned unit,
+   * and may itself have parts to hand back.
+   */
+  public static final Map<String, List<String>> handBacks = new ConcurrentHashMap<>();
+  /** Units that, the first time they are executed, wait for {@link #hang} to open before doing anything. */
+  public static final Set<String> hangOnce = ConcurrentHashMap.newKeySet();
+  /** Units that found their execution cancelled once {@link #hang} had opened. */
+  public static final Set<String> sawCancelled = ConcurrentHashMap.newKeySet();
+  /** Units that wait for {@link #hang} to open every time they are executed. */
+  public static final Set<String> hangAlways = ConcurrentHashMap.newKeySet();
+  public static volatile CountDownLatch hang = new CountDownLatch(0);
   /** Published by finalizeRun(), if set. */
   public static volatile String finalizeDocId = null;
 
@@ -73,6 +91,14 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     gate = new CountDownLatch(0);
     started.set(0);
     completed.clear();
+    handBacks.clear();
+    hangOnce.clear();
+    sawCancelled.clear();
+    gatedUnits.clear();
+    reachedGate.clear();
+    hangAlways.clear();
+    hang.countDown();
+    hang = new CountDownLatch(0);
     finalizeDocId = null;
   }
 
@@ -105,9 +131,9 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
   }
 
   @Override
-  public void executeUnit(WorkUnit unit, Publisher publisher) throws ConnectorException {
-    int unitNumber = unit.payload().get("unit").asInt();
-    String unitKey = "u" + unitNumber;
+  public void executeUnit(WorkUnit unit, Publisher publisher, UnitContext context) throws ConnectorException {
+    // a planned unit is described by its number, a handed-back part by its key
+    String unitKey = unit.payload().has("key") ? unit.payload().get("key").asText() : "u" + unit.payload().get("unit").asInt();
     int execution = executions.computeIfAbsent(unitKey, k -> new AtomicInteger()).incrementAndGet();
 
     if (failAlways.contains(unitKey) || (execution == 1 && failOnce.contains(unitKey))) {
@@ -115,7 +141,14 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     }
 
     try {
-      if (started.incrementAndGet() > gateAfter && gateAfter >= 0) {
+      if (hangAlways.contains(unitKey) || (execution == 1 && hangOnce.contains(unitKey))) {
+        hang.await();
+        if (context.isCancelled()) {
+          sawCancelled.add(unitKey);
+        }
+      }
+      if ((started.incrementAndGet() > gateAfter && gateAfter >= 0) || gatedUnits.contains(unitKey)) {
+        reachedGate.add(unitKey);
         gate.await();
       }
 
@@ -127,6 +160,10 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
           throw new NoClassDefFoundError("Scripted error while executing " + unitKey);
         }
       }
+      for (String part : handBacks.getOrDefault(unitKey, List.of())) {
+        context.handBack(part, WorkUnit.newPayload().put("key", part));
+      }
+      context.addSourceCalls(1);
       completed.add(unitKey);
     } catch (Exception e) {
       throw new ConnectorException("Error publishing document", e);

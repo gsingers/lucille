@@ -14,6 +14,10 @@ import com.kmwllc.lucille.message.KafkaCoordinatorMessenger;
 import com.kmwllc.lucille.message.KafkaCrawlerMessenger;
 import com.kmwllc.lucille.message.KafkaRunControl;
 import com.kmwllc.lucille.message.KafkaUtils;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -23,7 +27,9 @@ import com.kmwllc.lucille.message.WorkerMessengerFactory;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 import java.util.function.BooleanSupplier;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -109,6 +115,7 @@ public class KafkaDistributedCrawlTest {
   @After
   public void tearDown() throws Exception {
     ScriptedPartitionedConnector.gate.countDown();
+    ScriptedPartitionedConnector.hang.countDown();
     crawlerPool.stop();
     crawlerPool.join(10_000);
     workerPool.stop();
@@ -240,6 +247,157 @@ public class KafkaDistributedCrawlTest {
     } finally {
       runControl.close();
     }
+  }
+
+  @Test
+  public void testHandedBackPartsAreExecutedAsUnits() throws Exception {
+    String runId = "run-" + pipeline;
+    ScriptedPartitionedConnector.handBacks.put("u0", List.of("p1", "p2"));
+    ScriptedPartitionedConnector.handBacks.put("p1", List.of("p3"));
+    // a part that another unit hands back as well, and a unit the planner made
+    ScriptedPartitionedConnector.handBacks.put("u4", List.of("p2", "u5"));
+
+    RunResult result = Runner.startOrResumeAndLogResult(config, runId, false);
+
+    // six planned units and three parts, three Documents each
+    assertTrue(result.getStatus());
+    assertEquals(27, numSucceeded(result));
+    assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5", "p1", "p2", "p3"));
+
+    // Resuming reads the whole log again. The parts are in it only as named by the reports of the units that handed
+    // them back, followed by their own completions, and that is enough to know that all of them are done.
+    RunResult again = Runner.startOrResumeAndLogResult(config, runId, false);
+    assertTrue(again.getStatus());
+    assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5", "p1", "p2", "p3"));
+    assertEquals(1, ScriptedPartitionedConnector.finalizes.get());
+  }
+
+  @Test
+  public void testResumeExecutesPartsHandedBackBeforeTheCoordinatorDied() throws Exception {
+    String runId = "run-" + pipeline;
+    // every planned unit hands back a part, and no part can finish until the gate opens
+    ScriptedPartitionedConnector.gate = new CountDownLatch(1);
+    List<String> planned = List.of("u0", "u1", "u2", "u3", "u4", "u5");
+    List<String> parts = List.of("p0", "p1", "p2", "p3", "p4", "p5");
+    for (int i = 0; i < 6; i++) {
+      ScriptedPartitionedConnector.handBacks.put(planned.get(i), List.of(parts.get(i)));
+      ScriptedPartitionedConnector.gatedUnits.add(parts.get(i));
+    }
+
+    SilenceableRunControl firstControl = new SilenceableRunControl(new KafkaRunControl(config));
+    CrawlCoordinator first = new CrawlCoordinator(config, runId, firstControl, replay -> new KafkaCoordinatorMessenger(config, replay));
+    Thread firstThread = new Thread(() -> {
+      try {
+        first.run(false, false);
+      } catch (Exception e) {
+        // expected: the thread is interrupted below
+      }
+    });
+    firstThread.start();
+
+    // Kill the first Coordinator once a part is being executed. Other parts have been dispatched and not started,
+    // or been reported and not dispatched, or belong to planned units that have not been executed yet.
+    waitFor("a part to be executed", () -> !ScriptedPartitionedConnector.reachedGate.isEmpty());
+    String[] doneBeforeDeath = ScriptedPartitionedConnector.completed.toArray(new String[0]);
+    firstControl.silent = true;
+    firstThread.interrupt();
+    firstThread.join(30_000);
+    assertFalse(firstThread.isAlive());
+
+    Thread.sleep(4000);
+    ScriptedPartitionedConnector.gate.countDown();
+
+    RunResult result = Runner.resumeAndLogResult(config, runId, false, false);
+
+    // every unit and every part was executed, whichever state the first Coordinator left it in
+    assertTrue(result.getStatus());
+    assertTrue(ScriptedPartitionedConnector.completed.containsAll(planned));
+    assertTrue(ScriptedPartitionedConnector.completed.containsAll(parts));
+    assertTrue("succeeded: " + numSucceeded(result), numSucceeded(result) >= 36);
+    // and what was done before it died was not done again
+    assertTrue(executedOnce(doneBeforeDeath));
+  }
+
+  @Test
+  public void testFileConnectorSharesOutALargeTree() throws Exception {
+    // three levels of directories, three wide, with two files in each: 13 directories and 26 files
+    Path root = Files.createTempDirectory("crawl-tree");
+    int numFiles = 0;
+    try {
+      List<Path> level = List.of(root);
+      for (int depth = 0; depth < 3; depth++) {
+        List<Path> next = new ArrayList<>();
+        for (Path directory : level) {
+          Files.writeString(directory.resolve("one.txt"), "one");
+          Files.writeString(directory.resolve("two.txt"), "two");
+          numFiles += 2;
+          for (int i = 0; depth < 2 && i < 3; i++) {
+            next.add(Files.createDirectory(directory.resolve("d" + i)));
+          }
+        }
+        level = next;
+      }
+
+      // The whole tree is planned as one unit, and a unit may list three directories.
+      Config fileConfig = ConfigFactory.parseString("""
+          connectors: [{
+            name: "files", class: "com.kmwllc.lucille.connector.FileConnector", pipeline: "%s",
+            paths: ["%s"], partitioning { depth: 0, maxDirectoriesPerUnit: 3 }
+          }]
+          """.formatted(pipeline, root.toUri())).withFallback(config);
+
+      // Crawlers execute units of the connectors they were configured with
+      crawlerPool.stop();
+      crawlerPool.join(10_000);
+      crawlerPool = new CrawlerPool(fileConfig, CrawlerMessengerFactory.getKafkaFactory(fileConfig));
+      crawlerPool.start();
+
+      RunResult result = Runner.run(fileConfig, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
+
+      // every file was published once, though no unit walked more than three of the thirteen directories
+      assertTrue(result.getStatus());
+      assertEquals(26, numFiles);
+      assertEquals(26, numSucceeded(result));
+
+      // 13 directories at 3 a unit cannot be done in fewer than 5 units
+      try (KafkaConsumer<String, String> consumer = KafkaUtils.createUngroupedConsumer(fileConfig, "test", 10)) {
+        List<TopicPartition> partitions = consumer.partitionsFor("work_" + pipeline).stream()
+            .map(info -> new TopicPartition(info.topic(), info.partition())).toList();
+        long numUnits = consumer.endOffsets(partitions).values().stream().mapToLong(Long::longValue).sum();
+        assertTrue("units: " + numUnits, numUnits >= 5 && numUnits <= 13);
+      }
+    } finally {
+      try (Stream<Path> paths = Files.walk(root)) {
+        paths.sorted(Comparator.reverseOrder()).forEach(path -> path.toFile().delete());
+      }
+    }
+  }
+
+  @Test
+  public void testUnitThatHangsIsReportedAndExecutedAgain() throws Exception {
+    Config limited = ConfigFactory.parseString("crawl.maxUnitSecs: 2").withFallback(config);
+    crawlerPool.stop();
+    crawlerPool.join(10_000);
+    crawlerPool = new CrawlerPool(limited, CrawlerMessengerFactory.getKafkaFactory(limited));
+    AtomicInteger exits = new AtomicInteger();
+    crawlerPool.setExitAction(exits::incrementAndGet);
+    crawlerPool.start();
+
+    ScriptedPartitionedConnector.hang = new CountDownLatch(1);
+    ScriptedPartitionedConnector.hangOnce.add("u3");
+
+    RunResult result = Runner.run(limited, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
+
+    assertTrue(result.getStatus());
+    assertEquals(18, numSucceeded(result));
+    // Once as the attempt that hung and once as the attempt that replaced it. The attempt that hung was acknowledged,
+    // so it was not delivered to another Crawler to hang that one too. And the Crawler that hung gave up its
+    // partitions of the work topic, or the units on them, which may include the replacement attempt, would have
+    // waited for it for ever.
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("u3"));
+    assertTrue(executedOnce("u0", "u1", "u2", "u4", "u5"));
+    assertEquals(0, exits.get());
+    ScriptedPartitionedConnector.hang.countDown();
   }
 
   @Test

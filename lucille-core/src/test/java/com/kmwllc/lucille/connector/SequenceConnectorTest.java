@@ -79,7 +79,7 @@ public class SequenceConnectorTest {
     TestMessenger unitMessenger = new TestMessenger();
     Publisher unitPublisher = new PublisherImpl(config, unitMessenger, "run1", "pipeline1");
     for (Map.Entry<String, ObjectNode> unit : units.entrySet()) {
-      connector.executeUnit(unit(unit.getKey(), unit.getValue()), unitPublisher);
+      connector.executeUnit(unit(unit.getKey(), unit.getValue()), unitPublisher, new RecordingUnitContext());
     }
 
     assertEquals(wholeMessenger.getDocsSentForProcessing(), unitMessenger.getDocsSentForProcessing());
@@ -99,7 +99,8 @@ public class SequenceConnectorTest {
         WorkUnit.newPayload().put("from", -5).put("to", 3),
         WorkUnit.newPayload().put("from", 6).put("to", 2),
         WorkUnit.newPayload())) {
-      assertThrows(ConnectorException.class, () -> connector.executeUnit(unit("bad", payload), publisher));
+      assertThrows(ConnectorException.class,
+          () -> connector.executeUnit(unit("bad", payload), publisher, new RecordingUnitContext()));
     }
     assertTrue(messenger.getDocsSentForProcessing().isEmpty());
   }

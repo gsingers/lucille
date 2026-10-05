@@ -43,8 +43,11 @@ public interface PartitionableConnector extends Connector {
   /**
    * Publishes the Documents belonging to one unit. Executing the same unit again must publish Documents with the
    * same IDs, so that a repeated unit overwrites what the earlier execution indexed instead of duplicating it.
+   *
+   * A unit that turns out to be large may publish part of what it covers and hand the rest back through the
+   * context, to be executed as further units.
    */
-  void executeUnit(WorkUnit unit, Publisher publisher) throws ConnectorException;
+  void executeUnit(WorkUnit unit, Publisher publisher, UnitContext context) throws ConnectorException;
 
   /**
    * Performs any logic that needs a view of the whole run, which no single unit has. Documents may be published.

@@ -608,6 +608,44 @@ public class LocalStorageClientTest {
     localStorageClient.shutdown();
   }
 
+  // A traversal with a budget lists as many directories as it allows and hands back the rest, unwalked.
+  @Test
+  public void testTraverseWithinBudget() throws Exception {
+    Config connectorConfig = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("excludes", List.of(".*\\.DS_Store$"))));
+    URI root = URI.create("src/test/resources/StorageClientTest/testPublishFilesDefault");
+    URI subdir1 = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault/subdir1").toAbsolutePath().toUri();
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    localStorageClient.init();
+
+    // one directory: the four files in the root are published and subdir1 is handed back
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = new TraversalBudget(1, null);
+    localStorageClient.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(connectorConfig, root, "", true, budget));
+    assertEquals(4, messenger.getDocsSentForProcessing().size());
+    assertEquals(List.of(subdir1), budget.getHandedBack());
+    assertEquals(1, budget.getDirectoriesListed());
+
+    // two directories: everything is walked and nothing is handed back
+    messenger = new TestMessenger();
+    budget = new TraversalBudget(2, null);
+    localStorageClient.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(connectorConfig, root, "", true, budget));
+    assertEquals(8, messenger.getDocsSentForProcessing().size());
+    assertEquals(List.of(), budget.getHandedBack());
+    assertEquals(2, budget.getDirectoriesListed());
+
+    // a budget with no limits walks everything too, and counts
+    messenger = new TestMessenger();
+    budget = TraversalBudget.unlimited();
+    localStorageClient.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(connectorConfig, root, "", true, budget));
+    assertEquals(8, messenger.getDocsSentForProcessing().size());
+    assertEquals(2, budget.getDirectoriesListed());
+
+    localStorageClient.shutdown();
+  }
+
   @Test
   public void testListSubdirectories() throws Exception {
     LocalStorageClient localStorageClient = new LocalStorageClient();

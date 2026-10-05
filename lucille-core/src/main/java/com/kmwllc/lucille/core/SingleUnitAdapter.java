@@ -32,7 +32,7 @@ final class SingleUnitAdapter implements PartitionableConnector {
   }
 
   @Override
-  public void executeUnit(WorkUnit unit, Publisher publisher) throws ConnectorException {
+  public void executeUnit(WorkUnit unit, Publisher publisher, UnitContext context) throws ConnectorException {
     delegate.execute(publisher);
   }
 

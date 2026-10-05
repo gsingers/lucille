@@ -384,6 +384,7 @@ public class PublisherImpl implements Publisher {
     // each event. We would then join on the connector thread, then the Event handling thread, and
     // finally stop the logging thread.
     while (true) {
+      onWaitIteration();
 
       // we assume that messenger.pollEvent() is a blocking operation with a timeout in the range
       // of several milliseconds to several seconds.
@@ -468,6 +469,12 @@ public class PublisherImpl implements Publisher {
    */
   protected boolean hasOutstandingWork() {
     return false;
+  }
+
+  /**
+   * Called by waitForCompletion() each time round its loop, which is at least every few seconds. Does nothing here.
+   */
+  protected void onWaitIteration() {
   }
 
   /**

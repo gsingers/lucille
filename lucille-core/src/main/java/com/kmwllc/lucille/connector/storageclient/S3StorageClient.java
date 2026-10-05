@@ -12,6 +12,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
 import org.slf4j.Logger;
@@ -102,7 +105,61 @@ public class S3StorageClient extends BaseStorageClient {
 
   @Override
   protected void traverseStorageClient(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr) throws Exception {
-    traversePrefix(publisher, params, stateMgr, getStartingDirectory(params));
+    if (params.getBudget() != null) {
+      traverseWithinBudget(publisher, params, stateMgr, getStartingDirectory(params));
+    } else {
+      traversePrefix(publisher, params, stateMgr, getStartingDirectory(params));
+    }
+  }
+
+  /**
+   * Traverses as traversePrefix does, but lists only as many prefixes as the budget allows and hands the rest back.
+   * The prefixes still to be listed are kept on a stack, where traversePrefix keeps them in its recursion, so that
+   * whatever is left when the budget runs out can be handed back. A prefix's objects are all published before any of
+   * the prefixes beneath it is listed.
+   */
+  private void traverseWithinBudget(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr,
+      String startingPrefix) {
+    TraversalBudget budget = params.getBudget();
+    Deque<String> prefixes = new ArrayDeque<>();
+    prefixes.push(startingPrefix);
+
+    while (!prefixes.isEmpty()) {
+      String prefix = prefixes.pop();
+
+      if (!budget.mayList()) {
+        budget.handBack(uriForDirectory(prefix, params));
+        continue;
+      }
+
+      ListObjectsV2Request request = ListObjectsV2Request.builder()
+          .bucket(getBucketOrContainerName(params))
+          .prefix(prefix)
+          .delimiter("/")
+          .maxKeys(maxNumOfPages)
+          .build();
+
+      List<String> prefixesBeneath = new ArrayList<>();
+      s3.listObjectsV2Paginator(request).stream().forEachOrdered(resp -> {
+        resp.contents().forEach(obj -> {
+          S3FileReference fileRef = new S3FileReference(obj, params);
+          processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
+        });
+
+        if (params.isRecursive()) {
+          resp.commonPrefixes().forEach(cp -> {
+            if (!isSkippedDirectory(uriForDirectory(cp.prefix(), params), params)) {
+              prefixesBeneath.add(cp.prefix());
+            }
+          });
+        }
+      });
+
+      // pushed last first, so that they are listed in the order the store returned them
+      for (int i = prefixesBeneath.size() - 1; i >= 0; i--) {
+        prefixes.push(prefixesBeneath.get(i));
+      }
+    }
   }
 
   private void traversePrefix(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr, String prefix) {

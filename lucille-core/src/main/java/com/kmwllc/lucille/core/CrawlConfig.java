@@ -36,7 +36,14 @@ import org.apache.kafka.clients.admin.NewTopic;
  *   <li>maxOutstandingUnits (Int, Optional) : The Coordinator dispatches no more units while this many are incomplete. Defaults to 64.</li>
  *   <li>maxAttempts (Int, Optional) : Times a unit is dispatched before its failure fails the connector. Defaults to 3.</li>
  *   <li>heartbeatSecs (Int, Optional) : Period of the Coordinator's heartbeat. Defaults to 10.</li>
- *   <li>orphanTimeoutSecs (Int, Optional) : Crawlers give up on a run whose heartbeat is older than this. Defaults to 120.</li>
+ *   <li>orphanTimeoutSecs (Int, Optional) : Crawlers give up on a run whose heartbeat is older than this. A Coordinator
+ *   whose own Event loop has been stuck for this long stops and exits. Defaults to 120.</li>
+ *   <li>maxUnitSecs (Int, Optional) : A unit that has been executing for this long is reported as failed, so that it
+ *   is dispatched again, and its Crawler thread is replaced. The thread itself cannot be stopped and is left behind.
+ *   Not set by default, so a unit may take any length of time.</li>
+ *   <li>exitOnTimeout (Boolean, Optional) : Whether a Crawler process exits after reporting a unit that passed
+ *   maxUnitSecs, instead of replacing the thread. Exiting is the only way to free what a stuck thread holds, and
+ *   suits a deployment that restarts Crawlers. Defaults to false.</li>
  * </ul>
  */
 public final class CrawlConfig {
@@ -44,7 +51,8 @@ public final class CrawlConfig {
   public static final Spec SPEC = SpecBuilder.withoutDefaults()
       .optionalString("workTopic", "controlTopic", "consumerGroupId")
       .optionalNumber("workTopicPartitions", "topicReplicationFactor", "threads", "maxOutstandingUnits", "maxAttempts",
-          "heartbeatSecs", "orphanTimeoutSecs").build();
+          "heartbeatSecs", "orphanTimeoutSecs", "maxUnitSecs")
+      .optionalBoolean("exitOnTimeout").build();
 
   // Config keys whose values are left out of the config hash, so that a hash published to Kafka cannot be used to
   // confirm a guess at a credential.
@@ -74,6 +82,9 @@ public final class CrawlConfig {
   public final int maxAttempts;
   public final int heartbeatSecs;
   public final int orphanTimeoutSecs;
+  // null when not configured, in which case a unit is never timed out
+  public final Integer maxUnitSecs;
+  public final boolean exitOnTimeout;
 
   public CrawlConfig(Config config) {
     this.workTopic = ConfigUtils.getOrDefault(config, "crawl.workTopic", "lucille_work");
@@ -87,6 +98,8 @@ public final class CrawlConfig {
     this.maxAttempts = atLeastOne(config, "crawl.maxAttempts", 3);
     this.heartbeatSecs = atLeastOne(config, "crawl.heartbeatSecs", 10);
     this.orphanTimeoutSecs = atLeastOne(config, "crawl.orphanTimeoutSecs", 120);
+    this.maxUnitSecs = config.hasPath("crawl.maxUnitSecs") ? atLeastOne(config, "crawl.maxUnitSecs", 1) : null;
+    this.exitOnTimeout = config.hasPath("crawl.exitOnTimeout") && config.getBoolean("crawl.exitOnTimeout");
 
     if (orphanTimeoutSecs <= heartbeatSecs) {
       throw new IllegalArgumentException("crawl.orphanTimeoutSecs must be greater than crawl.heartbeatSecs.");

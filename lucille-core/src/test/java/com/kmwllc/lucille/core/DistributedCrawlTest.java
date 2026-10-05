@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -50,6 +51,8 @@ public class DistributedCrawlTest {
   private Indexer indexer;
   private Thread indexerThread;
   private CrawlerPool crawlerPool;
+  // While this is closed, the Coordinator's read of the run's Events does not return.
+  private volatile CountDownLatch eventsBlocked = new CountDownLatch(0);
 
   @Before
   public void setUp() {
@@ -68,9 +71,19 @@ public class DistributedCrawlTest {
 
   // Starts Crawlers, Workers and an Indexer, as a deployment would have running before any run begins.
   private Config start(String connectors) throws Exception {
-    Config config = ConfigFactory.parseString(connectors + COMMON);
+    return start(connectors, "");
+  }
+
+  private Config start(String connectors, String settings) throws Exception {
+    Config config = ConfigFactory.parseString(connectors + COMMON + settings);
     LocalMessenger localMessenger = new LocalMessenger(config);
-    messenger = new LocalCrawlMessenger(localMessenger, 60_000);
+    messenger = new LocalCrawlMessenger(localMessenger, 60_000) {
+      @Override
+      public Event pollEvent() throws Exception {
+        eventsBlocked.await();
+        return super.pollEvent();
+      }
+    };
 
     workerPool = new WorkerPool(config, "pipeline1", null, WorkerMessengerFactory.getConstantFactory(localMessenger), "test");
     workerPool.start();
@@ -111,6 +124,183 @@ public class DistributedCrawlTest {
     assertEquals(1, ScriptedPartitionedConnector.plans.get());
     assertEquals(1, ScriptedPartitionedConnector.finalizes.get());
     assertEquals(1, ScriptedPartitionedConnector.postExecutes.get());
+  }
+
+  @Test
+  public void testHandedBackPartsAreExecutedAsUnits() throws Exception {
+    Config config = start(SCRIPTED);
+    // u0 hands back two parts, and one of those hands back a third
+    ScriptedPartitionedConnector.handBacks.put("u0", List.of("p1", "p2"));
+    ScriptedPartitionedConnector.handBacks.put("p1", List.of("p3"));
+    // u4 hands back a part that another unit hands back as well, and a unit the planner made
+    ScriptedPartitionedConnector.handBacks.put("u4", List.of("p2", "u5"));
+
+    RunResult result = run(config, "run1");
+
+    // six planned units and three parts, five Documents each
+    assertTrue(result.getStatus());
+    assertEquals(45, numSucceeded(result));
+    for (String unitKey : List.of("u0", "u1", "u2", "u3", "u4", "u5", "p1", "p2", "p3")) {
+      assertEquals(unitKey, 1, ScriptedPartitionedConnector.executionsOf(unitKey));
+    }
+    assertEquals(1, ScriptedPartitionedConnector.finalizes.get());
+  }
+
+  @Test
+  public void testHandedBackPartsOfAFailedExecutionAreNotExecutedUntilItSucceeds() throws Exception {
+    Config config = start(SCRIPTED);
+    ScriptedPartitionedConnector.handBacks.put("u2", List.of("p1"));
+    ScriptedPartitionedConnector.failOnce.add("u2");
+    ScriptedPartitionedConnector.failOnce.add("p1");
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(35, numSucceeded(result));
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("u2"));
+    // a part is retried like any unit
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("p1"));
+  }
+
+  @Test
+  public void testUnitThatHangsIsReportedAndExecutedAgain() throws Exception {
+    Config config = start(SCRIPTED, "crawl.maxUnitSecs: 1");
+    ScriptedPartitionedConnector.hang = new CountDownLatch(1);
+    ScriptedPartitionedConnector.hangOnce.add("u2");
+
+    // the Crawler executing u2 never returns from it, and without the limit the run would never end
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(30, numSucceeded(result));
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("u2"));
+
+    // The Crawler started in place of the one that hung keeps the process alive as the others do. A thread takes
+    // after the thread that starts it, and this one is started by the watchdog, which is a daemon.
+    List<Thread> crawlerThreads = Thread.getAllStackTraces().keySet().stream()
+        .filter(thread -> thread.isAlive() && thread.getName().contains("Crawler-")).toList();
+    assertTrue(crawlerThreads.size() >= 3);
+    assertTrue(crawlerThreads.toString(), crawlerThreads.stream().noneMatch(Thread::isDaemon));
+
+    // a connector that looks can see that its unit has been given up on, and stop
+    ScriptedPartitionedConnector.hang.countDown();
+    long deadline = System.currentTimeMillis() + 10_000;
+    while (!ScriptedPartitionedConnector.sawCancelled.contains("u2") && System.currentTimeMillis() < deadline) {
+      Thread.sleep(50);
+    }
+    assertEquals(java.util.Set.of("u2"), ScriptedPartitionedConnector.sawCancelled);
+  }
+
+  @Test
+  public void testUnitThatAlwaysHangsFailsTheRun() throws Exception {
+    Config config = start(SCRIPTED, "crawl.maxUnitSecs: 1");
+    ScriptedPartitionedConnector.hang = new CountDownLatch(1);
+    // crawl.maxAttempts is 2
+    ScriptedPartitionedConnector.hangAlways.add("u2");
+
+    RunResult result = run(config, "run1");
+
+    // a hang counts against the unit's attempts, so a unit that hangs every time ends the run instead of stalling it
+    assertFalse(result.getStatus());
+    assertTrue(result.toString(), result.toString().contains("Timed out"));
+  }
+
+  @Test
+  public void testCrawlerExitsAfterAUnitTimesOutIfConfiguredTo() throws Exception {
+    Config config = start(SCRIPTED, "crawl { maxUnitSecs: 1, exitOnTimeout: true }");
+    AtomicInteger exits = new AtomicInteger();
+    CrawlerPool first = crawlerPool;
+    // in place of the process exiting and being started again by whatever runs it
+    first.setExitAction(() -> {
+      exits.incrementAndGet();
+      try {
+        crawlerPool = new CrawlerPool(config, CrawlerMessengerFactory.getConstantFactory(messenger));
+        crawlerPool.start();
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    });
+    ScriptedPartitionedConnector.hang = new CountDownLatch(1);
+    ScriptedPartitionedConnector.hangOnce.add("u2");
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("u2"));
+    // once for the one unit that timed out, not once each time the watchdog looks
+    assertEquals(1, exits.get());
+    // before "exiting", the pool's other Crawlers were stopped, so that they give their work up at once
+    first.join(5000);
+  }
+
+  @Test
+  public void testCrawlerDoesNotExitByDefault() throws Exception {
+    Config config = start(SCRIPTED, "crawl.maxUnitSecs: 1");
+    AtomicInteger exits = new AtomicInteger();
+    crawlerPool.setExitAction(exits::incrementAndGet);
+    ScriptedPartitionedConnector.hang = new CountDownLatch(1);
+    ScriptedPartitionedConnector.hangOnce.add("u2");
+
+    assertTrue(run(config, "run1").getStatus());
+    assertEquals(0, exits.get());
+  }
+
+  @Test
+  public void testStuckCoordinatorStopsItsHeartbeatAndExitsWithoutCancellingTheRun() throws Exception {
+    Config config = ConfigFactory.parseString("crawl.orphanTimeoutSecs: 2").withFallback(start(SCRIPTED));
+    CrawlCoordinator coordinator = new CrawlCoordinator(config, "run1", messenger, replay -> messenger);
+    CountDownLatch stuck = new CountDownLatch(1);
+    coordinator.setStuckAction(stuck::countDown);
+    AtomicReference<RunResult> result = new AtomicReference<>();
+
+    // the Coordinator's read of the Event log blocks, as a call to a broker that never answers would
+    eventsBlocked = new CountDownLatch(1);
+    Thread runThread = new Thread(() -> {
+      try {
+        result.set(coordinator.run(false, false));
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    });
+    runThread.start();
+
+    // its heartbeat comes from another thread, and would otherwise go on saying the run is in hand
+    assertTrue(stuck.await(20, java.util.concurrent.TimeUnit.SECONDS));
+    Thread.sleep(2500);
+    RunControl.Status status = messenger.latest("run1");
+    assertTrue("age " + status.ageMillis(), status.ageMillis() >= 2000);
+    // The run is not cancelled: it is left as a run whose Coordinator died, which is one that can be resumed.
+    assertFalse(status.cancelled());
+
+    eventsBlocked.countDown();
+    runThread.join(30_000);
+    assertFalse(runThread.isAlive());
+    assertFalse(messenger.latest("run1").cancelled());
+  }
+
+  @Test
+  public void testCoordinatorThatIsNotStuckIsLeftAlone() throws Exception {
+    // units that take longer than the orphan timeout do not make the Coordinator look stuck: it is still reading Events
+    Config config = ConfigFactory.parseString("crawl.orphanTimeoutSecs: 2").withFallback(start(SCRIPTED));
+    CrawlCoordinator coordinator = new CrawlCoordinator(config, "run1", messenger, replay -> messenger);
+    AtomicBoolean stuck = new AtomicBoolean();
+    coordinator.setStuckAction(() -> stuck.set(true));
+    ScriptedPartitionedConnector.gateAfter = 0;
+    ScriptedPartitionedConnector.gate = new CountDownLatch(1);
+
+    Thread opener = new Thread(() -> {
+      try {
+        Thread.sleep(5000);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      ScriptedPartitionedConnector.gate.countDown();
+    });
+    opener.start();
+
+    assertTrue(coordinator.run(false, false).getStatus());
+    assertFalse(stuck.get());
+    opener.join();
   }
 
   @Test

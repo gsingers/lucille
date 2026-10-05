@@ -169,6 +169,43 @@ public class S3StorageClientTest {
     assertEquals(List.of("s3://bucket/root.txt"), traversePrefixBucket(false));
   }
 
+  private TraversalBudget traversePrefixBucketWithinBudget(Integer maxDirectories, List<String> published) throws Exception {
+    TestMessenger messenger = new TestMessenger();
+    Publisher publisher = new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1");
+    S3StorageClient s3StorageClient = new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_REGION, "us-east-1")));
+    s3StorageClient.setS3ClientForTesting(mockClientWithPrefixes());
+    s3StorageClient.initializeForTesting();
+    TraversalBudget budget = new TraversalBudget(maxDirectories, null);
+
+    s3StorageClient.traverse(publisher, new TraversalParams(ConfigFactory.empty(), URI.create("s3://bucket/"), "", true, budget));
+    messenger.getDocsSentForProcessing().forEach(doc -> published.add(doc.getString(FILE_PATH)));
+    return budget;
+  }
+
+  // A traversal with a budget lists as many prefixes as it allows and hands back the rest, unlisted.
+  @Test
+  public void testTraverseWithinBudget() throws Exception {
+    // one prefix: the object at the root is published, and both prefixes beneath it are handed back
+    List<String> published = new ArrayList<>();
+    TraversalBudget budget = traversePrefixBucketWithinBudget(1, published);
+    assertEquals(List.of("s3://bucket/root.txt"), published);
+    assertEquals(List.of(URI.create("s3://bucket/a/"), URI.create("s3://bucket/b/")), budget.getHandedBack());
+    assertEquals(1, budget.getDirectoriesListed());
+
+    // two: the first prefix is walked as well, in the order the store listed it
+    published = new ArrayList<>();
+    budget = traversePrefixBucketWithinBudget(2, published);
+    assertEquals(List.of("s3://bucket/root.txt", "s3://bucket/a/file.txt"), published);
+    assertEquals(List.of(URI.create("s3://bucket/b/")), budget.getHandedBack());
+
+    // no limit: the same objects, in the same order, as a traversal with no budget, and a count of the listings
+    published = new ArrayList<>();
+    budget = traversePrefixBucketWithinBudget(null, published);
+    assertEquals(traversePrefixBucket(true), published);
+    assertEquals(List.of(), budget.getHandedBack());
+    assertEquals(3, budget.getDirectoriesListed());
+  }
+
   @Test
   public void testListSubdirectories() throws Exception {
     S3StorageClient s3StorageClient = new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_REGION, "us-east-1")));

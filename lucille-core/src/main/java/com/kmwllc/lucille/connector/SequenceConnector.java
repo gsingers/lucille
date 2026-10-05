@@ -4,6 +4,7 @@ import com.kmwllc.lucille.core.ConnectorException;
 import com.kmwllc.lucille.core.Document;
 import com.kmwllc.lucille.core.PartitionableConnector;
 import com.kmwllc.lucille.core.Publisher;
+import com.kmwllc.lucille.core.UnitContext;
 import com.kmwllc.lucille.core.WorkUnit;
 import com.kmwllc.lucille.core.WorkUnitSink;
 import com.kmwllc.lucille.core.spec.Spec;
@@ -78,7 +79,7 @@ public class SequenceConnector extends AbstractConnector implements Partitionabl
   }
 
   @Override
-  public void executeUnit(WorkUnit unit, Publisher publisher) throws ConnectorException {
+  public void executeUnit(WorkUnit unit, Publisher publisher, UnitContext context) throws ConnectorException {
     long from = unit.payload().path("from").asLong(-1);
     long to = unit.payload().path("to").asLong(-1);
 

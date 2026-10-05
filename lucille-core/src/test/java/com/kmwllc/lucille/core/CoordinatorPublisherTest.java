@@ -7,6 +7,8 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kmwllc.lucille.connector.ScriptedPartitionedConnector;
 import com.kmwllc.lucille.message.CoordinatorMessenger;
 import com.typesafe.config.Config;
@@ -92,6 +94,251 @@ public class CoordinatorPublisherTest {
 
   private CoordinatorPublisher publisher(int epoch) throws Exception {
     return new CoordinatorPublisher(CONFIG, messenger, RUN_ID, connector, "test", epoch);
+  }
+
+  // What a Crawler sends for an execution of a unit that handed parts back: the parts, then the completion.
+  private static Event childrenEvent(String unitKey, int attempt, int epoch, String execution, String... partKeys) {
+    ObjectNode message = CrawlConfig.newMessage().put("attempt", attempt).put("epoch", epoch).put("execution", execution);
+    ArrayNode children = message.putArray("children");
+    for (String partKey : partKeys) {
+      children.addObject().put("key", partKey).putObject("payload").put("key", partKey);
+    }
+    return new Event("connector1/" + unitKey, RUN_ID, message.toString(), Event.Type.UNIT_CHILDREN);
+  }
+
+  private static Event doneEvent(String unitKey, int attempt, int epoch, String execution, int numChildren) {
+    String message = CrawlConfig.newMessage().put("attempt", attempt).put("epoch", epoch).put("execution", execution)
+        .put("numChildren", numChildren).toString();
+    return new Event("connector1/" + unitKey, RUN_ID, message, Event.Type.UNIT_DONE);
+  }
+
+  private List<String> dispatchedKeys() {
+    List<String> keys = new ArrayList<>();
+    messenger.dispatched.forEach(unit -> keys.add(unit.unitId().substring("connector1/".length())));
+    return keys;
+  }
+
+  @Test
+  public void testHandedBackPartsBecomeUnits() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // the parts arrive ahead of the completion, and nothing is done with them until it does
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p1"));
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p2"));
+    assertEquals(List.of("u0"), dispatchedKeys());
+
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 2));
+    assertEquals(List.of("u0", "p1", "p2"), dispatchedKeys());
+    assertEquals(1, publisher.numUnitsDone());
+    assertEquals(2, publisher.numUnitsOutstanding());
+
+    // each part is logged before it is dispatched, like a planned unit, and carries what the Crawler described
+    assertTrue(messenger.sent.indexOf("UNIT_CREATED connector1/p1") < messenger.sent.indexOf("DISPATCH connector1/p1"));
+    WorkUnit part = messenger.dispatched.get(1);
+    assertEquals("p1", part.payload().get("key").asText());
+    assertEquals(1, part.attempt());
+    assertEquals(1, part.epoch());
+    assertEquals(messenger.dispatched.get(0).configHash(), part.configHash());
+    assertEquals("pipeline1", part.pipelineName());
+
+    // the connector is not complete until the parts are done, and a part may hand back parts of its own
+    publisher.handleEvent(childrenEvent("p1", 1, 1, "y", "p3"));
+    publisher.handleEvent(doneEvent("p1", 1, 1, "y", 1));
+    publisher.handleEvent(doneEvent("p2", 1, 1, "z", 0));
+    assertTrue(publisher.hasOutstandingWork());
+    publisher.handleEvent(doneEvent("p3", 1, 1, "w", 0));
+    assertFalse(publisher.hasOutstandingWork());
+    assertEquals(4, publisher.numUnitsDone());
+  }
+
+  @Test
+  public void testHandedBackPartsWaitForRoom() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    WorkUnitSink sink = publisher.getSink();
+    sink.emit("u0", WorkUnit.newPayload());
+    sink.emit("u1", WorkUnit.newPayload());
+
+    // crawl.maxOutstandingUnits is 2. With u1 still outstanding there is room for one of the three parts.
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p1", "p2", "p3"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 3));
+    assertEquals(List.of("u0", "u1", "p1"), dispatchedKeys());
+
+    // the two that are waiting are units all the same: they keep the connector from completing
+    assertEquals(4, publisher.numUnitsOutstanding());
+    assertTrue(publisher.outstandingUnitIds().containsAll(List.of("connector1/p2", "connector1/p3")));
+    // and the planner coming to one of them is not a reason to create it again
+    sink.emit("p3", WorkUnit.newPayload());
+    assertEquals(3, messenger.dispatched.size());
+
+    // they are dispatched as units complete, in the order they were handed back
+    publisher.handleEvent(doneEvent("u1", 1, 1, "y", 0));
+    assertEquals(List.of("u0", "u1", "p1", "p2"), dispatchedKeys());
+    publisher.handleEvent(doneEvent("p1", 1, 1, "y", 0));
+    assertEquals(List.of("u0", "u1", "p1", "p2", "p3"), dispatchedKeys());
+    publisher.handleEvent(doneEvent("p2", 1, 1, "y", 0));
+    publisher.handleEvent(doneEvent("p3", 1, 1, "y", 0));
+    assertFalse(publisher.hasOutstandingWork());
+  }
+
+  @Test
+  public void testHandedBackPartsWaitWhileTooManyDocumentsArePending() throws Exception {
+    Config config = ConfigFactory.parseString("publisher.maxPendingDocs: 1").withFallback(CONFIG);
+    CoordinatorPublisher publisher = new CoordinatorPublisher(config, messenger, RUN_ID, connector, "test", 1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+    publisher.handleEvent(docEvent("doc1", Event.Type.CREATE));
+
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p1"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 1));
+    assertEquals(List.of("u0"), dispatchedKeys());
+    assertTrue(publisher.hasOutstandingWork());
+
+    // no unit completes to make room, so it is the wait loop that notices the Document has finished
+    publisher.handleEvent(docEvent("doc1", Event.Type.FINISH));
+    publisher.onWaitIteration();
+    assertEquals(List.of("u0", "p1"), dispatchedKeys());
+  }
+
+  @Test
+  public void testOnlyTheExecutionThatCompletedHandsBack() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // The unit was delivered twice and two Crawlers executed it, cutting it differently. Their reports interleave.
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "first", "a"));
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "second", "b", "c"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "second", 2));
+    assertEquals(List.of("u0", "b", "c"), dispatchedKeys());
+
+    // the other execution's completion is a report on a unit that is no longer outstanding
+    publisher.handleEvent(doneEvent("u0", 1, 1, "first", 1));
+    assertEquals(List.of("u0", "b", "c"), dispatchedKeys());
+    assertEquals(1, publisher.numUnitsDone());
+  }
+
+  @Test
+  public void testUnitWhoseHandedBackPartsDidNotAllArriveIsDispatchedAgain() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // the unit says it handed back two parts, and one arrived
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p1"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 2));
+
+    // accepting it would leave the other part uncrawled, so the whole unit is done again
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+    assertEquals(2, messenger.dispatched.get(1).attempt());
+    assertEquals(0, publisher.numUnitsDone());
+
+    publisher.handleEvent(childrenEvent("u0", 2, 1, "y", "p1", "p2"));
+    publisher.handleEvent(doneEvent("u0", 2, 1, "y", 2));
+    assertEquals(List.of("u0", "u0", "p1", "p2"), dispatchedKeys());
+  }
+
+  @Test
+  public void testFailedExecutionHandsNothingBack() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p1"));
+    publisher.handleEvent(unitEvent("u0", 1, 1, Event.Type.UNIT_FAILED));
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+
+    // the second attempt walks all of the unit itself, and that is the account of it that stands
+    publisher.handleEvent(doneEvent("u0", 2, 1, "y", 0));
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+    assertFalse(publisher.hasOutstandingWork());
+  }
+
+  @Test
+  public void testPartThatIsAlreadyAUnitIsNotCreatedAgain() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    WorkUnitSink sink = publisher.getSink();
+    sink.emit("u0", WorkUnit.newPayload());
+    sink.emit("u1", WorkUnit.newPayload());
+
+    // u1 is outstanding: handing it back creates nothing
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "u1", "p1"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 2));
+    assertEquals(List.of("u0", "u1", "p1"), dispatchedKeys());
+
+    // p1 is done: handing it back creates nothing either, or two units could hand each other back forever
+    publisher.handleEvent(doneEvent("p1", 1, 1, "y", 0));
+    publisher.handleEvent(childrenEvent("u1", 1, 1, "z", "p1", "u0"));
+    publisher.handleEvent(doneEvent("u1", 1, 1, "z", 2));
+    assertEquals(List.of("u0", "u1", "p1"), dispatchedKeys());
+    assertFalse(publisher.hasOutstandingWork());
+  }
+
+  @Test
+  public void testMalformedHandedBackPartsAreIgnored() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    String attemptAndEpoch = "\"attempt\": 1, \"epoch\": 1, \"execution\": \"x\"";
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, "{" + attemptAndEpoch + ", \"children\": \"p1\"}",
+        Event.Type.UNIT_CHILDREN));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID,
+        "{" + attemptAndEpoch + ", \"children\": [{\"key\": 5}, {\"key\": \"p2\"}, \"p3\"]}", Event.Type.UNIT_CHILDREN));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 3));
+
+    assertEquals(List.of("u0"), dispatchedKeys());
+    assertFalse(publisher.hasOutstandingWork());
+  }
+
+  @Test
+  public void testRecoverDerivesHandedBackPartsFromTheReport() throws Exception {
+    // An earlier Coordinator, at epoch 1, was told that u0 handed back three parts. It dispatched two of them, and
+    // one of those was completed, handing back a part of its own. Then it stopped.
+    WorkUnit p1 = unit("p1", 1, 1);
+    messenger.log.addAll(List.of(
+        created(unit("u0", 1, 1)),
+        new Event("connector1", RUN_ID, null, Event.Type.PLANNING_DONE),
+        childrenEvent("u0", 1, 1, "x", "p1", "p2", "p3"),
+        doneEvent("u0", 1, 1, "x", 3),
+        created(p1),
+        created(unit("p2", 1, 1)),
+        childrenEvent("p1", 1, 1, "y", "p4"),
+        doneEvent("p1", 1, 1, "y", 1)));
+
+    CoordinatorPublisher publisher = publisher(2);
+    publisher.recover();
+
+    // p3 and p4 were never logged as units. They are known because the reports that named them were.
+    assertEquals(2, publisher.numUnitsDone());
+    assertEquals(List.of("connector1/p2", "connector1/p3", "connector1/p4"),
+        publisher.outstandingUnitIds().stream().sorted().toList());
+    assertTrue(messenger.sent.isEmpty());
+
+    // all three are dispatched under the new epoch, as far as there is room; crawl.maxOutstandingUnits is 2
+    publisher.redispatchOutstandingUnits();
+    assertEquals(2, messenger.dispatched.size());
+    messenger.dispatched.forEach(unit -> assertEquals(2, unit.epoch()));
+    assertEquals("p3", messenger.dispatched.stream().filter(unit -> unit.unitId().endsWith("/p3")).findFirst()
+        .map(unit -> unit.payload().get("key").asText()).orElse("p3 is queued"));
+    assertEquals(3, publisher.numUnitsOutstanding());
+
+    for (WorkUnit unit : List.copyOf(messenger.dispatched)) {
+      publisher.handleEvent(new Event(unit.unitId(), RUN_ID, doneEvent("x", 1, 2, "z", 0).getMessage(), Event.Type.UNIT_DONE));
+    }
+    assertEquals(3, messenger.dispatched.size());
+    publisher.handleEvent(new Event(messenger.dispatched.get(2).unitId(), RUN_ID, doneEvent("x", 1, 2, "z", 0).getMessage(),
+        Event.Type.UNIT_DONE));
+    assertFalse(publisher.hasOutstandingWork());
+    assertEquals(5, publisher.numUnitsDone());
+  }
+
+  @Test
+  public void testTimeSinceTheWaitLoopLastWentRound() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    // not waiting, so not stuck
+    assertEquals(0, publisher.millisSinceWaitIteration());
+
+    publisher.onWaitIteration();
+    Thread.sleep(30);
+    assertTrue(publisher.millisSinceWaitIteration() >= 30);
+    publisher.onWaitIteration();
+    assertTrue(publisher.millisSinceWaitIteration() < 30);
   }
 
   private static Event unitEvent(String unitKey, int attempt, int epoch, Event.Type type) {

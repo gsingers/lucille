@@ -38,6 +38,9 @@ public class TraversalParams {
   // Whether to traverse the directories under the path as well.
   private final boolean recursive;
 
+  // Limits the traversal and collects what it leaves unwalked. Null for a traversal that walks everything.
+  private final TraversalBudget budget;
+
   // FileOptions
   private final boolean getFileContent;
   private final boolean handleArchivedFiles;
@@ -66,9 +69,21 @@ public class TraversalParams {
    *                  the files directly under the path are visited.
    */
   public TraversalParams(Config config, URI pathToStorage, String docIdPrefix, boolean recursive) {
+    this(config, pathToStorage, docIdPrefix, recursive, null);
+  }
+
+  /**
+   * @param recursive Whether the traversal should descend into the directories under the path. When false, only
+   *                  the files directly under the path are visited.
+   * @param budget Limits how many directories the traversal lists, and collects those it leaves unwalked. May be
+   *               null, for a traversal that walks everything. Honoured by the local and S3 clients; the others
+   *               walk everything regardless.
+   */
+  public TraversalParams(Config config, URI pathToStorage, String docIdPrefix, boolean recursive, TraversalBudget budget) {
     this.uri = pathToStorage;
     this.docIdPrefix = docIdPrefix;
     this.recursive = recursive;
+    this.budget = budget;
 
     Config fileOptions = config.hasPath("fileOptions") ? config.getConfig("fileOptions") : ConfigFactory.empty();
     // file options / derived params
@@ -205,6 +220,10 @@ public class TraversalParams {
 
   public boolean isRecursive() {
     return recursive;
+  }
+
+  public TraversalBudget getBudget() {
+    return budget;
   }
 
   public String getDocIdPrefix() {

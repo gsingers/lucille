@@ -37,10 +37,22 @@ A Connector that can be split implements `PartitionableConnector` and is given a
 
 | Connector | A unit is | Config |
 |---|---|---|
-| `FileConnector` | A directory (local) or key prefix (S3) to traverse recursively, or the files directly inside one | `partitioning { depth: 1 }` |
+| `FileConnector` | A directory (local) or key prefix (S3) to traverse recursively, or the files directly inside one | `partitioning { depth: 1, maxDirectoriesPerUnit: 500 }` |
 | `SequenceConnector` | A range of the sequence | `partitioning { unitSize: 1000 }` |
 
 For `FileConnector`, `depth` is how many levels below each configured path the split happens. With `depth: 1` and a path containing thirty directories, the plan is thirty-one units: one per directory, and one for the files that sit directly in the path.
+
+### Units that turn out to be large
+
+A plan made at a fixed depth knows nothing about what lies beneath it. One directory may hold most of the tree, and the unit for it would be walked by a single Crawler while the others sit idle. A unit can therefore **hand part of itself back**.
+
+For `FileConnector`, set `partitioning.maxDirectoriesPerUnit`, `partitioning.maxUnitSecs`, or both. A unit lists directories until it reaches either limit. It still publishes every file in the directories it has listed, but the directories it has found and not listed are handed back, in groups, and each group becomes a unit, to be executed by whichever Crawler receives it. Those units are limited in the same way, so a subtree of any size is cut into pieces no larger than the limit, and nearly every piece is as large as the limit allows: a tree of 4,000 directories with a limit of 50 becomes about 90 units. A unit always lists at least the directory it was given.
+
+With these limits `depth` matters much less, and may be `0`: each configured path is then planned as one unit, and the tree is shared out as it is discovered. Without them, a unit walks all of its subtree, as before.
+
+The Crawler does not dispatch the parts itself. It names them in its report, and the Coordinator creates the units, so that the Coordinator remains the one place that knows every unit of the run and can tell when all are done. A part is handed back only if its unit completes: a unit that fails, or whose Crawler dies, is executed again from the start. A part that is already a unit of the run is not created twice.
+
+A Connector of your own hands work back by calling `UnitContext.handBack(key, payload)` from `executeUnit`. The same part of the source must always be given the same key.
 
 Any other Connector, or one of these without a `partitioning` block, still works in a distributed crawl. It runs as a single unit, on one Crawler, by calling its ordinary `execute()` method. Its work is not parallelized, but it no longer runs inside the Runner.
 
@@ -51,17 +63,21 @@ Units are small JSON records. Their content is a description of *where* to read,
 In every other mode, the Runner knows a Connector is finished because it published every Document itself and received an Event when each was indexed. In a distributed crawl the Coordinator publishes nothing, so it learns of everything through Events on the run's event topic:
 
 - A Crawler sends a `CREATE` Event for each Document, once Kafka has accepted the Document. The Coordinator tracks the Document from then until the Indexer reports it, exactly as it already tracks child Documents that a pipeline creates.
-- A Crawler sends `UNIT_DONE` when all of a unit's Documents and their `CREATE` Events have been accepted, or `UNIT_FAILED` if the unit threw an exception.
+- A Crawler sends `UNIT_DONE` when all of a unit's Documents and their `CREATE` Events have been accepted, or `UNIT_FAILED` if the unit threw an exception. If the unit handed parts back, `UNIT_CHILDREN` Events naming them come first, and `UNIT_DONE` says how many to expect. A unit whose parts did not all arrive is treated as failed.
 
-A Connector is complete when planning has finished, no unit is outstanding, and no Document is pending.
+A Connector is complete when planning has finished, no unit is outstanding or waiting to be dispatched, and no Document is pending.
 
-The Coordinator applies back-pressure by holding units back. It dispatches no more while `crawl.maxOutstandingUnits` units are incomplete, or while more Documents are pending than `publisher.maxPendingDocs` allows.
+The Coordinator applies back-pressure by holding units back. It dispatches no more while `crawl.maxOutstandingUnits` units are incomplete, or while more Documents are pending than `publisher.maxPendingDocs` allows. Units that were handed back wait in the Coordinator's memory until there is room, a few hundred bytes each.
+
+As each unit finishes, the Coordinator logs the Crawler that executed it, the Documents it published, the calls it made to the source (for `FileConnector`, directories listed), how long it took and how many parts it handed back.
 
 ## When Things Fail
 
 Delivery is at-least-once throughout, as it already is from the source topic onward. Every recovery described below can cause some Documents to be published twice. They carry the same IDs both times, so the search engine ends up with one copy, but the run summary counts each copy that was indexed.
 
 **A unit throws an exception.** The Crawler reports `UNIT_FAILED` and the Coordinator dispatches the unit again, up to `crawl.maxAttempts` times in total. After that the Connector fails, and with it the run.
+
+**A unit hangs.** Nothing is done about it unless `crawl.maxUnitSecs` is set. If it is, a unit that has been executing for that long is reported as failed, which counts against `crawl.maxAttempts`, and is dispatched again. A thread that is blocked cannot be stopped, so the Crawler leaves it behind, gives up that thread's partitions of the work topic so that nothing waits behind it, and starts a new thread in its place. With `crawl.exitOnTimeout: true` the Crawler process exits instead, which suits a deployment that restarts it and is the only way to free what the stuck thread holds. Set the limit well above the longest a healthy unit takes; `partitioning.maxUnitSecs` and `maxDirectoriesPerUnit` are what keep units short.
 
 **A Crawler dies.** A Crawler claims a unit by reading it from the work topic and commits its position only when the unit is finished. The unit of a Crawler that dies is therefore delivered to another Crawler, with no action from the Coordinator.
 
@@ -74,6 +90,8 @@ java -Dconfig.file=<CONFIG> -cp '...' com.kmwllc.lucille.core.Runner -resume <ru
 Everything the Coordinator decides is written to the run's event topic before it takes effect, so the new Coordinator rebuilds its state by reading that topic from the beginning. Connectors that had completed are skipped, lifecycle methods that had returned are not called again, and units that were done are not executed again. Units that were outstanding are dispatched again.
 
 Each Coordinator of a run has an **epoch**, one higher than the last, which it stamps on its units and heartbeats. Crawlers discard units from an older epoch than the newest they have heard from. This is what makes it safe to dispatch the outstanding units again without knowing what became of the earlier copies, and it means a Coordinator that was wrongly presumed dead cannot keep work alive once another has taken over. Such a Coordinator notices the newer epoch at its next heartbeat and stops, reporting its run as failed. `-resume` refuses to take over a run whose heartbeat is recent unless `-force` is given.
+
+**The Coordinator is alive but stuck.** Heartbeats are sent by a thread of their own, so a Coordinator whose main thread had stopped reading Events would otherwise go on announcing a run that can no longer finish, and a replacement would be refused. The heartbeat thread checks: if the main thread has not gone round its loop for `crawl.orphanTimeoutSecs`, the Coordinator stops its heartbeat and exits with a failure. It does not cancel the run, which is then in the same state as one whose Coordinator died, and is resumed the same way. Only the wait for units and Documents is watched; a Connector's own lifecycle methods may take as long as they need.
 
 A run can be resumed for a week after its last heartbeat. After that its record is removed from the control topic.
 
@@ -155,14 +173,16 @@ crawl {
 How fast a crawl goes is decided by how the work is cut into units, more than by how many Crawlers there are.
 
 - **Concurrency is the number of units in flight.** A unit is executed by one Crawler thread, which walks it alone. The number in flight is the smallest of: the total Crawler threads, `crawl.workTopicPartitions`, and `crawl.maxOutstandingUnits`.
-- **The largest unit is a floor.** No number of Crawlers finishes a run faster than its longest unit takes. Crawlers beyond `total work / largest unit` add nothing.
+- **The largest unit is a floor.** No number of Crawlers finishes a run faster than its longest unit takes. Crawlers beyond `total work / largest unit` add nothing. `partitioning.maxDirectoriesPerUnit` puts a ceiling on the largest unit, whatever the shape of the tree.
 - **A unit's cost is the number of directories it lists, not the number of files it finds.** A deep tree of nearly empty directories is slower than a flat one holding ten times the files.
 - **Each unit costs several milliseconds of messaging on top of its own work** (about 8 ms against a broker on the same machine): two flushes, a report, a commit and the next poll. Units should take seconds or more. A `depth` that yields thousands of units of a few hundred files each makes a crawl slower than not distributing it at all.
-- **Units cannot be moved once dealt.** They are dealt to the work topic's partitions in turn, and a partition is read by one Crawler thread, one unit at a time. A Crawler that has finished its own units does not take those queued behind another's long unit.
+- **Units cannot be moved once dealt.** They are dealt to the work topic's partitions in turn, and a partition is read by one Crawler thread, one unit at a time. A Crawler that has finished its own units does not take those queued behind another's long unit. Keeping units small is what keeps that wait short.
 - **Set `crawl.workTopicPartitions` to the number of Crawler threads you intend to run,** or a small multiple of it. The topic is created with that many partitions the first time any component needs it; changing the setting later does not change an existing topic.
 - **Crawlers have their own consumer group.** `crawl.consumerGroupId` must differ from `kafka.consumerGroupId`, or every Crawler that joins or leaves would interrupt the Workers. A config in which they are the same is rejected.
 
-In practice: choose the smallest `depth` that gives several times more units than Crawler threads, check the per-unit times that the Coordinator logs as units finish, and go one level deeper only if a few units dominate.
+In practice, for a tree whose shape you do not know: use `depth: 0` or `1` with `maxDirectoriesPerUnit` set so that a unit takes seconds, not milliseconds. A few hundred directories is a reasonable start for a source where a listing takes around ten milliseconds. Then read the per-unit lines the Coordinator logs: if most units take well under a second, raise the limit; if a few take minutes, lower it or add `maxUnitSecs`.
+
+For a tree you do know, a fixed `depth` with no limit has the least overhead: choose the smallest `depth` that gives several times more units than Crawler threads, and go one level deeper only if a few units dominate.
 
 A source that is fast to list, such as a local disk, is often traversed faster by a single connector thread than by any number of Crawlers. Distributing the crawl pays when listing the source is slow and the source can serve many listings at once.
 
@@ -186,7 +206,9 @@ A distributed crawl adds two shared topics, and what is written to them directs 
 - **A run's topics are replicated as the cluster is configured to.** The work topic, the control topic and each run's event topic are created with the cluster's default replication factor unless `crawl.topicReplicationFactor` is set. The event topic is the only record of what a run has done, so a run whose event topic is lost cannot be resumed. In the other run modes the event topic is always created with one replica.
 - **Numbers in the `crawl` block may come from the environment.** A value substituted from an environment variable is text; `crawl.*` and `partitioning.*` settings accept a number written that way.
 - **Start Crawlers before the run.** A Crawler receives nothing until it has joined its consumer group, which can take tens of seconds when other members have recently come or gone.
-- **A unit that hangs is not detected.** A Crawler that is alive but stuck on a unit keeps it. The run then waits until `runner.connectorTimeout`.
+- **A unit that hangs is not detected by default.** Without `crawl.maxUnitSecs`, a Crawler that is alive but stuck on a unit keeps it, and the run waits until `runner.connectorTimeout`.
+- **Handing back needs listings that can be stopped.** `maxDirectoriesPerUnit` and `maxUnitSecs` apply to local paths and S3. For other providers a unit walks all of its subtree. The limits count directories, so one directory holding millions of files is still one unit's work.
+- **Changing the limits changes the units.** Resuming a run with different `partitioning` settings is refused, like any other change to a Connector's config.
 - **`FileConnector` state needs a shared database.** A partitioned `FileConnector` with `state` enabled requires `state.connectionString` to name a database that every Crawler and the Coordinator can reach; the embedded default is a file in one process's working directory. Expiry and `sendTombstones` are applied by the Coordinator after all units are done, since no single unit sees every file.
 - **Crawlers and the Coordinator must have the same Connector config.** Each unit carries a hash of the Connector's config, and a Crawler whose own config hashes differently fails the unit rather than crawl something other than what was planned. Credentials are left out of the hash, so they may differ between machines.
 - **The Lucille API runs local runs only.** `RunnerManager` does not start or resume distributed crawls.

@@ -19,7 +19,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Stream;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -91,7 +93,8 @@ public class PartitionedFileConnectorTest {
       TestMessenger messenger = new TestMessenger();
       FileConnector connector = new FileConnector(config);
       try {
-        connector.executeUnit(unit(entry.getKey(), entry.getValue()), new PublisherImpl(config, messenger, "run1", "pipeline1"));
+        connector.executeUnit(unit(entry.getKey(), entry.getValue()), new PublisherImpl(config, messenger, "run1", "pipeline1"),
+            new RecordingUnitContext());
       } finally {
         connector.close();
       }
@@ -115,7 +118,10 @@ public class PartitionedFileConnectorTest {
   public void testPartitioningIsOptIn() throws Exception {
     assertFalse(new FileConnector(config("")).isPartitioningEnabled());
     assertTrue(new FileConnector(config("partitioning {}")).isPartitioningEnabled());
-    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { depth: 0 }")));
+    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { depth: -1 }")));
+    assertThrows(IllegalArgumentException.class,
+        () -> new FileConnector(config("partitioning { maxDirectoriesPerUnit: 0 }")));
+    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { maxUnitSecs: 0 }")));
   }
 
   @Test
@@ -123,7 +129,7 @@ public class PartitionedFileConnectorTest {
     // as it is when it comes from an environment variable substitution
     Config config = config("partitioning { depth: \"2\" }");
     assertEquals(4, plan(config).size());
-    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { depth: \"0\" }")));
+    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { depth: \"-1\" }")));
   }
 
   @Test
@@ -144,6 +150,206 @@ public class PartitionedFileConnectorTest {
     assertEquals(Set.of("top.txt"), published.get(keys.get(0)));
     assertEquals(Set.of("a1.txt", "a2.txt"), published.get(keys.get(1)));
     assertEquals(Set.of("b1.txt", "b2.txt"), published.get(keys.get(2)));
+  }
+
+  @Test
+  public void testDepthZeroPlansEachPathAsOneUnit() throws Exception {
+    Config config = config("partitioning { depth: 0 }");
+    Map<String, ObjectNode> units = plan(config);
+
+    assertEquals(List.of(root.toUri().toString()), new ArrayList<>(units.keySet()));
+    assertEquals(Set.of("top.txt", "a1.txt", "a2.txt", "b1.txt", "b2.txt"), allFiles(execute(config, units)));
+  }
+
+  /**
+   * Executes the given units, then whatever they hand back, and so on until nothing is handed back. Returns the ID
+   * of every Document published, with duplicates, and adds to the totals given.
+   */
+  private List<String> executeWithHandBack(Config config, Map<String, ObjectNode> units, int[] unitsExecuted, long[] sourceCalls)
+      throws Exception {
+    List<String> ids = new ArrayList<>();
+    Map<String, ObjectNode> toExecute = new LinkedHashMap<>(units);
+    Set<String> seen = new TreeSet<>(units.keySet());
+
+    while (!toExecute.isEmpty()) {
+      Map.Entry<String, ObjectNode> next = toExecute.entrySet().iterator().next();
+      toExecute.remove(next.getKey());
+
+      TestMessenger messenger = new TestMessenger();
+      RecordingUnitContext context = new RecordingUnitContext();
+      FileConnector connector = new FileConnector(config);
+      connector.executeUnit(unit(next.getKey(), next.getValue()), new PublisherImpl(config, messenger, "run1", "pipeline1"), context);
+      connector.close();
+
+      messenger.getDocsSentForProcessing().forEach(doc -> ids.add(doc.getId()));
+      unitsExecuted[0]++;
+      sourceCalls[0] += context.sourceCalls;
+      for (Map.Entry<String, ObjectNode> part : context.handedBack.entrySet()) {
+        // no directory is handed back twice
+        assertTrue(part.getKey(), seen.add(part.getKey()));
+        toExecute.put(part.getKey(), part.getValue());
+      }
+    }
+    return ids;
+  }
+
+  @Test
+  public void testUnitHandsBackWhatItsBudgetDoesNotCover() throws Exception {
+    // one directory per unit: the unit for root lists root, publishes its file, and hands back a/ and b/
+    Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 1 }");
+    TestMessenger messenger = new TestMessenger();
+    RecordingUnitContext context = new RecordingUnitContext();
+    FileConnector connector = new FileConnector(config);
+    Map<String, ObjectNode> units = plan(config);
+    Map.Entry<String, ObjectNode> rootUnit = units.entrySet().iterator().next();
+
+    connector.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()), new PublisherImpl(config, messenger, "run1", "pipeline1"), context);
+    connector.close();
+
+    assertEquals(Set.of("top.txt"), fileNames(messenger));
+    assertEquals(List.of(root.resolve("a").toUri().toString(), root.resolve("b").toUri().toString()),
+        new ArrayList<>(context.handedBack.keySet()));
+    assertEquals(1, context.sourceCalls);
+    // a handed-back directory is described as the planner would describe it, so it is executed the same way
+    ObjectNode payload = context.handedBack.get(root.resolve("a").toUri().toString());
+    assertEquals(root.resolve("a").toUri().toString(), payload.get("path").asText());
+    assertTrue(payload.get("recursive").asBoolean());
+  }
+
+  @Test
+  public void testHandBackPublishesEveryFileExactlyOnce() throws Exception {
+    // the tree has four directories: root, a, a/deep, b
+    TestMessenger wholeMessenger = new TestMessenger();
+    Config unpartitioned = config("");
+    FileConnector whole = new FileConnector(unpartitioned);
+    whole.execute(new PublisherImpl(unpartitioned, wholeMessenger, "run1", "pipeline1"));
+    whole.close();
+    List<String> expectedIds = wholeMessenger.getDocsSentForProcessing().stream().map(Document::getId).sorted().toList();
+    assertEquals(5, expectedIds.size());
+
+    for (int depth = 0; depth <= 2; depth++) {
+      for (int maxDirectories = 1; maxDirectories <= 5; maxDirectories++) {
+        String label = "depth " + depth + ", maxDirectoriesPerUnit " + maxDirectories;
+        Config config = config("partitioning { depth: " + depth + ", maxDirectoriesPerUnit: " + maxDirectories + " }");
+        int[] unitsExecuted = {0};
+        long[] sourceCalls = {0};
+
+        List<String> ids = executeWithHandBack(config, plan(config), unitsExecuted, sourceCalls);
+
+        // however the tree is cut, the same Documents come out as from a traversal that is not cut at all
+        assertEquals(label, expectedIds, ids.stream().sorted().toList());
+        // and no unit lists more directories than it is allowed
+        assertTrue(label, sourceCalls[0] <= (long) unitsExecuted[0] * maxDirectories);
+      }
+    }
+
+    // with no limit, nothing is handed back: the planned units are all there is
+    Config unlimited = config("partitioning { depth: 0 }");
+    int[] unitsExecuted = {0};
+    long[] sourceCalls = {0};
+    assertEquals(expectedIds, executeWithHandBack(unlimited, plan(unlimited), unitsExecuted, sourceCalls).stream().sorted().toList());
+    assertEquals(1, unitsExecuted[0]);
+    // the directories listed are counted even when they are not limited
+    assertEquals(4, sourceCalls[0]);
+  }
+
+  @Test
+  public void testDirectoriesAreHandedBackInGroupsThatFillAUnit() throws Exception {
+    // six directories of six directories, two files in each: 43 directories and 86 files
+    Path wide = Files.createTempDirectory("wide-tree");
+    try {
+      List<Path> level = List.of(wide);
+      for (int depth = 0; depth < 3; depth++) {
+        List<Path> next = new ArrayList<>();
+        for (Path directory : level) {
+          Files.writeString(directory.resolve("one.txt"), "one");
+          Files.writeString(directory.resolve("two.txt"), "two");
+          for (int i = 0; depth < 2 && i < 6; i++) {
+            next.add(Files.createDirectory(directory.resolve("d" + i)));
+          }
+        }
+        level = next;
+      }
+
+      Config config = ConfigFactory.parseString("""
+          name: "files", class: "com.kmwllc.lucille.connector.FileConnector", pipeline: "pipeline1"
+          paths: ["%s"]
+          partitioning { depth: 0, maxDirectoriesPerUnit: 10 }
+          """.formatted(wide.toUri()));
+      int[] unitsExecuted = {0};
+      long[] sourceCalls = {0};
+
+      List<String> ids = executeWithHandBack(config, plan(config), unitsExecuted, sourceCalls);
+
+      assertEquals(86, ids.size());
+      assertEquals(86, new TreeSet<>(ids).size());
+      assertEquals(43, sourceCalls[0]);
+      // A unit that stops with directories left over hands them back together, as many to a unit as a unit may
+      // list, and not one unit for each. So nearly every unit does a full unit's worth: 43 directories at 10 a unit
+      // is 5 units at best, and it is 10 if every directory left over is a unit of its own.
+      assertTrue("units executed: " + unitsExecuted[0], unitsExecuted[0] <= 7);
+    } finally {
+      try (Stream<Path> paths = Files.walk(wide)) {
+        paths.sorted(Comparator.reverseOrder()).forEach(path -> path.toFile().delete());
+      }
+    }
+  }
+
+  @Test
+  public void testUnitForSeveralDirectoriesIsHeldToTheConfiguredPaths() throws Exception {
+    Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 2 }");
+    FileConnector connector = new FileConnector(config);
+    TestMessenger messenger = new TestMessenger();
+
+    // every directory a unit names is checked, not only the first
+    ObjectNode payload = WorkUnit.newPayload().put("recursive", true);
+    payload.putArray("paths").add(root.resolve("a").toUri().toString()).add(root.getParent().toUri().toString());
+    assertThrows(ConnectorException.class, () -> connector.executeUnit(unit("group", payload),
+        new PublisherImpl(config, messenger, "run1", "pipeline1"), new RecordingUnitContext()));
+    assertTrue(messenger.getDocsSentForProcessing().isEmpty());
+
+    ObjectNode empty = WorkUnit.newPayload().put("recursive", true);
+    empty.putArray("paths");
+    assertThrows(ConnectorException.class, () -> connector.executeUnit(unit("group", empty),
+        new PublisherImpl(config, new TestMessenger(), "run1", "pipeline1"), new RecordingUnitContext()));
+
+    // one that names two directories within the configured path is executed: both are walked, up to the limit
+    ObjectNode both = WorkUnit.newPayload().put("recursive", true);
+    both.putArray("paths").add(root.resolve("a").toUri().toString()).add(root.resolve("b").toUri().toString());
+    RecordingUnitContext context = new RecordingUnitContext();
+    TestMessenger bothMessenger = new TestMessenger();
+    connector.executeUnit(unit("group", both), new PublisherImpl(config, bothMessenger, "run1", "pipeline1"), context);
+    connector.close();
+
+    // a/ and a/deep/ use up the two listings, so b/ is handed back
+    assertEquals(Set.of("a1.txt", "a2.txt"), fileNames(bothMessenger));
+    assertEquals(List.of(root.resolve("b").toUri().toString()), new ArrayList<>(context.handedBack.keySet()));
+  }
+
+  @Test
+  public void testSkippedDirectoryIsNotHandedBack() throws Exception {
+    Config config = config("""
+        partitioning { depth: 0, maxDirectoriesPerUnit: 1 }
+        filterOptions { pathsToSkip: ["%s"] }
+        """.formatted(root.resolve("b").toUri()));
+    int[] unitsExecuted = {0};
+    long[] sourceCalls = {0};
+
+    List<String> ids = executeWithHandBack(config, plan(config), unitsExecuted, sourceCalls);
+
+    // root, a and a/deep are each a unit; b is never one
+    assertEquals(3, ids.size());
+    assertEquals(3, unitsExecuted[0]);
+  }
+
+  @Test
+  public void testTimeLimitHandsBackToo() throws Exception {
+    // a limit of one second is not reached by a tree this small, so everything is walked by the one unit
+    Config config = config("partitioning { depth: 0, maxUnitSecs: 1 }");
+    int[] unitsExecuted = {0};
+    long[] sourceCalls = {0};
+    assertEquals(5, executeWithHandBack(config, plan(config), unitsExecuted, sourceCalls).size());
+    assertEquals(1, unitsExecuted[0]);
   }
 
   @Test
@@ -170,7 +376,8 @@ public class PartitionedFileConnectorTest {
       for (Map.Entry<String, ObjectNode> entry : plan(config).entrySet()) {
         TestMessenger unitMessenger = new TestMessenger();
         FileConnector connector = new FileConnector(config);
-        connector.executeUnit(unit(entry.getKey(), entry.getValue()), new PublisherImpl(config, unitMessenger, "run1", "pipeline1"));
+        connector.executeUnit(unit(entry.getKey(), entry.getValue()), new PublisherImpl(config, unitMessenger, "run1", "pipeline1"),
+            new RecordingUnitContext());
         connector.close();
         numDocs += unitMessenger.getDocsSentForProcessing().size();
         unitMessenger.getDocsSentForProcessing().forEach(doc -> ids.add(doc.getId()));
@@ -241,7 +448,7 @@ public class PartitionedFileConnectorTest {
       WorkUnit unit = unit("bad", WorkUnit.newPayload().put("path", badPath).put("recursive", true));
 
       assertThrows(badPath, ConnectorException.class,
-          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1")));
+          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1"), new RecordingUnitContext()));
       assertTrue(badPath, messenger.getDocsSentForProcessing().isEmpty());
       connector.close();
     }
@@ -261,7 +468,7 @@ public class PartitionedFileConnectorTest {
       WorkUnit unit = unit("bad", WorkUnit.newPayload().put("path", skipped.toUri().toString()).put("recursive", true));
 
       assertThrows(skipped.toString(), ConnectorException.class,
-          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1")));
+          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1"), new RecordingUnitContext()));
       assertTrue(messenger.getDocsSentForProcessing().isEmpty());
       connector.close();
     }
@@ -289,7 +496,7 @@ public class PartitionedFileConnectorTest {
       WorkUnit unit = unit("bad", WorkUnit.newPayload().put("path", root.toUri() + beyondLink).put("recursive", true));
 
       assertThrows(beyondLink, ConnectorException.class,
-          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1")));
+          () -> connector.executeUnit(unit, new PublisherImpl(config, messenger, "run1", "pipeline1"), new RecordingUnitContext()));
       assertTrue(messenger.getDocsSentForProcessing().isEmpty());
       connector.close();
     }
