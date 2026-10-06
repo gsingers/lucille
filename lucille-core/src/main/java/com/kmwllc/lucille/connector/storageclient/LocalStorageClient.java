@@ -7,6 +7,7 @@ import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.io.File;
 import java.io.FileInputStream;
+import com.kmwllc.lucille.core.FailureClass;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -155,6 +156,16 @@ public class LocalStorageClient extends BaseStorageClient {
 
     @Override
     public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+      // A directory that could not be listed, in a traversal that can hand work back: it is handed back, to be tried
+      // again as a unit of its own, and so is the rest of this traversal.
+      TraversalBudget budget = params.getBudget();
+      if (budget != null && Files.isDirectory(file)) {
+        log.warn("Could not list {}; handing it and the rest of the unit back.", file, exc);
+        budget.sourceError(FailureClass.SOURCE_ERROR, exc);
+        budget.handBack(file.toAbsolutePath().normalize().toUri());
+        return FileVisitResult.CONTINUE;
+      }
+
       // At some point we can add a feature to create a tombstone document, for now just log the failure.
       log.warn("Visit File Failed for : {}", file.toString(), exc);
       return FileVisitResult.CONTINUE;

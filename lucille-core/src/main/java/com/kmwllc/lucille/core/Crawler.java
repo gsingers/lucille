@@ -169,6 +169,7 @@ class Crawler implements Runnable {
     CrawlerPublisher publisher = null;
     Execution execution = new Execution();
     String error = null;
+    Throwable failure = null;
     VirtualMachineError fatal = null;
 
     synchronized (reportLock) {
@@ -189,6 +190,7 @@ class Crawler implements Runnable {
       // attempts. A unit that killed its Crawler without a report would be delivered to the next one, and the next.
       log.error("Unit {} failed.", unit.unitId(), t);
       error = describe(t);
+      failure = t;
       fatal = t instanceof VirtualMachineError ? (VirtualMachineError) t : null;
       // a connector that failed part way through may be in no state to execute another unit
       closeCachedConnector();
@@ -221,14 +223,24 @@ class Crawler implements Runnable {
           .put(CoordinatorPublisher.EXECUTION, execution.id)
           .put(CoordinatorPublisher.NUM_PUBLISHED, numPublished)
           .put(CoordinatorPublisher.SOURCE_CALLS, execution.sourceCalls.get())
+          .put(CoordinatorPublisher.REFUSED_CALLS, execution.refusedCalls.get())
           .put(CoordinatorPublisher.DURATION_MS, durationMillis);
       if (error == null) {
+        if (execution.errorClass != null) {
+          // the unit completed by handing back what its source would not let it do
+          message.put(CoordinatorPublisher.ERROR_CLASS, execution.errorClass.name())
+              .put(CoordinatorPublisher.ERROR_CAUSE, truncate(execution.errorCause));
+        }
         sendHandedBack(unit, execution);
         sendUnitEvent(unit, message.put(CoordinatorPublisher.NUM_CHILDREN, execution.handedBack.size()), Event.Type.UNIT_DONE);
-        log.info("Unit {} done: {} docs in {} ms, {} parts handed back.", unit.unitId(), numPublished, durationMillis,
-            execution.handedBack.size());
+        log.info("Unit {} done: {} docs in {} ms, {} parts handed back, {} calls refused{}.", unit.unitId(), numPublished,
+            durationMillis, execution.handedBack.size(), execution.refusedCalls.get(),
+            execution.errorClass == null ? "" : ", ended by " + execution.errorClass);
       } else {
-        sendUnitEvent(unit, message.put(CoordinatorPublisher.ERROR, error), Event.Type.UNIT_FAILED);
+        message.put(CoordinatorPublisher.ERROR, error)
+            .put(CoordinatorPublisher.ERROR_CLASS, FailureClass.of(failure).name())
+            .put(CoordinatorPublisher.ERROR_CAUSE, describe(FailureClass.rootCause(failure)));
+        sendUnitEvent(unit, message, Event.Type.UNIT_FAILED);
       }
     }
 
@@ -249,6 +261,9 @@ class Crawler implements Runnable {
     final String id = UUID.randomUUID().toString();
     final List<ObjectNode> handedBack = new CopyOnWriteArrayList<>();
     final AtomicLong sourceCalls = new AtomicLong();
+    final AtomicLong refusedCalls = new AtomicLong();
+    volatile FailureClass errorClass;
+    volatile String errorCause;
     // set once the unit has a publisher, which is what learns that the unit was lost or its run stopped
     volatile CrawlerPublisher publisher;
     volatile boolean timedOut = false;
@@ -263,6 +278,17 @@ class Crawler implements Runnable {
     @Override
     public void addSourceCalls(long calls) {
       sourceCalls.addAndGet(calls);
+    }
+
+    @Override
+    public void addRefusedCalls(long calls) {
+      refusedCalls.addAndGet(calls);
+    }
+
+    @Override
+    public void recordSourceError(FailureClass failureClass, String cause) {
+      errorClass = failureClass;
+      errorCause = cause;
     }
 
     @Override
@@ -346,7 +372,13 @@ class Crawler implements Runnable {
    * kept short and on one line; the full exception is in this Crawler's own log.
    */
   private static String describe(Throwable t) {
-    String text = t.getClass().getSimpleName() + ": " + t.getMessage();
+    return truncate(t.getClass().getSimpleName() + ": " + t.getMessage());
+  }
+
+  private static String truncate(String text) {
+    if (text == null) {
+      return null;
+    }
     text = text.replaceAll("\\p{Cntrl}", " ");
     return text.length() > MAX_ERROR_LENGTH ? text.substring(0, MAX_ERROR_LENGTH) + "..." : text;
   }

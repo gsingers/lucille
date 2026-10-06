@@ -41,6 +41,9 @@ public class TraversalParams {
   // Limits the traversal and collects what it leaves unwalked. Null for a traversal that walks everything.
   private final TraversalBudget budget;
 
+  // How long to go on retrying a request the source refused.
+  private final SourceRetryPolicy retryPolicy;
+
   // FileOptions
   private final boolean getFileContent;
   private final boolean handleArchivedFiles;
@@ -84,6 +87,7 @@ public class TraversalParams {
     this.docIdPrefix = docIdPrefix;
     this.recursive = recursive;
     this.budget = budget;
+    this.retryPolicy = SourceRetryPolicy.fromConfig(config);
 
     Config fileOptions = config.hasPath("fileOptions") ? config.getConfig("fileOptions") : ConfigFactory.empty();
     // file options / derived params
@@ -224,6 +228,10 @@ public class TraversalParams {
 
   public TraversalBudget getBudget() {
     return budget;
+  }
+
+  public SourceRetryPolicy getRetryPolicy() {
+    return retryPolicy;
   }
 
   public String getDocIdPrefix() {

@@ -62,6 +62,10 @@ public class CoordinatorPublisher extends PublisherImpl {
   static final String SOURCE_CALLS = "sourceCalls";
   static final String DURATION_MS = "durationMs";
   public static final String ERROR = "error";
+  // what kind of failure, and the innermost cause; on a UNIT_DONE, the failure that made the unit hand work back
+  public static final String ERROR_CLASS = "errorClass";
+  public static final String ERROR_CAUSE = "errorCause";
+  public static final String REFUSED_CALLS = "refusedCalls";
 
   private static final int UNDISPATCHED_EPOCH = 0;
 

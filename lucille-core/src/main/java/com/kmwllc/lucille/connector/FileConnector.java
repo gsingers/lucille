@@ -33,6 +33,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.commons.codec.digest.DigestUtils;
+import com.kmwllc.lucille.connector.storageclient.SourceRetryPolicy;
 import com.kmwllc.lucille.connector.storageclient.StorageClient;
 import com.kmwllc.lucille.connector.storageclient.TraversalBudget;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams;
@@ -103,6 +104,10 @@ import com.typesafe.config.Config;
  *   Local paths and S3 only. Not set by default, so a unit walks all of its subtree.</li>
  *   <li>partitioning.maxUnitSecs (Int, Optional) : As maxDirectoriesPerUnit, but a limit on how long a unit goes on
  *   listing directories. Either limit, when reached, ends the unit's descent.</li>
+ *   <li>sourceRetrySecs (Int, Optional) : How long, in all, to go on retrying a listing that the source refused for
+ *   rate (HTTP 429) or could not answer (5xx, connection failures), with exponential backoff. Defaults to 180. In a
+ *   distributed crawl, a listing given up on after this long ends the unit, which hands back what it has not listed.</li>
+ *   <li>sourceRetryCapSecs (Int, Optional) : The longest single wait between those retries. Defaults to 20.</li>
  *   <li>partitioning.handBackGroupSize (Int, Optional) : How many of the directories a unit hands back make one new
  *   unit. Defaults to maxDirectoriesPerUnit, or 64 when that is not set. A storage client that walks a unit's
  *   directories in parallel can take groups of hundreds or thousands.</li>
@@ -177,6 +182,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
   public static final Spec SPEC = SpecBuilder.connector()
       .requiredList("paths", new TypeReference<List<String>>(){})
       .optionalBoolean("concurrent")
+      .optionalNumber(SourceRetryPolicy.RETRY_SECS, SourceRetryPolicy.RETRY_CAP_SECS)
       .optionalParent(
           SpecBuilder.parent("filterOptions")
               .optionalList("includes", new TypeReference<List<String>>(){})
@@ -365,6 +371,11 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
 
     handBack(budget.getHandedBack(), context);
     context.addSourceCalls(budget.getDirectoriesListed());
+    // what the source refused or failed on, so that the Coordinator can delay the handed-back parts
+    context.addRefusedCalls(budget.getRefusedCalls());
+    if (budget.getSourceError() != null) {
+      context.recordSourceError(budget.getSourceError().failureClass(), budget.getSourceError().cause());
+    }
   }
 
   // The paths of a unit are given to each storage client together, so that a client able to walk several at once

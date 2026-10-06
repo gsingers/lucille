@@ -304,6 +304,31 @@ public class DistributedCrawlTest {
   }
 
   @Test
+  public void testUnitThrottledPartWayHandsTheRestBackAndCompletes() throws Exception {
+    Config config = start(SCRIPTED);
+    ScriptedPartitionedConnector.throttledOnce.add("u1");
+
+    RunResult result = run(config, "run1");
+
+    // the half that was published before the throttle, plus the handed-back rest as a unit of its own
+    assertTrue(result.getStatus());
+    assertEquals(1, ScriptedPartitionedConnector.executionsOf("u1"));
+    assertEquals(1, ScriptedPartitionedConnector.executionsOf("u1-rest"));
+    assertEquals(32, numSucceeded(result));
+  }
+
+  @Test
+  public void testUnitThatFailsThrottledIsExecutedAgain() throws Exception {
+    Config config = start(SCRIPTED);
+    ScriptedPartitionedConnector.throttleFailOnce.add("u3");
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("u3"));
+  }
+
+  @Test
   public void testFailedUnitIsExecutedAgain() throws Exception {
     Config config = start(SCRIPTED);
     ScriptedPartitionedConnector.failOnce.add("u2");

@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Rule;
+import com.kmwllc.lucille.core.FailureClass;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
@@ -346,6 +347,41 @@ public class PartitionedFileConnectorTest {
     // a/ and a/deep/ use up the two listings, so b/ is handed back
     assertEquals(Set.of("a1.txt", "a2.txt"), fileNames(bothMessenger));
     assertEquals(List.of(root.resolve("b").toUri().toString()), new ArrayList<>(context.handedBack.keySet()));
+  }
+
+  @Test
+  public void testDirectoryThatCannotBeListedIsHandedBackAndEndsTheUnit() throws Exception {
+    // b/ cannot be read; the walk reaches it after root and a/
+    Path b = root.resolve("b");
+    Assume.assumeTrue("needs a user that cannot read a directory it owns", b.toFile().setReadable(false, false)
+        && !Files.isReadable(b));
+    try {
+      Config config = config("partitioning { depth: 0 }");
+      FileConnector connector = new FileConnector(config);
+      TestMessenger messenger = new TestMessenger();
+      RecordingUnitContext context = new RecordingUnitContext();
+      Map.Entry<String, ObjectNode> rootUnit = plan(config).entrySet().iterator().next();
+
+      connector.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()), new PublisherImpl(config, messenger, "run1", "pipeline1"), context);
+      connector.close();
+
+      // what was listed was published, b/ was handed back to be tried as a unit of its own, and the unit completed
+      assertEquals(Set.of("top.txt", "a1.txt", "a2.txt"), fileNames(messenger));
+      assertEquals(List.of(b.toUri().toString()), new ArrayList<>(context.handedBack.keySet()));
+      assertEquals(FailureClass.SOURCE_ERROR, context.errorClass);
+      assertTrue(context.errorCause, context.errorCause.contains("AccessDenied"));
+
+      // that unit meets the same failure, and hands back only itself
+      FileConnector again = new FileConnector(config);
+      RecordingUnitContext bContext = new RecordingUnitContext();
+      again.executeUnit(unit(b.toUri().toString(), context.handedBack.get(b.toUri().toString())),
+          new PublisherImpl(config, new TestMessenger(), "run1", "pipeline1"), bContext);
+      again.close();
+      assertEquals(List.of(b.toUri().toString()), new ArrayList<>(bContext.handedBack.keySet()));
+      assertEquals(FailureClass.SOURCE_ERROR, bContext.errorClass);
+    } finally {
+      b.toFile().setReadable(true, true);
+    }
   }
 
   @Test

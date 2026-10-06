@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.net.URISyntaxException;
+import com.kmwllc.lucille.core.FailureClass;
+import com.kmwllc.lucille.core.SourceException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -23,6 +25,9 @@ import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
@@ -119,7 +124,7 @@ public class S3StorageClient extends BaseStorageClient {
    * the prefixes beneath it is listed.
    */
   private void traverseWithinBudget(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr,
-      String startingPrefix) {
+      String startingPrefix) throws SourceException {
     TraversalBudget budget = params.getBudget();
     Deque<String> prefixes = new ArrayDeque<>();
     prefixes.push(startingPrefix);
@@ -132,28 +137,18 @@ public class S3StorageClient extends BaseStorageClient {
         continue;
       }
 
-      ListObjectsV2Request request = ListObjectsV2Request.builder()
-          .bucket(getBucketOrContainerName(params))
-          .prefix(prefix)
-          .delimiter("/")
-          .maxKeys(maxNumOfPages)
-          .build();
-
-      List<String> prefixesBeneath = new ArrayList<>();
-      s3.listObjectsV2Paginator(request).stream().forEachOrdered(resp -> {
-        resp.contents().forEach(obj -> {
-          S3FileReference fileRef = new S3FileReference(obj, params);
-          processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
-        });
-
-        if (params.isRecursive()) {
-          resp.commonPrefixes().forEach(cp -> {
-            if (!isSkippedDirectory(uriForDirectory(cp.prefix(), params), params)) {
-              prefixesBeneath.add(cp.prefix());
-            }
-          });
-        }
-      });
+      List<String> prefixesBeneath;
+      try {
+        prefixesBeneath = listPrefix(publisher, params, stateMgr, prefix);
+      } catch (SourceException e) {
+        // The source has failed on this prefix for good. The prefix is handed back unlisted, to be tried again as a
+        // unit of its own, and so, as the stack unwinds, is everything else this unit had still to list.
+        log.warn("Giving up on listing {} ({}); handing it and the rest of the unit back.", prefix, e.getFailureClass(), e);
+        budget.sourceError(e.getFailureClass(), e);
+        budget.listingFailed();
+        budget.handBack(uriForDirectory(prefix, params));
+        continue;
+      }
 
       // pushed last first, so that they are listed in the order the store returned them
       for (int i = prefixesBeneath.size() - 1; i >= 0; i--) {
@@ -162,31 +157,97 @@ public class S3StorageClient extends BaseStorageClient {
     }
   }
 
-  private void traversePrefix(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr, String prefix) {
+  private void traversePrefix(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr, String prefix)
+      throws SourceException {
+    for (String beneath : listPrefix(publisher, params, stateMgr, prefix)) {
+      traversePrefix(publisher, params, stateMgr, beneath);
+    }
+  }
+
+  /**
+   * Lists one prefix, publishing its objects, and returns the prefixes beneath it that are to be traversed. A
+   * request the store refuses or cannot answer is tried again for as long as the params' retry policy allows; the
+   * objects published before the failure are published again on the retry, under the same IDs.
+   *
+   * @throws SourceException once the retries are used up, saying what kind of failure it was.
+   */
+  private List<String> listPrefix(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr,
+      String prefix) throws SourceException {
     ListObjectsV2Request request = ListObjectsV2Request.builder()
         .bucket(getBucketOrContainerName(params))
         .prefix(prefix)
         .delimiter("/")
         .maxKeys(maxNumOfPages)
         .build();
+    TraversalBudget budget = params.getBudget();
+    long firstFailureMillis = 0;
 
-    s3.listObjectsV2Paginator(request).stream().forEachOrdered(resp -> {
-      resp.contents().forEach(obj -> {
-        S3FileReference fileRef = new S3FileReference(obj, params);
-        processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
-      });
+    for (int retry = 0; ; retry++) {
+      List<String> prefixesBeneath = new ArrayList<>();
+      try {
+        s3.listObjectsV2Paginator(request).stream().forEachOrdered(resp -> {
+          resp.contents().forEach(obj -> {
+            S3FileReference fileRef = new S3FileReference(obj, params);
+            processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
+          });
 
-      if (!params.isRecursive()) {
-        return;
-      }
-
-      resp.commonPrefixes().forEach(cp -> {
-        URI prefixUri = uriForDirectory(cp.prefix(), params);
-        if (!isSkippedDirectory(prefixUri, params)) {
-          traversePrefix(publisher, params, stateMgr, cp.prefix());
+          if (params.isRecursive()) {
+            resp.commonPrefixes().forEach(cp -> {
+              if (!isSkippedDirectory(uriForDirectory(cp.prefix(), params), params)) {
+                prefixesBeneath.add(cp.prefix());
+              }
+            });
+          }
+        });
+        return prefixesBeneath;
+      } catch (SdkException e) {
+        FailureClass failureClass = classify(e);
+        if (retry == 0) {
+          firstFailureMillis = System.currentTimeMillis();
         }
-      });
-    });
+        if (budget != null) {
+          budget.callRefused();
+        }
+
+        long waitMillis = failureClass.isOverload() ? params.getRetryPolicy().nextWaitMillis(retry + 1, firstFailureMillis) : -1;
+        if (waitMillis < 0 || (budget != null && budget.isCancelled())) {
+          throw new SourceException(failureClass, "Could not list " + uriForDirectory(prefix, params) + " after "
+              + retry + " retries.", e);
+        }
+
+        log.info("Listing {} was refused ({}); retry {} in {} ms.", prefix, failureClass, retry + 1, waitMillis);
+        sleepUnlessCancelled(waitMillis, budget);
+      }
+    }
+  }
+
+  private static void sleepUnlessCancelled(long millis, TraversalBudget budget) {
+    long deadline = System.currentTimeMillis() + millis;
+    try {
+      while (System.currentTimeMillis() < deadline && (budget == null || !budget.isCancelled())) {
+        Thread.sleep(Math.min(200, Math.max(1, deadline - System.currentTimeMillis())));
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  /**
+   * Says what kind of failure an SDK exception is. Throttling is the store asking for a lower rate; a 5xx or a
+   * connection failure is the store being unavailable; anything else it answered with is an error of the request.
+   */
+  static FailureClass classify(SdkException e) {
+    if (e instanceof AwsServiceException service) {
+      if (service.isThrottlingException() || service.statusCode() == 429) {
+        return FailureClass.THROTTLED;
+      }
+      if (service.statusCode() >= 500) {
+        return FailureClass.SOURCE_UNAVAILABLE;
+      }
+      return FailureClass.SOURCE_ERROR;
+    }
+    // the SDK could not get an answer at all: a connection refused, a timeout, a reset
+    return e.retryable() || e instanceof SdkClientException ? FailureClass.SOURCE_UNAVAILABLE : FailureClass.SOURCE_ERROR;
   }
 
   @Override

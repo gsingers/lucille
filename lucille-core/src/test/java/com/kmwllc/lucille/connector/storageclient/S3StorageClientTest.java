@@ -11,6 +11,7 @@ import static com.kmwllc.lucille.connector.FileConnector.S3_SECRET_ACCESS_KEY;
 import static com.kmwllc.lucille.connector.FileConnector.SIZE;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -31,6 +32,13 @@ import com.kmwllc.lucille.core.fileHandler.FileHandler;
 import com.kmwllc.lucille.core.fileHandler.JsonFileHandler;
 import com.kmwllc.lucille.message.TestMessenger;
 import com.typesafe.config.Config;
+import com.kmwllc.lucille.core.FailureClass;
+import com.kmwllc.lucille.core.SourceException;
+import java.util.concurrent.atomic.AtomicInteger;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import com.typesafe.config.ConfigFactory;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
@@ -120,6 +128,137 @@ public class S3StorageClientTest {
     assertThrows(IllegalArgumentException.class,
         () -> new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_ANONYMOUS, true, S3_ACCESS_KEY_ID, "accessKey",
             S3_SECRET_ACCESS_KEY, "secretKey"))));
+  }
+
+  // The prefix bucket, whose listings are refused with the given status for the first several calls, or for ever.
+  private S3Client refusingClient(int status, int refusals, AtomicInteger calls) {
+    S3Client serving = mockClientWithPrefixes();
+    S3Client mockClient = mock(S3Client.class, RETURNS_DEEP_STUBS);
+    when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenAnswer(invocation -> {
+      if (calls.incrementAndGet() <= refusals) {
+        throw S3Exception.builder().statusCode(status).message("Please reduce your request rate")
+            .awsErrorDetails(AwsErrorDetails.builder().errorCode(status == 429 ? "TooManyRequestsException" : "ServiceUnavailable").build())
+            .build();
+      }
+      return serving.listObjectsV2Paginator((ListObjectsV2Request) invocation.getArgument(0));
+    });
+    return mockClient;
+  }
+
+  private S3StorageClient clientWith(S3Client s3) throws Exception {
+    S3StorageClient s3StorageClient = new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_REGION, "us-east-1")));
+    s3StorageClient.setS3ClientForTesting(s3);
+    s3StorageClient.initializeForTesting();
+    return s3StorageClient;
+  }
+
+  private static final Config QUICK_RETRIES = ConfigFactory.parseString("sourceRetrySecs: 10, sourceRetryCapSecs: 1");
+
+  @Test
+  public void testRefusedListingIsRetriedUntilItPasses() throws Exception {
+    // the first three calls are refused; with a cap of a second the retries take two or three seconds in all
+    AtomicInteger calls = new AtomicInteger();
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = TraversalBudget.unlimited();
+
+    clientWith(refusingClient(429, 3, calls)).traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(QUICK_RETRIES, URI.create("s3://bucket/"), "", true, budget));
+
+    // the traversal is whole, each prefix listed once, and the refusals are counted but did not end anything
+    assertEquals(traversePrefixBucket(true), messenger.getDocsSentForProcessing().stream().map(doc -> doc.getString(FILE_PATH)).toList());
+    assertEquals(6, calls.get());
+    assertEquals(3, budget.getDirectoriesListed());
+    assertEquals(3, budget.getRefusedCalls());
+    assertNull(budget.getSourceError());
+    assertEquals(List.of(), budget.getHandedBack());
+  }
+
+  @Test
+  public void testRefusedListingIsRetriedWithoutABudgetToo() throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    TestMessenger messenger = new TestMessenger();
+
+    clientWith(refusingClient(503, 2, calls)).traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(QUICK_RETRIES, URI.create("s3://bucket/"), "", true));
+
+    assertEquals(3, messenger.getDocsSentForProcessing().size());
+    assertEquals(5, calls.get());
+  }
+
+  @Test
+  public void testListingGivenUpOnEndsTheUnitAndHandsTheRestBack() throws Exception {
+    // the root lists, then a/ is refused for longer than the policy allows
+    AtomicInteger calls = new AtomicInteger();
+    S3Client serving = mockClientWithPrefixes();
+    S3Client mockClient = mock(S3Client.class, RETURNS_DEEP_STUBS);
+    when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenAnswer(invocation -> {
+      ListObjectsV2Request request = invocation.getArgument(0);
+      calls.incrementAndGet();
+      if (request.prefix().equals("a/")) {
+        throw S3Exception.builder().statusCode(429).message("slow down").build();
+      }
+      return serving.listObjectsV2Paginator(request);
+    });
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = TraversalBudget.unlimited();
+    Config shortRetries = ConfigFactory.parseString("sourceRetrySecs: 1, sourceRetryCapSecs: 1");
+
+    clientWith(mockClient).traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(shortRetries, URI.create("s3://bucket/"), "", true, budget));
+
+    // the root's object was published; a/ and everything after it were handed back, unlisted; nothing was listed twice
+    assertEquals(List.of("s3://bucket/root.txt"), messenger.getDocsSentForProcessing().stream().map(doc -> doc.getString(FILE_PATH)).toList());
+    assertEquals(List.of(URI.create("s3://bucket/a/"), URI.create("s3://bucket/b/")), budget.getHandedBack());
+    assertEquals(FailureClass.THROTTLED, budget.getSourceError().failureClass());
+    assertTrue(budget.getSourceError().cause(), budget.getSourceError().cause().contains("slow down"));
+    assertEquals(1, budget.getDirectoriesListed());
+    assertTrue("calls: " + calls.get(), calls.get() >= 3);
+    assertEquals(calls.get() - 1, budget.getRefusedCalls());
+
+    // without a budget, the same failure is thrown, classified
+    TestMessenger again = new TestMessenger();
+    SourceException e = assertThrows(SourceException.class, () -> clientWith(mockClient).traverse(
+        new PublisherImpl(ConfigFactory.empty(), again, "run1", "pipeline1"),
+        new TraversalParams(shortRetries, URI.create("s3://bucket/"), "", true)));
+    assertEquals(FailureClass.THROTTLED, e.getFailureClass());
+  }
+
+  @Test
+  public void testRetryingStopsWhenTheUnitIsGivenUpOn() throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    boolean[] cancelled = {false};
+    TraversalBudget budget = new TraversalBudget(null, null, () -> cancelled[0]);
+    Config longRetries = ConfigFactory.parseString("sourceRetrySecs: 60, sourceRetryCapSecs: 20");
+    S3StorageClient client = clientWith(refusingClient(429, Integer.MAX_VALUE, calls));
+    TestMessenger messenger = new TestMessenger();
+
+    Thread traversal = new Thread(() -> {
+      try {
+        client.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+            new TraversalParams(longRetries, URI.create("s3://bucket/"), "", true, budget));
+      } catch (Exception e) {
+        throw new RuntimeException(e);
+      }
+    });
+    traversal.start();
+    Thread.sleep(300);
+    assertTrue(traversal.isAlive());
+
+    // nobody wants the result any more, so the wait ends at once rather than in twenty seconds
+    cancelled[0] = true;
+    traversal.join(2000);
+    assertFalse(traversal.isAlive());
+  }
+
+  @Test
+  public void testClassification() {
+    assertEquals(FailureClass.THROTTLED, S3StorageClient.classify(S3Exception.builder().statusCode(429).build()));
+    assertEquals(FailureClass.THROTTLED, S3StorageClient.classify(S3Exception.builder().statusCode(400)
+        .awsErrorDetails(AwsErrorDetails.builder().errorCode("Throttling").build()).build()));
+    assertEquals(FailureClass.SOURCE_UNAVAILABLE, S3StorageClient.classify(S3Exception.builder().statusCode(503).build()));
+    assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(S3Exception.builder().statusCode(403).build()));
+    assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(NoSuchKeyException.builder().statusCode(404).build()));
+    assertEquals(FailureClass.SOURCE_UNAVAILABLE, S3StorageClient.classify(SdkClientException.create("connection reset")));
   }
 
   // A bucket with one object and two prefixes at its root, and one object under each prefix.

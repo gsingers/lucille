@@ -2,8 +2,11 @@ package com.kmwllc.lucille.connector.storageclient;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import com.kmwllc.lucille.core.FailureClass;
+import java.io.IOException;
 import java.net.URI;
 import java.util.List;
 import org.junit.Test;
@@ -65,6 +68,24 @@ public class TraversalBudgetTest {
     TraversalBudget fromTheStart = new TraversalBudget(null, null, () -> true);
     assertFalse(fromTheStart.mayList());
     assertEquals(0, fromTheStart.getDirectoriesListed());
+  }
+
+  @Test
+  public void testSourceErrorEndsTheTraversal() {
+    TraversalBudget budget = TraversalBudget.unlimited();
+    assertTrue(budget.mayList());
+    budget.callRefused();
+    budget.callRefused();
+    assertEquals(2, budget.getRefusedCalls());
+    assertNull(budget.getSourceError());
+
+    budget.sourceError(FailureClass.THROTTLED, new RuntimeException("wrapper", new IOException("429 Too Many Requests")));
+
+    // nothing more may be listed, so the rest of the traversal is handed back
+    assertFalse(budget.mayList());
+    assertEquals(FailureClass.THROTTLED, budget.getSourceError().failureClass());
+    assertEquals("IOException: 429 Too Many Requests", budget.getSourceError().cause());
+    assertEquals(1, budget.getDirectoriesListed());
   }
 
   @Test

@@ -28,6 +28,23 @@ public interface UnitContext {
   void addSourceCalls(long calls);
 
   /**
+   * Records calls to the source that it refused or could not answer, whether or not a retry then succeeded. Reported
+   * with the unit's result; the Coordinator reads them as a sign that the source is overloaded.
+   */
+  default void addRefusedCalls(long calls) {
+  }
+
+  /**
+   * Records that the source failed for good on part of this unit, which the connector has handed back rather than
+   * executed, so that the unit can complete. The Coordinator delays the handed-back parts if the failure says the
+   * source is overloaded.
+   *
+   * @param cause the innermost exception's class and message.
+   */
+  default void recordSourceError(FailureClass failureClass, String cause) {
+  }
+
+  /**
    * Returns whether this execution of the unit has been given up on: it ran past crawl.maxUnitSecs, its run was
    * cancelled or lost its Coordinator, or the unit was passed to another Crawler. Nothing the unit publishes or
    * hands back from then on counts. A connector whose units can be long should look now and then, and return.

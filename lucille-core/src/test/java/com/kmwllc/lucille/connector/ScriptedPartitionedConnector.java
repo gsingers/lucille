@@ -2,6 +2,8 @@ package com.kmwllc.lucille.connector;
 
 import com.kmwllc.lucille.core.ConnectorException;
 import com.kmwllc.lucille.core.Document;
+import com.kmwllc.lucille.core.FailureClass;
+import com.kmwllc.lucille.core.SourceException;
 import com.kmwllc.lucille.core.PartitionableConnector;
 import com.kmwllc.lucille.core.Publisher;
 import com.kmwllc.lucille.core.UnitContext;
@@ -64,6 +66,13 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
   public static final Set<String> hangOnce = ConcurrentHashMap.newKeySet();
   /** Units that found their execution cancelled once {@link #hang} had opened. */
   public static final Set<String> sawCancelled = ConcurrentHashMap.newKeySet();
+  /**
+   * Units that, the first time they are executed, publish half of their Documents, then meet a throttled source:
+   * they hand back a part named after them, record the failure, and complete.
+   */
+  public static final Set<String> throttledOnce = ConcurrentHashMap.newKeySet();
+  /** Units that, the first time they are executed, fail with a throttling failure. */
+  public static final Set<String> throttleFailOnce = ConcurrentHashMap.newKeySet();
   /** Units that wait for {@link #hang} to open every time they are executed. */
   public static final Set<String> hangAlways = ConcurrentHashMap.newKeySet();
   public static volatile CountDownLatch hang = new CountDownLatch(0);
@@ -93,6 +102,8 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     completed.clear();
     handBacks.clear();
     hangOnce.clear();
+    throttledOnce.clear();
+    throttleFailOnce.clear();
     sawCancelled.clear();
     gatedUnits.clear();
     reachedGate.clear();
@@ -139,6 +150,10 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     if (failAlways.contains(unitKey) || (execution == 1 && failOnce.contains(unitKey))) {
       throw new ConnectorException("Scripted failure of " + unitKey);
     }
+    if (execution == 1 && throttleFailOnce.contains(unitKey)) {
+      throw new ConnectorException("Error occurred while traversing " + unitKey,
+          new SourceException(FailureClass.THROTTLED, "Could not list " + unitKey, new RuntimeException("429 Too Many Requests")));
+    }
 
     try {
       if (hangAlways.contains(unitKey) || (execution == 1 && hangOnce.contains(unitKey))) {
@@ -153,6 +168,13 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       }
 
       for (int i = 0; i < docsPerUnit; i++) {
+        if (execution == 1 && throttledOnce.contains(unitKey) && i == docsPerUnit / 2) {
+          // the source refused the rest: handed back under a key of its own, to be executed as a unit
+          context.handBack(unitKey + "-rest", WorkUnit.newPayload().put("key", unitKey + "-rest"));
+          context.addRefusedCalls(3);
+          context.recordSourceError(FailureClass.THROTTLED, "RuntimeException: 429 Too Many Requests");
+          break;
+        }
         publisher.publish(Document.create(createDocId(unitKey + "-" + i)));
 
         if (execution == 1 && errorOnce.contains(unitKey)) {
