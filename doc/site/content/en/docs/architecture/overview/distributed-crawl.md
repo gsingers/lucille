@@ -248,7 +248,7 @@ The shipped default is unbounded: `partitioning.depth` 1 and no limit. Bounded u
 
 **A tight watchdog becomes possible.** `crawl.maxUnitSecs` can be set low when every unit is known to be small.
 
-On a tree of about 700,000 directories, with four Crawlers, a warm store and both runs dispatched largest-first, bounded units finished in 227 s against 277 s for unbounded, with the work spread within 1.7× across Crawlers instead of 9.5× (see [the measurements](#what-the-measurements-show)).
+On a tree of about 700,000 directories, with four Crawlers and both runs dispatched largest-first, bounded units finished in 227 s against 277 s for unbounded, with the work spread within 1.7× across Crawlers instead of 9.5× (see [the measurements](#what-the-measurements-show)).
 
 What it costs:
 
@@ -268,7 +268,7 @@ On a synthetic S3 tree of 4,102 prefixes and 8,005 objects, nine tenths of it un
 
 Wall time is not compared: on a tree this small it was dominated by indexing.
 
-The larger measurements were taken with a storage client outside Lucille that walks with a pool of threads and implements `traverseAll` and the per-unit concurrency share. That is the kind of client the bounded design is aimed at; Lucille's own S3 client lists on one thread. The tree had about 700,000 directories and about 6 million objects, on an S3-compatible store whose listings are served by a backend with a cache.
+The larger measurements were taken with a storage client outside Lucille that walks with a pool of threads and implements `traverseAll` and the per-unit concurrency share. That is the kind of client the bounded design is aimed at; Lucille's own S3 client lists on one thread. The tree had about 700,000 directories and about 6 million objects, on an S3-compatible store.
 
 An earlier version, before `traverseAll`, with four Crawlers each walking with 200 listing threads:
 
@@ -282,7 +282,7 @@ An earlier version, before `traverseAll`, with four Crawlers each walking with 2
 
 Bounding spread the work and brought the floor down, but the run was much slower: a handed-back group was walked one directory after another, which on a 200-thread client wastes nearly all of the pool. `traverseAll` was added in response.
 
-**Head to head, with `traverseAll`.** The same four Crawlers and the same tree, the store's cache warm and private (no evictions), 16 partitions, and both runs dispatched largest-first from an earlier run's costs (`-costsFrom`), so that the only difference was how the work was cut:
+**Head to head, with `traverseAll`.** The same four Crawlers and the same tree, run back to back under the same conditions, 16 partitions, and both runs dispatched largest-first from an earlier run's costs (`-costsFrom`), so that the only difference was how the work was cut:
 
 | | Unbounded, `depth: 1` | Bounded, 30 s per unit |
 |---|---|---|
@@ -294,40 +294,11 @@ Bounding spread the work and brought the floor down, but the run was much slower
 | Concurrent requests at the store (median) | 430 | 790 |
 | Failed units | 0 | 0 |
 
-Bounded units were 18% faster. The unbounded run was held to the length of its largest subtree, and two of its Crawlers sat idle once their share was done; the bounded run kept all four busy, its 154 handed-back units ran in a median 0.4 s, and it was the first run to load the store visibly (twice the concurrent requests, and the store's own time per listing doubled). Both runs listed the same directories and published the same Documents.
+Bounded units were 18% faster. The unbounded run was held to the length of its largest subtree, and two of its Crawlers sat idle once their share was done; the bounded run kept all four busy, its 154 handed-back units ran in a median 0.4 s, and it kept twice as many requests in flight at the store. Both runs listed the same directories and published the same Documents.
 
-**Repeated with `traverseAll`.** About 700,000 listings and 6 million Documents per run. Each Crawler ran on its own machine with 200 listing threads, `crawl.maxSourceConcurrency` was 4,800, and bounded units had `partitioning.maxUnitSecs: 30`. First, adding Crawlers, with the store's cache warm but shared and evicting throughout (hit rate 97% to 99%):
+**Other runs.** Bounded units completed every run at 4, 8, 16 and 24 Crawlers on the same tree, with `partitioning.maxUnitSecs: 30`, with no unit failed or dispatched again and every directory listed once. In a second like-for-like pair at four Crawlers, on another day, bounded units again finished first: 251 s against 270 s.
 
-| Crawlers | Units | Traversal | Listings/s | Listing latency, client | Server-side duration | Concurrent requests at the store (median) |
-|---|---|---|---|---|---|---|
-| 4 | unbounded | 270 s | 2,556 | 150 ms | 110 ms | 744 |
-| 4 | bounded | 251 s | 2,749 | 160 ms | 140 ms | 786 |
-| 8 | bounded | 158 s | 4,367 | 190 ms | 210 ms | 1,539 |
-| 16 | bounded | 218 s | 3,165 | 600 ms | 500 ms | 2,710 |
-| 24 | bounded | 217 s | 3,180 | 720 ms | 540 ms | 3,738 |
-
-Every run listed the same directories and published the same Documents. No request was throttled, no unit failed, and none was dispatched again.
-
-- **The store has a knee.** Throughput peaked at 8 Crawlers, about 1,500 concurrent requests. Beyond that the store slowed down rather than refusing, and more Crawlers added latency, not throughput.
-- **The knee's position is approximate.** The store's cache was evicting throughout, so part of the climb at 16 and 24 Crawlers may be the cache rather than the store. The shape of the curve is reliable; the exact knee is not.
-- **Units ran past their limit under load.** The longest unit took 173 to 182 s in the larger runs, against a 30-second limit, for the reason given [above](#bounded-cut-as-the-tree-is-discovered).
-
-Then, at 4 Crawlers, the store's cache state alone was varied:
-
-| | Unbounded, store cold | Bounded, cache private and warm | Bounded, cache shared and evicting (above) |
-|---|---|---|---|
-| Traversal | 327 s | 191 s | 251 s |
-| Listings/s | 2,110 | 3,613 | 2,749 |
-| Listing latency, client | 240 ms | 80 ms | 160 ms |
-| Server-side duration | 210 ms | 50 ms | 140 ms |
-| Units (handed back) | 41 (0) | 199 (158) | 167 (126) |
-
-All three made the same listings, give or take 14, and published the same Documents, with no request throttled and no error.
-
-- **The cache was worth 31%.** The two bounded runs differed only in the state of the store's cache.
-- **The store was no longer the limit.** In the fastest run only about 37% of the 800 threads were busy on average, and the units each Crawler executed ranged from 21 to 71. The likely reading, not yet tested, is that the limit has moved from the store to how units are dealt across Crawlers.
-
-Taken together: in the two like-for-like comparisons, bounded units were faster (227 s against 277 s with a private warm cache; 251 s against 270 s with a shared one), and they completed every run with no failed unit. The larger swings in absolute speed came from the store's cache and from concurrency past the store's knee, not from how the work was cut.
+Under heavy load the longest units ran for up to three minutes against the 30-second limit, for the reason given [above](#bounded-cut-as-the-tree-is-discovered): the limit stops a unit starting new listings, not the listings already in flight.
 
 For unbounded units, the order matters as much as the size: largest-first dispatch from an earlier run's costs alone took the unbounded run from 345 s to 277 s.
 
@@ -416,4 +387,4 @@ flowchart LR
 
 On a throttling proxy that accepted three concurrent requests of 40 ms each, in front of the synthetic tree above, with eight Crawler threads, `maxSourceConcurrency: 8`, and, so that the figure started at the top, `initialSourceConcurrency: 8`, `sourceConcurrencyStep: 1` and `sourceConcurrencyHoldSecs: 3`, the figure went 8 → 4 → 2, climbed back to 5, was cut again on the next refusals, and oscillated around the line for the rest of the run, between 2 and 5 against a limit of 3, as the loop is meant to. A burst of 25 seconds in which the store refused every request was waited out with no failed unit, and a store stopped for 20 seconds in the middle of a crawl cost 43 retried calls and nothing else. Every case indexed every Document.
 
-On the larger tree, with the external client above, twenty-four Crawlers against a cold store met a burst of 429s in their first minutes. Against a warm store, with the figure starting at 1,200 and rising by 480 each 10-second heartbeat, they reached about 4,300 concurrent requests with no 429 at all. In every run the figure reached 4,800, was halved on one to four refused calls out of about 650,000, and recovered within a minute, the client's retries absorbing the refusals. Halving the whole run's budget for a single refusal is harsh for a source that refuses occasionally; a threshold or a refusal rate would suit it better, and is a known limitation.
+On the larger tree, with the external client above, twenty-four Crawlers that started at full concurrency, before `crawl.maxSourceConcurrency` existed, met a burst of 429s in their first minutes. In later runs with the figure starting at 1,200 and rising by 480 each 10-second heartbeat to 4,800, the source refused one to four calls out of about 650,000 per run; each time the figure was halved and recovered within a minute, and the client's retries absorbed the refusals. Halving the whole run's budget for a single refusal is harsh for a source that refuses occasionally; a threshold or a refusal rate would suit it better, and is a known limitation.
