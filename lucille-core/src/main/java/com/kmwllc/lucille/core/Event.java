@@ -24,7 +24,7 @@ public class Event {
 
     // The remaining types are only used in a distributed crawl. They describe a work unit or the run itself rather
     // than a document, and carry the unit ID, connector name, or run ID in place of a document ID.
-    UNIT_CREATED, UNIT_CHILDREN, UNIT_DONE, UNIT_FAILED, PLANNING_DONE, HOOK_DONE, HEARTBEAT, CANCEL
+    UNIT_CREATED, UNIT_CHILDREN, UNIT_PROGRESS, UNIT_DONE, UNIT_FAILED, PLANNING_DONE, HOOK_DONE, HEARTBEAT, CANCEL
   }
 
   private Type type;

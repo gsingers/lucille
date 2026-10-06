@@ -460,6 +460,35 @@ public class KafkaDistributedCrawlTest {
   }
 
   @Test
+  public void testSourceAllowanceReachesCrawlersInTheHeartbeat() throws Exception {
+    // 40 calls over 4 partitions: 10 a unit at most, starting from a quarter of that
+    Config limited = ConfigFactory.parseString("crawl.maxSourceConcurrency: 40").withFallback(config);
+    crawlerPool.stop();
+    crawlerPool.join(10_000);
+    crawlerPool = new CrawlerPool(limited, CrawlerMessengerFactory.getKafkaFactory(limited));
+    crawlerPool.start();
+    ScriptedPartitionedConnector.gate = new CountDownLatch(1);
+    ScriptedPartitionedConnector.gateAfter = 4;
+    new Thread(() -> {
+      try {
+        Thread.sleep(2500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      ScriptedPartitionedConnector.gate.countDown();
+    }).start();
+
+    RunResult result = Runner.run(limited, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
+
+    assertTrue(result.getStatus());
+    List<Integer> seen = ScriptedPartitionedConnector.allowancesSeen;
+    assertEquals(6, seen.size());
+    assertTrue(seen.toString(), seen.stream().allMatch(allowance -> allowance != null && allowance >= 2 && allowance <= 10));
+    // it climbed while the first units were held: the later units saw more than the first
+    assertTrue(seen.toString(), seen.get(seen.size() - 1) > seen.get(0));
+  }
+
+  @Test
   public void testFailedUnitIsExecutedAgain() throws Exception {
     ScriptedPartitionedConnector.failOnce.add("u4");
     RunResult result = Runner.run(config, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
@@ -492,9 +521,9 @@ public class KafkaDistributedCrawlTest {
     }
 
     @Override
-    public void heartbeat(String runId, int epoch, String configHash) throws Exception {
+    public void heartbeat(String runId, int epoch, String configHash, Integer unitConcurrency) throws Exception {
       if (!silent) {
-        delegate.heartbeat(runId, epoch, configHash);
+        delegate.heartbeat(runId, epoch, configHash, unitConcurrency);
       }
     }
 

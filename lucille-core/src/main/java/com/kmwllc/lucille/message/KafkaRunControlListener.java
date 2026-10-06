@@ -1,5 +1,7 @@
 package com.kmwllc.lucille.message;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kmwllc.lucille.core.CrawlConfig;
 import com.kmwllc.lucille.core.Event;
 import com.kmwllc.lucille.core.RunControlTracker;
@@ -122,12 +124,14 @@ class KafkaRunControlListener implements Runnable {
 
     try {
       Event event = Event.fromJsonString(record.value());
-      int epoch = CrawlConfig.parseMessage(event.getMessage()).path(KafkaRunControl.EPOCH).asInt();
+      ObjectNode message = CrawlConfig.parseMessage(event.getMessage());
+      int epoch = message.path(KafkaRunControl.EPOCH).asInt();
 
       if (Event.Type.CANCEL.equals(event.getType())) {
         tracker.onCancel(record.key(), epoch);
       } else if (Event.Type.HEARTBEAT.equals(event.getType())) {
-        tracker.onHeartbeat(record.key(), epoch, seenAtMillis);
+        JsonNode allowance = message.path(KafkaRunControl.UNIT_CONCURRENCY);
+        tracker.onHeartbeat(record.key(), epoch, seenAtMillis, allowance.isInt() && allowance.asInt() > 0 ? allowance.asInt() : null);
       }
     } catch (Exception e) {
       log.warn("Ignoring unreadable record on control topic at offset {}.", record.offset(), e);

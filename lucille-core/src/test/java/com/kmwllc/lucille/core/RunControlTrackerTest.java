@@ -1,12 +1,31 @@
 package com.kmwllc.lucille.core;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 import com.kmwllc.lucille.core.RunControlTracker.Decision;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Test;
 
 public class RunControlTrackerTest {
+
+  @Test
+  public void testUnitConcurrencyFollowsTheLatestHeartbeat() {
+    RunControlTracker tracker = new RunControlTracker(60_000);
+    assertNull(tracker.unitConcurrency("run1"));
+
+    tracker.onHeartbeat("run1", 1, 1000, 100);
+    assertEquals(Integer.valueOf(100), tracker.unitConcurrency("run1"));
+    tracker.onHeartbeat("run1", 1, 2000, 50);
+    assertEquals(Integer.valueOf(50), tracker.unitConcurrency("run1"));
+    // a heartbeat that says nothing about it means nothing bounds the source
+    tracker.onHeartbeat("run1", 1, 3000);
+    assertNull(tracker.unitConcurrency("run1"));
+    // a stale Coordinator's heartbeat does not set it
+    tracker.onHeartbeat("run1", 2, 4000, 10);
+    tracker.onHeartbeat("run1", 1, 5000, 999);
+    assertEquals(Integer.valueOf(10), tracker.unitConcurrency("run1"));
+  }
 
   private final AtomicLong clock = new AtomicLong(1_000_000);
   private final RunControlTracker tracker = new RunControlTracker(5000, clock::get);

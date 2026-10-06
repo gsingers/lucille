@@ -23,7 +23,7 @@ public class RunControlTracker {
     UNKNOWN
   }
 
-  private record RunState(int epoch, long lastSeenMillis, boolean cancelled) {
+  private record RunState(int epoch, long lastSeenMillis, boolean cancelled, Integer unitConcurrency) {
   }
 
   private final ConcurrentHashMap<String, RunState> runs = new ConcurrentHashMap<>();
@@ -44,7 +44,15 @@ public class RunControlTracker {
    * Coordinator that is still running cannot keep its units alive.
    */
   public void onHeartbeat(String runId, int epoch, long seenAtMillis) {
-    runs.merge(runId, new RunState(epoch, seenAtMillis, false), (current, update) -> {
+    onHeartbeat(runId, epoch, seenAtMillis, null);
+  }
+
+  /**
+   * Records a heartbeat that also says how many calls to the source each unit of the run may make at once, or null
+   * if nothing bounds them.
+   */
+  public void onHeartbeat(String runId, int epoch, long seenAtMillis, Integer unitConcurrency) {
+    runs.merge(runId, new RunState(epoch, seenAtMillis, false, unitConcurrency), (current, update) -> {
       if (update.epoch() < current.epoch() || (update.epoch() == current.epoch() && current.cancelled())) {
         return current;
       }
@@ -53,8 +61,17 @@ public class RunControlTracker {
   }
 
   public void onCancel(String runId, int epoch) {
-    runs.merge(runId, new RunState(epoch, clock.getAsLong(), true),
+    runs.merge(runId, new RunState(epoch, clock.getAsLong(), true, null),
         (current, update) -> update.epoch() < current.epoch() ? current : update);
+  }
+
+  /**
+   * Returns how many calls to the source each unit of the run may make at once, by the run's latest heartbeat, or
+   * null if nothing bounds them or no heartbeat has been seen.
+   */
+  public Integer unitConcurrency(String runId) {
+    RunState state = runs.get(runId);
+    return state == null ? null : state.unitConcurrency();
   }
 
   public Decision decide(String runId, int unitEpoch) {

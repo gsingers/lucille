@@ -17,6 +17,46 @@ import org.junit.Test;
 public class CrawlConfigTest {
 
   @Test
+  public void testSourceConcurrencySettings() {
+    CrawlConfig off = new CrawlConfig(ConfigFactory.empty());
+    assertNull(off.maxSourceConcurrency);
+
+    CrawlConfig defaults = new CrawlConfig(ConfigFactory.parseString("crawl.maxSourceConcurrency: 2400"));
+    assertEquals(Integer.valueOf(2400), defaults.maxSourceConcurrency);
+    assertEquals(600, defaults.initialSourceConcurrency);
+    assertEquals(240, defaults.sourceConcurrencyStep);
+    assertEquals(120, defaults.sourceConcurrencyHoldSecs);
+
+    CrawlConfig set = new CrawlConfig(ConfigFactory.parseString(
+        "crawl { maxSourceConcurrency: \"100\", initialSourceConcurrency: 10, sourceConcurrencyStep: 5, sourceConcurrencyHoldSecs: 30 }"));
+    assertEquals(10, set.initialSourceConcurrency);
+    assertEquals(5, set.sourceConcurrencyStep);
+    assertEquals(30, set.sourceConcurrencyHoldSecs);
+
+    assertThrows(IllegalArgumentException.class, () -> new CrawlConfig(ConfigFactory.parseString(
+        "crawl { maxSourceConcurrency: 10, initialSourceConcurrency: 20 }")));
+    assertThrows(IllegalArgumentException.class, () -> new CrawlConfig(ConfigFactory.parseString("crawl.maxSourceConcurrency: 0")));
+  }
+
+  @Test
+  public void testThrottleSettings() {
+    CrawlConfig defaults = new CrawlConfig(ConfigFactory.empty());
+    assertEquals(20, defaults.maxThrottledAttempts);
+    assertEquals(10, defaults.throttleBackoffSecs);
+    assertEquals(120, defaults.throttleBackoffCapSecs);
+
+    CrawlConfig set = new CrawlConfig(ConfigFactory.parseString(
+        "crawl { maxThrottledAttempts: \"5\", throttleBackoffSecs: 2, throttleBackoffCapSecs: 4 }"));
+    assertEquals(5, set.maxThrottledAttempts);
+    assertEquals(2, set.throttleBackoffSecs);
+    assertEquals(4, set.throttleBackoffCapSecs);
+
+    assertThrows(IllegalArgumentException.class, () -> new CrawlConfig(ConfigFactory.parseString(
+        "crawl { throttleBackoffSecs: 30, throttleBackoffCapSecs: 10 }")));
+    assertThrows(IllegalArgumentException.class, () -> new CrawlConfig(ConfigFactory.parseString("crawl.maxThrottledAttempts: 0")));
+  }
+
+  @Test
   public void testDefaults() {
     CrawlConfig crawlConfig = new CrawlConfig(ConfigFactory.empty());
     assertEquals("lucille_work", crawlConfig.workTopic);

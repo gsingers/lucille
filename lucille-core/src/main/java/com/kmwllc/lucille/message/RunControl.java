@@ -32,7 +32,17 @@ public interface RunControl {
   /**
    * Announces that the Coordinator of the given run is alive.
    */
-  void heartbeat(String runId, int epoch, String configHash) throws Exception;
+  default void heartbeat(String runId, int epoch, String configHash) throws Exception {
+    heartbeat(runId, epoch, configHash, null);
+  }
+
+  /**
+   * Announces that the Coordinator of the given run is alive, and how many calls to the source each unit in flight
+   * may make at once.
+   *
+   * @param unitConcurrency the allowance, or null when nothing bounds calls to the source.
+   */
+  void heartbeat(String runId, int epoch, String configHash, Integer unitConcurrency) throws Exception;
 
   /**
    * Announces that Crawlers should discard the given run's units. Sent when a run ends, however it ends.

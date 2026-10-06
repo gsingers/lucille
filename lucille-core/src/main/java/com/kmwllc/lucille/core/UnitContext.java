@@ -45,6 +45,16 @@ public interface UnitContext {
   }
 
   /**
+   * Returns how many calls to the source this unit may have in flight at once, by the run's latest heartbeat, or
+   * null if nothing bounds them. The Coordinator divides the run's allowance (crawl.maxSourceConcurrency) among the
+   * units in flight and lowers it when the source refuses calls, so a connector that lists with a pool of threads
+   * should cap the pool at this and look again now and then.
+   */
+  default Integer maxSourceConcurrency() {
+    return null;
+  }
+
+  /**
    * Returns whether this execution of the unit has been given up on: it ran past crawl.maxUnitSecs, its run was
    * cancelled or lost its Coordinator, or the unit was passed to another Crawler. Nothing the unit publishes or
    * hands back from then on counts. A connector whose units can be long should look now and then, and return.

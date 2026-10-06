@@ -77,7 +77,7 @@ public class DistributedCrawlTest {
   private Config start(String connectors, String settings) throws Exception {
     Config config = ConfigFactory.parseString(connectors + COMMON + settings);
     LocalMessenger localMessenger = new LocalMessenger(config);
-    messenger = new LocalCrawlMessenger(localMessenger, 60_000) {
+    messenger = new LocalCrawlMessenger(localMessenger, 60_000, new CrawlConfig(config).workTopicPartitions) {
       @Override
       public Event pollEvent() throws Exception {
         eventsBlocked.await();
@@ -304,6 +304,50 @@ public class DistributedCrawlTest {
   }
 
   @Test
+  public void testUnitsAreToldTheirShareOfTheSourceConcurrency() throws Exception {
+    // 30 calls for the run over 3 partitions is 10 a unit; starting at the maximum, so that is what every unit sees
+    Config config = start(SCRIPTED, "crawl { maxSourceConcurrency: 30, initialSourceConcurrency: 30, workTopicPartitions: 3 }");
+
+    assertTrue(run(config, "run1").getStatus());
+
+    assertEquals(6, ScriptedPartitionedConnector.allowancesSeen.size());
+    assertTrue(ScriptedPartitionedConnector.allowancesSeen.toString(),
+        ScriptedPartitionedConnector.allowancesSeen.stream().allMatch(allowance -> allowance != null && allowance == 10));
+  }
+
+  @Test
+  public void testWithoutALimitUnitsAreToldNothing() throws Exception {
+    assertTrue(run(start(SCRIPTED), "run1").getStatus());
+    assertTrue(ScriptedPartitionedConnector.allowancesSeen.stream().allMatch(allowance -> allowance == null));
+  }
+
+  @Test
+  public void testSourceConcurrencyIsCutWhenTheSourceRefusesCalls() throws Exception {
+    // 3 units in flight at 10 calls each is 30 against a source that takes 12; after a heartbeat with refusals the
+    // run's figure is halved and the units see 5
+    Config config = start("""
+        connectors: [{
+          name: "connector1", class: "com.kmwllc.lucille.connector.ScriptedPartitionedConnector",
+          pipeline: "pipeline1", numUnits: 40, docsPerUnit: 1
+        }]
+        """, "crawl { maxSourceConcurrency: 30, initialSourceConcurrency: 30, sourceConcurrencyStep: 3, "
+        + "sourceConcurrencyHoldSecs: 2, workTopicPartitions: 3 }");
+    ScriptedPartitionedConnector.sourceLimit = 12;
+    ScriptedPartitionedConnector.sourceHoldMillis = 300;
+    CrawlCoordinator coordinator = new CrawlCoordinator(config, "run1", messenger, replay -> messenger);
+
+    RunResult result = coordinator.run(false, false);
+
+    assertTrue(result.getStatus());
+    assertTrue("the source refused nothing", ScriptedPartitionedConnector.sourceRefused.get() > 0);
+    List<Integer> seen = ScriptedPartitionedConnector.allowancesSeen;
+    assertTrue(seen.toString(), seen.contains(10));
+    assertTrue("the allowance never came down: " + seen, seen.stream().anyMatch(allowance -> allowance != null && allowance <= 5));
+    // the run's figure ends at or below what the source takes, give or take a step
+    assertTrue(String.valueOf(coordinator.currentSourceConcurrency()), coordinator.currentSourceConcurrency() <= 15 + 3);
+  }
+
+  @Test
   public void testUnitThrottledPartWayHandsTheRestBackAndCompletes() throws Exception {
     Config config = start(SCRIPTED);
     ScriptedPartitionedConnector.throttledOnce.add("u1");
@@ -318,14 +362,32 @@ public class DistributedCrawlTest {
   }
 
   @Test
-  public void testUnitThatFailsThrottledIsExecutedAgain() throws Exception {
-    Config config = start(SCRIPTED);
+  public void testUnitThatFailsThrottledIsExecutedAgainAfterAWait() throws Exception {
+    // crawl.maxAttempts is 2: two throttled failures would end the run if they counted
+    Config config = start(SCRIPTED, "crawl { throttleBackoffSecs: 1, throttleBackoffCapSecs: 1 }");
     ScriptedPartitionedConnector.throttleFailOnce.add("u3");
+    ScriptedPartitionedConnector.throttleFailTwice.add("u4");
 
+    long start = System.currentTimeMillis();
     RunResult result = run(config, "run1");
 
     assertTrue(result.getStatus());
     assertEquals(2, ScriptedPartitionedConnector.executionsOf("u3"));
+    assertEquals(3, ScriptedPartitionedConnector.executionsOf("u4"));
+    // u4 waited out two backoffs of at least half a second each
+    assertTrue(System.currentTimeMillis() - start >= 1000);
+  }
+
+  @Test
+  public void testUnitRefusedTooOftenFailsTheRun() throws Exception {
+    Config config = start(SCRIPTED, "crawl { maxThrottledAttempts: 2, throttleBackoffSecs: 1, throttleBackoffCapSecs: 1 }");
+    ScriptedPartitionedConnector.throttleFailAlways.add("u2");
+
+    RunResult result = run(config, "run1");
+
+    assertFalse(result.getStatus());
+    assertTrue(result.toString(), result.toString().contains("refused"));
+    assertEquals(2, ScriptedPartitionedConnector.executionsOf("u2"));
   }
 
   @Test

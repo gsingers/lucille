@@ -38,6 +38,7 @@ public class CrawlerPool {
   private final AtomicInteger crawlersCreated = new AtomicInteger();
 
   private final Integer maxUnitSecs;
+  private final int heartbeatSecs;
   private final boolean exitOnTimeout;
   private ScheduledExecutorService watchdog;
   // what "exit" means; replaced in tests, which cannot have the JVM exit
@@ -49,6 +50,7 @@ public class CrawlerPool {
     CrawlConfig crawlConfig = new CrawlConfig(config);
     this.numCrawlers = crawlConfig.threads;
     this.maxUnitSecs = crawlConfig.maxUnitSecs;
+    this.heartbeatSecs = crawlConfig.heartbeatSecs;
     this.exitOnTimeout = crawlConfig.exitOnTimeout;
   }
 
@@ -74,9 +76,7 @@ public class CrawlerPool {
       throw e;
     }
 
-    if (maxUnitSecs != null) {
-      startWatchdog();
-    }
+    startTimer();
   }
 
   // Starts a Crawler in the given position, in place of the one that was there if there was one.
@@ -105,10 +105,23 @@ public class CrawlerPool {
    * holding whatever it holds, and a new Crawler is started in its place. If crawl.exitOnTimeout is set the process
    * exits instead, for whatever started it to start a clean one.
    */
-  private void startWatchdog() {
+  private void startTimer() {
     BasicThreadFactory threadFactory = new BasicThreadFactory.Builder()
         .namingPattern(ThreadNameUtils.createName("CrawlerWatchdog")).daemon(true).build();
     watchdog = Executors.newSingleThreadScheduledExecutor(threadFactory);
+
+    // progress reports, every heartbeat, so that the Coordinator hears of refused calls before a unit ends
+    watchdog.scheduleWithFixedDelay(() -> {
+      for (Crawler crawler : crawlers) {
+        if (!stopped) {
+          crawler.reportProgress();
+        }
+      }
+    }, heartbeatSecs, heartbeatSecs, TimeUnit.SECONDS);
+
+    if (maxUnitSecs == null) {
+      return;
+    }
 
     watchdog.scheduleWithFixedDelay(() -> {
       for (int i = 0; i < crawlers.size(); i++) {

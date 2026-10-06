@@ -16,6 +16,10 @@ import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,6 +83,11 @@ public class CoordinatorPublisher extends PublisherImpl {
   private final int epoch;
   private final int maxOutstandingUnits;
   private final int maxAttempts;
+  private final int maxThrottledAttempts;
+  private final long throttleBackoffMillis;
+  private final long throttleBackoffCapMillis;
+  // the time, replaceable by tests that do not want to wait out a backoff
+  private LongSupplier clock = System::currentTimeMillis;
 
   // Planning may emit far more units than can be in flight. They wait here; past this many, the planner waits.
   static final int MAX_QUEUED_UNITS = 100_000;
@@ -115,6 +124,17 @@ public class CoordinatorPublisher extends PublisherImpl {
 
   private record QueuedUnit(WorkUnit unit, long cost, long sequence) { }
 
+  // Units waiting out a backoff before they may be queued: the unit, and when. Guarded by dispatchLock.
+  private record DelayedUnit(WorkUnit unit, long cost, long dueMillis) { }
+  private final List<DelayedUnit> delayedUnits = new ArrayList<>();
+
+  // How many times each unit that is not done has failed, by whether the failure was the source refusing it or
+  // not. The two are limited separately: a source that is overloaded is waited out, a unit that is broken is not.
+  private final Map<String, Integer> plainFailures = new HashMap<>();
+  private final Map<String, Integer> throttledFailures = new HashMap<>();
+  // the refusals each execution of an outstanding unit has reported so far, by unit ID and execution
+  private final Map<String, Long> refusedSoFar = new HashMap<>();
+
   private record Dispatch(WorkUnit unit, int partition) { }
 
   // What executions of outstanding units have handed back so far, by unit ID and then by execution. A unit that is
@@ -134,6 +154,11 @@ public class CoordinatorPublisher extends PublisherImpl {
   private final Counter unitsDone;
   private final Counter unitsFailed;
   private final Counter unitsHandedBack;
+  private final Counter unitsThrottled;
+  private final Counter callsRefused;
+  // the same, for this connector alone; the registry's counters are shared across runs of a JVM
+  private final AtomicLong numUnitsThrottled = new AtomicLong();
+  private final AtomicLong numCallsRefused = new AtomicLong();
 
   /**
    * @param unitCosts what the units cost in an earlier run, by unit ID, or empty. See crawl.costsFromRun.
@@ -151,6 +176,9 @@ public class CoordinatorPublisher extends PublisherImpl {
     CrawlConfig crawlConfig = new CrawlConfig(config);
     this.maxOutstandingUnits = crawlConfig.maxOutstandingUnits;
     this.maxAttempts = crawlConfig.maxAttempts;
+    this.maxThrottledAttempts = crawlConfig.maxThrottledAttempts;
+    this.throttleBackoffMillis = TimeUnit.SECONDS.toMillis(crawlConfig.throttleBackoffSecs);
+    this.throttleBackoffCapMillis = TimeUnit.SECONDS.toMillis(crawlConfig.throttleBackoffCapSecs);
     if (messenger.numWorkPartitions() < 1) {
       throw new IllegalStateException("The work topic has no partitions; nothing could be dispatched.");
     }
@@ -163,6 +191,8 @@ public class CoordinatorPublisher extends PublisherImpl {
     this.unitsDone = metrics.counter(metricsPrefix + ".units.done");
     this.unitsFailed = metrics.counter(metricsPrefix + ".units.failed");
     this.unitsHandedBack = metrics.counter(metricsPrefix + ".units.handedBack");
+    this.unitsThrottled = metrics.counter(metricsPrefix + ".units.throttled");
+    this.callsRefused = metrics.counter(metricsPrefix + ".calls.refused");
   }
 
   /**
@@ -296,6 +326,41 @@ public class CoordinatorPublisher extends PublisherImpl {
     queuedUnits.add(new QueuedUnit(unit, cost, nextSequence++));
   }
 
+  // Called with dispatchLock held. A unit with a delay is held aside until it falls due, then queued like any other.
+  private void enqueue(WorkUnit unit, long cost, long delayMillis) {
+    if (delayMillis <= 0) {
+      enqueue(unit, cost);
+      return;
+    }
+    queuedUnitIds.add(unit.unitId());
+    costOf.put(unit.unitId(), cost);
+    delayedUnits.add(new DelayedUnit(unit, cost, clock.getAsLong() + delayMillis));
+  }
+
+  // Called with dispatchLock held.
+  private void queueDueUnits() {
+    long now = clock.getAsLong();
+    for (var it = delayedUnits.iterator(); it.hasNext(); ) {
+      DelayedUnit delayed = it.next();
+      if (delayed.dueMillis() <= now) {
+        it.remove();
+        queuedUnits.add(new QueuedUnit(delayed.unit(), delayed.cost(), nextSequence++));
+      }
+    }
+  }
+
+  /** Returns the number of units waiting out a backoff before they are dispatched again. */
+  int numUnitsDelayed() {
+    synchronized (dispatchLock) {
+      return delayedUnits.size();
+    }
+  }
+
+  // package access for unit tests
+  void setClock(LongSupplier clock) {
+    this.clock = clock;
+  }
+
   /**
    * Returns the next partition with no unit in flight, or -1 if every partition has one. Partitions are tried in
    * an order that reaches different Crawlers in turn, carrying on from wherever the last dispatch went.
@@ -334,6 +399,7 @@ public class CoordinatorPublisher extends PublisherImpl {
     List<Dispatch> ready = new ArrayList<>();
 
     synchronized (dispatchLock) {
+      queueDueUnits();
       while (failure == null && !queuedUnits.isEmpty() && dispatchWindowOpen()) {
         int partition = nextFreePartition();
         if (partition < 0) {
@@ -357,6 +423,11 @@ public class CoordinatorPublisher extends PublisherImpl {
         failure = "Unit " + dispatch.unit().unitId() + " could not be dispatched: " + e.getMessage();
       }
     }
+  }
+
+  /** Returns how many partitions the work topic has: the most units that can be in flight. */
+  public int numPartitions() {
+    return partitionOrder.length;
   }
 
   /** Returns how many partitions have a unit in flight. */
@@ -478,6 +549,7 @@ public class CoordinatorPublisher extends PublisherImpl {
 
     switch (event.getType()) {
       case UNIT_CHILDREN -> handleUnitChildren(event);
+      case UNIT_PROGRESS -> handleUnitProgress(event);
       case UNIT_DONE -> handleUnitDone(event);
       case UNIT_FAILED -> handleUnitFailed(event);
       // The next three record what a Coordinator decided. This Coordinator knows its own decisions, so it only takes
@@ -551,6 +623,26 @@ public class CoordinatorPublisher extends PublisherImpl {
     message.path(CHILDREN).forEach(children::add);
   }
 
+  // A unit's refusals arrive as running totals, in progress reports and then in its completion; only what is new
+  // since the last report is counted, so that a refusal is counted once.
+  private void countRefusedSoFar(WorkUnit unit, ObjectNode message) {
+    String key = unit.unitId() + "#" + message.path(EXECUTION).asText();
+    long total = message.path(REFUSED_CALLS).asLong(0);
+    Long before = refusedSoFar.put(key, total);
+    countRefused(Math.max(0, total - (before == null ? 0 : before)));
+  }
+
+  private void handleUnitProgress(Event event) {
+    ObjectNode message = parse(event);
+    WorkUnit unit = message == null ? null : outstandingUnitFor(event, message);
+    if (unit == null || replaying) {
+      return;
+    }
+    countRefusedSoFar(unit, message);
+    log.debug("Unit {} in progress: {} source calls, {} refused, {} docs.", unit.unitId(),
+        message.path(SOURCE_CALLS).asLong(), message.path(REFUSED_CALLS).asLong(), message.path(NUM_PUBLISHED).asLong());
+  }
+
   private void handleUnitDone(Event event) {
     ObjectNode message = parse(event);
     WorkUnit unit = message == null ? null : outstandingUnitFor(event, message);
@@ -573,22 +665,32 @@ public class CoordinatorPublisher extends PublisherImpl {
     doneUnits.add(unit.unitId());
     outstandingUnits.remove(unit.unitId());
     costOf.remove(unit.unitId());
+    plainFailures.remove(unit.unitId());
+    throttledFailures.remove(unit.unitId());
     freePartitionOf(unit.unitId());
     unitsDone.inc();
+    countRefusedSoFar(unit, message);
+    refusedSoFar.keySet().removeIf(key -> key.startsWith(unit.unitId() + "#"));
+
+    // A unit that completed because its source refused the rest hands that rest back. It is not sent straight back
+    // to the same source; it waits as a failed unit would.
+    FailureClass endedBy = FailureClass.parse(message.path(ERROR_CLASS).asText(null));
+    long childDelayMillis = endedBy != null && endedBy.isOverload() && !replaying ? backoffMillis(1) : 0;
 
     int numCreated = 0;
     synchronized (dispatchLock) {
       if (children != null) {
         for (JsonNode child : children) {
-          numCreated += createHandedBackUnit(child) ? 1 : 0;
+          numCreated += createHandedBackUnit(child, childDelayMillis) ? 1 : 0;
         }
       }
     }
 
-    log.info("Unit {} done by {}: {} docs, {} source calls, {} ms, {} handed back. {} units outstanding, {} queued.",
+    log.info("Unit {} done by {}: {} docs, {} source calls, {} refused, {} ms, {} handed back{}. {} units outstanding, {} queued.",
         unit.unitId(), message.path(CRAWLER).asText(), message.path(NUM_PUBLISHED).asLong(),
-        message.path(SOURCE_CALLS).asLong(), message.path(DURATION_MS).asLong(), numCreated, outstandingUnits.size(),
-        queuedUnitIds.size());
+        message.path(SOURCE_CALLS).asLong(), message.path(REFUSED_CALLS).asLong(0), message.path(DURATION_MS).asLong(),
+        numCreated, endedBy == null ? "" : " after " + endedBy + " (" + message.path(ERROR_CAUSE).asText() + ")",
+        outstandingUnits.size(), queuedUnitIds.size());
 
     dispatchQueuedUnits();
     synchronized (dispatchWindow) {
@@ -601,7 +703,7 @@ public class CoordinatorPublisher extends PublisherImpl {
    * executed twice hands the same parts back twice, and the second time they are already known. Returns whether a
    * unit was created.
    */
-  private boolean createHandedBackUnit(JsonNode child) {
+  private boolean createHandedBackUnit(JsonNode child, long delayMillis) {
     if (!child.path(CHILD_KEY).isTextual() || !child.path(CHILD_PAYLOAD).isObject()) {
       log.warn("Ignoring a handed-back part with no key or payload: {}", child);
       return false;
@@ -622,7 +724,7 @@ public class CoordinatorPublisher extends PublisherImpl {
     if (replaying) {
       outstandingUnits.put(unitId, unit);
     } else {
-      enqueue(unit, costOf(unitId, 0));
+      enqueue(unit, costOf(unitId, 0), delayMillis);
     }
     return true;
   }
@@ -631,12 +733,22 @@ public class CoordinatorPublisher extends PublisherImpl {
     ObjectNode message = parse(event);
     WorkUnit unit = message == null ? null : outstandingUnitFor(event, message);
     if (unit != null) {
-      failUnit(unit, message.path(ERROR).asText());
+      countRefusedSoFar(unit, message);
+      refusedSoFar.keySet().removeIf(key -> key.startsWith(unit.unitId() + "#"));
+      failUnit(unit, message.path(ERROR).asText(), FailureClass.parse(message.path(ERROR_CLASS).asText(null)));
     }
   }
 
-  // Queues the unit to be dispatched again, or fails the connector if it has had all its attempts.
   private void failUnit(WorkUnit unit, String error) {
+    failUnit(unit, error, FailureClass.CONNECTOR_ERROR);
+  }
+
+  /**
+   * Queues the unit to be dispatched again, or fails the connector if the unit has had all its attempts. A unit
+   * whose source refused it is not dispatched straight back into the same overload: it waits, longer each time, and
+   * such failures are counted against crawl.maxThrottledAttempts rather than crawl.maxAttempts.
+   */
+  private void failUnit(WorkUnit unit, String error, FailureClass failureClass) {
     handedBack.remove(unit.unitId());
 
     // When replaying, the earlier Coordinator already responded to the failure; if it dispatched the unit again,
@@ -647,19 +759,51 @@ public class CoordinatorPublisher extends PublisherImpl {
 
     unitsFailed.inc();
     freePartitionOf(unit.unitId());
+    boolean throttled = failureClass != null && failureClass.isOverload();
+    Map<String, Integer> failures = throttled ? throttledFailures : plainFailures;
+    int count = failures.merge(unit.unitId(), 1, Integer::sum);
+    int limit = throttled ? maxThrottledAttempts : maxAttempts;
 
-    if (unit.attempt() >= maxAttempts) {
-      failure = "Unit " + unit.unitId() + " failed after " + unit.attempt() + " attempts: " + error;
+    if (count >= limit) {
+      failure = "Unit " + unit.unitId() + (throttled ? " failed " + count + " times because its source refused it: "
+          : " failed after " + count + " attempts: ") + error;
       return;
     }
 
-    log.warn("Unit {} failed on attempt {} of {}; dispatching it again. Error: {}", unit.unitId(), unit.attempt(),
-        maxAttempts, error);
+    long delayMillis = throttled ? backoffMillis(count) : 0;
+    if (throttled) {
+      unitsThrottled.inc();
+      numUnitsThrottled.incrementAndGet();
+    }
+    log.warn("Unit {} failed ({}, {} of {}); dispatching it again{}. Error: {}", unit.unitId(),
+        failureClass == null ? "unclassified" : failureClass, count, limit,
+        delayMillis > 0 ? " in " + delayMillis + " ms" : "", error);
     synchronized (dispatchLock) {
       outstandingUnits.remove(unit.unitId());
-      enqueue(unit.withAttempt(unit.attempt() + 1), costOf.getOrDefault(unit.unitId(), 0L));
+      enqueue(unit.withAttempt(unit.attempt() + 1), costOf.getOrDefault(unit.unitId(), 0L), delayMillis);
     }
     dispatchQueuedUnits();
+  }
+
+  // How long a unit waits after its nth failure at the hands of its source: doubling, capped, jittered.
+  private long backoffMillis(int failures) {
+    long ceiling = Math.min(throttleBackoffCapMillis, throttleBackoffMillis << Math.min(failures - 1, 20));
+    return ThreadLocalRandom.current().nextLong(ceiling / 2 + 1, ceiling + 1);
+  }
+
+  private void countRefused(long calls) {
+    callsRefused.inc(calls);
+    numCallsRefused.addAndGet(calls);
+  }
+
+  /** Returns how many calls to the source the Crawlers have reported as refused, over the whole connector. */
+  public long numCallsRefused() {
+    return numCallsRefused.get();
+  }
+
+  /** Returns how many times a unit was dispatched again after its source refused it. */
+  public long numUnitsThrottled() {
+    return numUnitsThrottled.get();
   }
 
   private ObjectNode parse(Event event) {

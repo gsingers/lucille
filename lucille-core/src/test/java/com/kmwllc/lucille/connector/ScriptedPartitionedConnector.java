@@ -12,7 +12,10 @@ import com.kmwllc.lucille.core.WorkUnitSink;
 import com.kmwllc.lucille.core.spec.Spec;
 import com.kmwllc.lucille.core.spec.SpecBuilder;
 import com.typesafe.config.Config;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -71,8 +74,21 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
    * they hand back a part named after them, record the failure, and complete.
    */
   public static final Set<String> throttledOnce = ConcurrentHashMap.newKeySet();
-  /** Units that, the first time they are executed, fail with a throttling failure. */
+  /** Units that, the first time they are executed, fail with a throttling failure; or the first two times; or always. */
   public static final Set<String> throttleFailOnce = ConcurrentHashMap.newKeySet();
+  public static final Set<String> throttleFailTwice = ConcurrentHashMap.newKeySet();
+  public static final Set<String> throttleFailAlways = ConcurrentHashMap.newKeySet();
+  /** The source allowance each execution saw, in order. */
+  public static final List<Integer> allowancesSeen = Collections.synchronizedList(new ArrayList<>());
+  /**
+   * A source that takes only so many concurrent calls. When set to a positive limit, each execution of a unit makes
+   * as many concurrent calls as its allowance says (or 50 without one), for {@link #sourceHoldMillis}; calls beyond
+   * the limit are refused and counted on the context.
+   */
+  public static volatile int sourceLimit = 0;
+  public static volatile long sourceHoldMillis = 200;
+  private static final AtomicInteger sourceInFlight = new AtomicInteger();
+  public static final AtomicLong sourceRefused = new AtomicLong();
   /** Units that wait for {@link #hang} to open every time they are executed. */
   public static final Set<String> hangAlways = ConcurrentHashMap.newKeySet();
   public static volatile CountDownLatch hang = new CountDownLatch(0);
@@ -104,6 +120,13 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     hangOnce.clear();
     throttledOnce.clear();
     throttleFailOnce.clear();
+    allowancesSeen.clear();
+    sourceLimit = 0;
+    sourceHoldMillis = 200;
+    sourceInFlight.set(0);
+    sourceRefused.set(0);
+    throttleFailTwice.clear();
+    throttleFailAlways.clear();
     sawCancelled.clear();
     gatedUnits.clear();
     reachedGate.clear();
@@ -150,12 +173,18 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     if (failAlways.contains(unitKey) || (execution == 1 && failOnce.contains(unitKey))) {
       throw new ConnectorException("Scripted failure of " + unitKey);
     }
-    if (execution == 1 && throttleFailOnce.contains(unitKey)) {
+    if (throttleFailAlways.contains(unitKey) || (execution <= 2 && throttleFailTwice.contains(unitKey))
+        || (execution == 1 && throttleFailOnce.contains(unitKey))) {
       throw new ConnectorException("Error occurred while traversing " + unitKey,
           new SourceException(FailureClass.THROTTLED, "Could not list " + unitKey, new RuntimeException("429 Too Many Requests")));
     }
 
+    allowancesSeen.add(context.maxSourceConcurrency());
+
     try {
+      if (sourceLimit > 0) {
+        callTheSource(context);
+      }
       if (hangAlways.contains(unitKey) || (execution == 1 && hangOnce.contains(unitKey))) {
         hang.await();
         if (context.isCancelled()) {
@@ -189,6 +218,22 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       completed.add(unitKey);
     } catch (Exception e) {
       throw new ConnectorException("Error publishing document", e);
+    }
+  }
+
+  // Makes the unit's share of concurrent calls against the limited source: those beyond the limit are refused.
+  private static void callTheSource(UnitContext context) throws InterruptedException {
+    int calls = context.maxSourceConcurrency() == null ? 50 : context.maxSourceConcurrency();
+    int inFlight = sourceInFlight.addAndGet(calls);
+    try {
+      int refused = Math.max(0, Math.min(calls, inFlight - sourceLimit));
+      if (refused > 0) {
+        sourceRefused.addAndGet(refused);
+        context.addRefusedCalls(refused);
+      }
+      Thread.sleep(sourceHoldMillis);
+    } finally {
+      sourceInFlight.addAndGet(-calls);
     }
   }
 

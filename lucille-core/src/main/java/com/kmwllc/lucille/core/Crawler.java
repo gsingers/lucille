@@ -167,7 +167,7 @@ class Crawler implements Runnable {
     log.info("Executing unit {} (attempt {}).", unit.unitId(), unit.attempt());
     Timer.Context timing = unitTimer.time();
     CrawlerPublisher publisher = null;
-    Execution execution = new Execution();
+    Execution execution = new Execution(unit.runId());
     String error = null;
     Throwable failure = null;
     VirtualMachineError fatal = null;
@@ -256,9 +256,17 @@ class Crawler implements Runnable {
    * What one execution of a unit handed back and how many calls it made to its source. Each execution has an ID of
    * its own, because a unit can be executed more than once and the Coordinator must not mix their reports.
    */
-  private static class Execution implements UnitContext {
+  private class Execution implements UnitContext {
 
     final String id = UUID.randomUUID().toString();
+    final String runId;
+    // what the last UNIT_PROGRESS said, so that one is sent only when there is something new to say
+    long reportedSourceCalls = -1;
+    long reportedRefusedCalls = -1;
+
+    Execution(String runId) {
+      this.runId = runId;
+    }
     final List<ObjectNode> handedBack = new CopyOnWriteArrayList<>();
     final AtomicLong sourceCalls = new AtomicLong();
     final AtomicLong refusedCalls = new AtomicLong();
@@ -283,6 +291,11 @@ class Crawler implements Runnable {
     @Override
     public void addRefusedCalls(long calls) {
       refusedCalls.addAndGet(calls);
+    }
+
+    @Override
+    public Integer maxSourceConcurrency() {
+      return messenger.getRunControlTracker().unitConcurrency(runId);
     }
 
     @Override
@@ -322,6 +335,41 @@ class Crawler implements Runnable {
     ObjectNode message = unitMessage(unit).put(CoordinatorPublisher.EXECUTION, execution.id);
     message.putArray(CoordinatorPublisher.CHILDREN).addAll(parts);
     sendUnitEvent(unit, message, Event.Type.UNIT_CHILDREN);
+  }
+
+  /**
+   * Sends a UNIT_PROGRESS report for the unit being executed, if there is one and it has done anything since the
+   * last report: the calls it has made to its source and how many were refused. Called from the pool's timer every
+   * heartbeat, so that the Coordinator learns of refusals while a long unit is still running, not only when it ends.
+   */
+  void reportProgress() {
+    WorkUnit unit = executingUnit;
+    Execution execution = currentExecution;
+    if (unit == null || execution == null) {
+      return;
+    }
+
+    long sourceCalls = execution.sourceCalls.get();
+    long refusedCalls = execution.refusedCalls.get();
+    synchronized (reportLock) {
+      if (executingUnit != unit || executingUnitReported
+          || (sourceCalls == execution.reportedSourceCalls && refusedCalls == execution.reportedRefusedCalls)) {
+        return;
+      }
+      execution.reportedSourceCalls = sourceCalls;
+      execution.reportedRefusedCalls = refusedCalls;
+    }
+
+    try {
+      ObjectNode message = unitMessage(unit)
+          .put(CoordinatorPublisher.EXECUTION, execution.id)
+          .put(CoordinatorPublisher.SOURCE_CALLS, sourceCalls)
+          .put(CoordinatorPublisher.REFUSED_CALLS, refusedCalls)
+          .put(CoordinatorPublisher.NUM_PUBLISHED, execution.publisher == null ? 0 : execution.publisher.numPublished());
+      sendUnitEvent(unit, message, Event.Type.UNIT_PROGRESS);
+    } catch (Exception e) {
+      log.warn("Could not report progress on unit {}.", unit.unitId(), e);
+    }
   }
 
   /**

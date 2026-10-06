@@ -42,6 +42,24 @@ import org.apache.kafka.clients.admin.NewTopic;
  *   <li>maxUnitSecs (Int, Optional) : A unit that has been executing for this long is reported as failed, so that it
  *   is dispatched again, and its Crawler thread is replaced. The thread itself cannot be stopped and is left behind.
  *   Not set by default, so a unit may take any length of time.</li>
+ *   <li>maxThrottledAttempts (Int, Optional) : Times a unit may fail because its source refused it (HTTP 429, 5xx, a
+ *   connection failure) before that fails the connector. Counted apart from maxAttempts, since such a failure is the
+ *   source's, and each is waited out before the unit is dispatched again. Defaults to 20.</li>
+ *   <li>throttleBackoffSecs (Int, Optional) : How long to wait before dispatching a unit again after its first such
+ *   failure; doubled at each one after, with jitter. Parts handed back by a unit that met such a failure wait this long
+ *   too. Defaults to 10.</li>
+ *   <li>throttleBackoffCapSecs (Int, Optional) : The longest such wait. Defaults to 120.</li>
+ *   <li>maxSourceConcurrency (Int, Optional) : The most calls the run as a whole may have in flight against its source,
+ *   divided among the units in flight and sent to Crawlers in the heartbeat; a storage client that lists with a pool of
+ *   threads caps the pool at its share. Not set by default, so Crawlers call the source as fast as they can, which with
+ *   many Crawlers and many threads can be more than a source will take.</li>
+ *   <li>initialSourceConcurrency (Int, Optional) : Where the run starts; it climbs from here while no calls are refused,
+ *   so a source that scales on demand is given time to. Defaults to a quarter of the maximum.</li>
+ *   <li>sourceConcurrencyStep (Int, Optional) : How much a heartbeat interval with no refused calls adds. Defaults to a
+ *   tenth of the maximum.</li>
+ *   <li>sourceConcurrencyHoldSecs (Int, Optional) : After refused calls halve the figure, how long before it may be
+ *   halved again, so that reports still arriving from the same burst do not halve it twice. Defaults to
+ *   throttleBackoffCapSecs.</li>
  *   <li>costsFromRun (String, Optional) : The ID of an earlier run of this config whose unit reports say what each unit
  *   cost. The Coordinator dispatches the units it expects to cost most first, which keeps a few large units from
  *   setting the length of the run. Not set by default; units are then dispatched in the order they are planned.
@@ -56,7 +74,9 @@ public final class CrawlConfig {
   public static final Spec SPEC = SpecBuilder.withoutDefaults()
       .optionalString("workTopic", "controlTopic", "consumerGroupId")
       .optionalNumber("workTopicPartitions", "topicReplicationFactor", "threads", "maxOutstandingUnits", "maxAttempts",
-          "heartbeatSecs", "orphanTimeoutSecs", "maxUnitSecs")
+          "heartbeatSecs", "orphanTimeoutSecs", "maxUnitSecs", "maxThrottledAttempts", "throttleBackoffSecs",
+          "throttleBackoffCapSecs", "maxSourceConcurrency", "initialSourceConcurrency", "sourceConcurrencyStep",
+          "sourceConcurrencyHoldSecs")
       .optionalBoolean("exitOnTimeout")
       .optionalString("costsFromRun").build();
 
@@ -86,6 +106,14 @@ public final class CrawlConfig {
   public final int threads;
   public final int maxOutstandingUnits;
   public final int maxAttempts;
+  public final int maxThrottledAttempts;
+  public final int throttleBackoffSecs;
+  public final int throttleBackoffCapSecs;
+  // null when not configured, in which case nothing bounds calls to the source
+  public final Integer maxSourceConcurrency;
+  public final int initialSourceConcurrency;
+  public final int sourceConcurrencyStep;
+  public final int sourceConcurrencyHoldSecs;
   public final int heartbeatSecs;
   public final int orphanTimeoutSecs;
   // null when not configured, in which case a unit is never timed out
@@ -104,6 +132,20 @@ public final class CrawlConfig {
     this.threads = atLeastOne(config, "crawl.threads", 1);
     this.maxOutstandingUnits = atLeastOne(config, "crawl.maxOutstandingUnits", 64);
     this.maxAttempts = atLeastOne(config, "crawl.maxAttempts", 3);
+    this.maxThrottledAttempts = atLeastOne(config, "crawl.maxThrottledAttempts", 20);
+    this.throttleBackoffSecs = atLeastOne(config, "crawl.throttleBackoffSecs", 10);
+    this.throttleBackoffCapSecs = atLeastOne(config, "crawl.throttleBackoffCapSecs", 120);
+    if (throttleBackoffCapSecs < throttleBackoffSecs) {
+      throw new IllegalArgumentException("crawl.throttleBackoffCapSecs cannot be less than crawl.throttleBackoffSecs.");
+    }
+    this.maxSourceConcurrency = config.hasPath("crawl.maxSourceConcurrency") ? atLeastOne(config, "crawl.maxSourceConcurrency", 1) : null;
+    int max = maxSourceConcurrency == null ? 4 : maxSourceConcurrency;
+    this.initialSourceConcurrency = atLeastOne(config, "crawl.initialSourceConcurrency", Math.max(1, max / 4));
+    this.sourceConcurrencyStep = atLeastOne(config, "crawl.sourceConcurrencyStep", Math.max(1, max / 10));
+    this.sourceConcurrencyHoldSecs = atLeastOne(config, "crawl.sourceConcurrencyHoldSecs", throttleBackoffCapSecs);
+    if (maxSourceConcurrency != null && initialSourceConcurrency > maxSourceConcurrency) {
+      throw new IllegalArgumentException("crawl.initialSourceConcurrency cannot exceed crawl.maxSourceConcurrency.");
+    }
     this.heartbeatSecs = atLeastOne(config, "crawl.heartbeatSecs", 10);
     this.orphanTimeoutSecs = atLeastOne(config, "crawl.orphanTimeoutSecs", 120);
     this.maxUnitSecs = config.hasPath("crawl.maxUnitSecs") ? atLeastOne(config, "crawl.maxUnitSecs", 1) : null;

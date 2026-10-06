@@ -50,6 +50,11 @@ public class CrawlCoordinator {
   private volatile boolean runActive = false;
   private volatile CoordinatorPublisher currentPublisher;
   private final Map<String, Map<String, Long>> unitCostsByPipeline = new HashMap<>();
+  // null unless crawl.maxSourceConcurrency is set
+  private final SourceConcurrencyController sourceConcurrency;
+  // refusals counted at the last heartbeat, over every connector so far; the publisher's own count restarts per connector
+  private long refusedAtLastHeartbeat = 0;
+  private volatile long refusedBeforeCurrentPublisher = 0;
   // what a Coordinator that finds itself stuck does after it stops sending heartbeats; replaced in tests
   private Runnable stuckAction = () -> System.exit(1);
 
@@ -77,6 +82,10 @@ public class CrawlCoordinator {
     this.messengerFactory = messengerFactory;
     this.crawlConfig = new CrawlConfig(config);
     this.configHash = CrawlConfig.runConfigHash(config);
+    this.sourceConcurrency = crawlConfig.maxSourceConcurrency == null ? null : new SourceConcurrencyController(
+        crawlConfig.maxSourceConcurrency, crawlConfig.initialSourceConcurrency, crawlConfig.sourceConcurrencyStep,
+        Math.min(crawlConfig.maxSourceConcurrency, Math.max(1, crawlConfig.workTopicPartitions)),
+        TimeUnit.SECONDS.toMillis(crawlConfig.sourceConcurrencyHoldSecs));
   }
 
   private enum Mode { START, RESUME, START_OR_RESUME }
@@ -133,7 +142,7 @@ public class CrawlCoordinator {
       }
 
       // Crawlers ignore units until they have seen a heartbeat for the unit's epoch, so send one before dispatching any.
-      runControl.heartbeat(runId, epoch, configHash);
+      runControl.heartbeat(runId, epoch, configHash, unitConcurrency());
       runActive = true;
       heartbeat = startHeartbeat();
       Runner.onInterrupt(() -> endRun("interrupted"));
@@ -227,7 +236,8 @@ public class CrawlCoordinator {
     executor.scheduleAtFixedRate(() -> {
       try {
         if (runActive && !stuck() && !supersededOrCancelled()) {
-          runControl.heartbeat(runId, epoch, configHash);
+          adjustSourceConcurrency();
+          runControl.heartbeat(runId, epoch, configHash, unitConcurrency());
         }
       } catch (Exception e) {
         log.error("Could not send heartbeat for run {}.", runId, e);
@@ -235,6 +245,34 @@ public class CrawlCoordinator {
     }, crawlConfig.heartbeatSecs, crawlConfig.heartbeatSecs, TimeUnit.SECONDS);
 
     return executor;
+  }
+
+  /**
+   * Once per heartbeat: the calls Crawlers reported as refused since the last heartbeat decide whether the run's
+   * source concurrency goes up or down.
+   */
+  private void adjustSourceConcurrency() {
+    if (sourceConcurrency == null) {
+      return;
+    }
+    CoordinatorPublisher publisher = currentPublisher;
+    long refusedNow = publisher == null ? refusedAtLastHeartbeat : publisher.numCallsRefused() + refusedBeforeCurrentPublisher;
+    sourceConcurrency.adjust(Math.max(0, refusedNow - refusedAtLastHeartbeat));
+    refusedAtLastHeartbeat = refusedNow;
+  }
+
+  // Each unit's share of the run's source concurrency: the run's figure over the units that can be in flight.
+  private Integer unitConcurrency() {
+    if (sourceConcurrency == null) {
+      return null;
+    }
+    CoordinatorPublisher publisher = currentPublisher;
+    return sourceConcurrency.perUnit(publisher != null ? publisher.numPartitions() : crawlConfig.workTopicPartitions);
+  }
+
+  /** The run's current source concurrency, or null if nothing bounds it. */
+  public Integer currentSourceConcurrency() {
+    return sourceConcurrency == null ? null : sourceConcurrency.current();
   }
 
   /**
@@ -338,6 +376,10 @@ public class CrawlCoordinator {
       log.error("Connector " + connector.getName() + " failed.", e);
       return new ConnectorResult(connector, publisher, false, String.valueOf(e.getMessage()));
     } finally {
+      // the refusals this connector's publisher counted carry over to the run's running total
+      if (publisher != null) {
+        refusedBeforeCurrentPublisher += publisher.numCallsRefused();
+      }
       currentPublisher = null;
       close(connector, "connector");
       close(publisher, "publisher");
@@ -434,8 +476,10 @@ public class CrawlCoordinator {
     publisher.logHookDone(CoordinatorPublisher.HOOK_POST_EXECUTE);
 
     double durationSecs = stopWatch.getTime(TimeUnit.MILLISECONDS) / 1000.0;
-    log.info(String.format("Connector %s feeding to pipeline %s complete: %d units. Time: %.2f secs.",
-        connector.getName(), connector.getPipelineName(), publisher.numUnitsDone(), durationSecs));
+    log.info(String.format("Connector %s feeding to pipeline %s complete: %d units, %d calls refused by the source, "
+        + "%d units dispatched again after the source refused them. Time: %.2f secs.", connector.getName(),
+        connector.getPipelineName(), publisher.numUnitsDone(), publisher.numCallsRefused(), publisher.numUnitsThrottled(),
+        durationSecs));
     return new ConnectorResult(connector, publisher, true, null, durationSecs);
   }
 

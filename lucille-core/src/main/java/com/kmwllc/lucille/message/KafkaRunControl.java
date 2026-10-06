@@ -26,6 +26,7 @@ import org.apache.kafka.common.config.TopicConfig;
 public class KafkaRunControl implements RunControl {
 
   static final String EPOCH = "epoch";
+  static final String UNIT_CONCURRENCY = "unitConcurrency";
   static final String CONFIG_HASH = "configHash";
   static final String REASON = "reason";
 
@@ -128,8 +129,12 @@ public class KafkaRunControl implements RunControl {
   }
 
   @Override
-  public void heartbeat(String runId, int epoch, String configHash) throws Exception {
-    send(runId, CrawlConfig.newMessage().put(EPOCH, epoch).put(CONFIG_HASH, configHash), Event.Type.HEARTBEAT);
+  public void heartbeat(String runId, int epoch, String configHash, Integer unitConcurrency) throws Exception {
+    ObjectNode message = CrawlConfig.newMessage().put(EPOCH, epoch).put(CONFIG_HASH, configHash);
+    if (unitConcurrency != null) {
+      message.put(UNIT_CONCURRENCY, unitConcurrency);
+    }
+    send(runId, message, Event.Type.HEARTBEAT);
   }
 
   @Override
