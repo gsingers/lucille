@@ -261,8 +261,8 @@ class Crawler implements Runnable {
     final String id = UUID.randomUUID().toString();
     final String runId;
     // what the last UNIT_PROGRESS said, so that one is sent only when there is something new to say
-    long reportedSourceCalls = -1;
-    long reportedRefusedCalls = -1;
+    long reportedSourceCalls = 0;
+    long reportedRefusedCalls = 0;
 
     Execution(String runId) {
       this.runId = runId;
@@ -404,7 +404,8 @@ class Crawler implements Runnable {
     running = false;
     try {
       ObjectNode message = unitMessage(unit)
-          .put(CoordinatorPublisher.ERROR, "Timed out: still executing after " + maxUnitMillis + " ms.");
+          .put(CoordinatorPublisher.ERROR, "Timed out: still executing after " + maxUnitMillis + " ms.")
+          .put(CoordinatorPublisher.ERROR_CLASS, FailureClass.TIMEOUT.name());
       sendUnitEvent(unit, message, Event.Type.UNIT_FAILED);
       messenger.ackWorkUnit();
     } catch (Exception e) {

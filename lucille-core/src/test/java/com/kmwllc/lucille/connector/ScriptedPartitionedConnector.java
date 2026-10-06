@@ -78,6 +78,9 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
   public static final Set<String> throttleFailOnce = ConcurrentHashMap.newKeySet();
   public static final Set<String> throttleFailTwice = ConcurrentHashMap.newKeySet();
   public static final Set<String> throttleFailAlways = ConcurrentHashMap.newKeySet();
+  /** The most executions that were under way at once. */
+  public static final AtomicInteger maxConcurrentExecutions = new AtomicInteger();
+  private static final AtomicInteger executing = new AtomicInteger();
   /** The source allowance each execution saw, in order. */
   public static final List<Integer> allowancesSeen = Collections.synchronizedList(new ArrayList<>());
   /**
@@ -121,6 +124,8 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     throttledOnce.clear();
     throttleFailOnce.clear();
     allowancesSeen.clear();
+    maxConcurrentExecutions.set(0);
+    executing.set(0);
     sourceLimit = 0;
     sourceHoldMillis = 200;
     sourceInFlight.set(0);
@@ -180,6 +185,7 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     }
 
     allowancesSeen.add(context.maxSourceConcurrency());
+    maxConcurrentExecutions.accumulateAndGet(executing.incrementAndGet(), Math::max);
 
     try {
       if (sourceLimit > 0) {
@@ -218,6 +224,8 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       completed.add(unitKey);
     } catch (Exception e) {
       throw new ConnectorException("Error publishing document", e);
+    } finally {
+      executing.decrementAndGet();
     }
   }
 

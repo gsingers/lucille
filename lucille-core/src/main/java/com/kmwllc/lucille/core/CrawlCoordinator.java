@@ -54,7 +54,8 @@ public class CrawlCoordinator {
   private final SourceConcurrencyController sourceConcurrency;
   // refusals counted at the last heartbeat, over every connector so far; the publisher's own count restarts per connector
   private long refusedAtLastHeartbeat = 0;
-  private volatile long refusedBeforeCurrentPublisher = 0;
+  private long refusedBeforeCurrentPublisher = 0;
+  private final Object refusedLock = new Object();
   // what a Coordinator that finds itself stuck does after it stops sending heartbeats; replaced in tests
   private Runnable stuckAction = () -> System.exit(1);
 
@@ -84,8 +85,8 @@ public class CrawlCoordinator {
     this.configHash = CrawlConfig.runConfigHash(config);
     this.sourceConcurrency = crawlConfig.maxSourceConcurrency == null ? null : new SourceConcurrencyController(
         crawlConfig.maxSourceConcurrency, crawlConfig.initialSourceConcurrency, crawlConfig.sourceConcurrencyStep,
-        Math.min(crawlConfig.maxSourceConcurrency, Math.max(1, crawlConfig.workTopicPartitions)),
-        TimeUnit.SECONDS.toMillis(crawlConfig.sourceConcurrencyHoldSecs));
+        // down to one call at a time: units in flight follow the figure, so one call is one unit
+        1, TimeUnit.SECONDS.toMillis(crawlConfig.sourceConcurrencyHoldSecs));
   }
 
   private enum Mode { START, RESUME, START_OR_RESUME }
@@ -255,10 +256,20 @@ public class CrawlCoordinator {
     if (sourceConcurrency == null) {
       return;
     }
-    CoordinatorPublisher publisher = currentPublisher;
-    long refusedNow = publisher == null ? refusedAtLastHeartbeat : publisher.numCallsRefused() + refusedBeforeCurrentPublisher;
+    CoordinatorPublisher publisher;
+    long refusedNow;
+    synchronized (refusedLock) {
+      publisher = currentPublisher;
+      refusedNow = refusedBeforeCurrentPublisher + (publisher == null ? 0 : publisher.numCallsRefused());
+    }
+    // only while units are running: an interval with no calls says nothing about the source, and must not raise it
+    if (publisher == null || publisher.numPartitionsBusy() == 0) {
+      refusedAtLastHeartbeat = refusedNow;
+      return;
+    }
     sourceConcurrency.adjust(Math.max(0, refusedNow - refusedAtLastHeartbeat));
     refusedAtLastHeartbeat = refusedNow;
+    publisher.setMaxUnitsInFlight(sourceConcurrency.unitsInFlight(publisher.numPartitions()));
   }
 
   // Each unit's share of the run's source concurrency: the run's figure over the units that can be in flight.
@@ -367,7 +378,12 @@ public class CrawlCoordinator {
       } else {
         publisher = newPublisher(connector);
       }
-      currentPublisher = publisher;
+      synchronized (refusedLock) {
+        currentPublisher = publisher;
+      }
+      if (sourceConcurrency != null) {
+        publisher.setMaxUnitsInFlight(sourceConcurrency.unitsInFlight(publisher.numPartitions()));
+      }
       if (!runActive) {
         return new ConnectorResult(connector, publisher, false, "Run was cancelled or taken over by another Coordinator.");
       }
@@ -377,10 +393,12 @@ public class CrawlCoordinator {
       return new ConnectorResult(connector, publisher, false, String.valueOf(e.getMessage()));
     } finally {
       // the refusals this connector's publisher counted carry over to the run's running total
-      if (publisher != null) {
-        refusedBeforeCurrentPublisher += publisher.numCallsRefused();
+      synchronized (refusedLock) {
+        if (publisher != null) {
+          refusedBeforeCurrentPublisher += publisher.numCallsRefused();
+        }
+        currentPublisher = null;
       }
-      currentPublisher = null;
       close(connector, "connector");
       close(publisher, "publisher");
     }

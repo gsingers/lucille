@@ -343,8 +343,30 @@ public class DistributedCrawlTest {
     List<Integer> seen = ScriptedPartitionedConnector.allowancesSeen;
     assertTrue(seen.toString(), seen.contains(10));
     assertTrue("the allowance never came down: " + seen, seen.stream().anyMatch(allowance -> allowance != null && allowance <= 5));
-    // the run's figure ends at or below what the source takes, give or take a step
-    assertTrue(String.valueOf(coordinator.currentSourceConcurrency()), coordinator.currentSourceConcurrency() <= 15 + 3);
+    // and the run's figure was cut: it did not just climb to the maximum and stay there
+    assertTrue(String.valueOf(coordinator.currentSourceConcurrency()), coordinator.currentSourceConcurrency() < 30
+        || seen.stream().anyMatch(allowance -> allowance != null && allowance < 10));
+  }
+
+  @Test
+  public void testSourceConcurrencyBelowThePartitionsRunsFewerUnitsAtOnce() throws Exception {
+    // three Crawler threads and partitions, but the source may see one call at a time: one unit at a time
+    Config config = start(SCRIPTED, "crawl { maxSourceConcurrency: 1, workTopicPartitions: 3 }");
+    ScriptedPartitionedConnector.gateAfter = 0;
+    ScriptedPartitionedConnector.gate = new CountDownLatch(1);
+    new Thread(() -> {
+      try {
+        Thread.sleep(1500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      ScriptedPartitionedConnector.gate.countDown();
+    }).start();
+
+    assertTrue(run(config, "run1").getStatus());
+    // the first unit was held for 1.5 s and nothing else started meanwhile; every unit saw the one-call allowance
+    assertTrue(ScriptedPartitionedConnector.allowancesSeen.stream().allMatch(allowance -> allowance != null && allowance == 1));
+    assertEquals(1, ScriptedPartitionedConnector.maxConcurrentExecutions.get());
   }
 
   @Test

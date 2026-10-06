@@ -18,6 +18,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.function.Supplier;
 import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,6 +29,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.retries.DefaultRetryStrategy;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
@@ -76,6 +78,13 @@ public class S3StorageClient extends BaseStorageClient {
   protected void initializeStorageClient() throws IOException {
     try {
       S3ClientBuilder builder = S3Client.builder();
+
+      // Lucille retries a refused listing itself, for longer and with a count of the refusals that a distributed
+      // crawl acts on. The SDK's own retries would hide the first few refusals of every burst from that count, so
+      // they are turned off whenever Lucille's policy is on.
+      if (SourceRetryPolicy.fromConfig(config).maxMillis() > 0) {
+        builder = builder.overrideConfiguration(o -> o.retryStrategy(DefaultRetryStrategy.doNotRetry()));
+      }
 
       if (config.hasPath(S3_REGION)) {
         builder = builder.region(Region.of(config.getString(S3_REGION)));
@@ -216,19 +225,57 @@ public class S3StorageClient extends BaseStorageClient {
         }
 
         log.info("Listing {} was refused ({}); retry {} in {} ms.", prefix, failureClass, retry + 1, waitMillis);
-        sleepUnlessCancelled(waitMillis, budget);
+        if (!sleepUnlessCancelled(waitMillis, budget)) {
+          // interrupted: the thread is being stopped, and must not spin on the SDK until the horizon
+          throw new SourceException(failureClass, "Interrupted while waiting to list " + uriForDirectory(prefix, params)
+              + " again.", e);
+        }
       }
     }
   }
 
-  private static void sleepUnlessCancelled(long millis, TraversalBudget budget) {
+  /** Returns false if interrupted; the interrupt flag is left set. */
+  private static boolean sleepUnlessCancelled(long millis, TraversalBudget budget) {
     long deadline = System.currentTimeMillis() + millis;
     try {
       while (System.currentTimeMillis() < deadline && (budget == null || !budget.isCancelled())) {
         Thread.sleep(Math.min(200, Math.max(1, deadline - System.currentTimeMillis())));
       }
+      return true;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
+      return false;
+    }
+  }
+
+  /**
+   * Fetches an object, trying again on a refusal as a listing is tried again. A traversal that gives up on an
+   * object's content skips the object (the base client logs it); the refusals are counted all the same.
+   */
+  private <T> T getWithRetry(TraversalParams params, String key, Supplier<T> fetch) {
+    TraversalBudget budget = params.getBudget();
+    long firstFailureMillis = 0;
+
+    for (int retry = 0; ; retry++) {
+      try {
+        return fetch.get();
+      } catch (SdkException e) {
+        FailureClass failureClass = classify(e);
+        if (retry == 0) {
+          firstFailureMillis = System.currentTimeMillis();
+        }
+        if (budget != null) {
+          budget.callRefused();
+        }
+        long waitMillis = failureClass.isOverload() ? params.getRetryPolicy().nextWaitMillis(retry + 1, firstFailureMillis) : -1;
+        if (waitMillis < 0 || (budget != null && budget.isCancelled())) {
+          throw e;
+        }
+        log.info("Fetching {} was refused ({}); retry {} in {} ms.", key, failureClass, retry + 1, waitMillis);
+        if (!sleepUnlessCancelled(waitMillis, budget)) {
+          throw e;
+        }
+      }
     }
   }
 
@@ -241,13 +288,20 @@ public class S3StorageClient extends BaseStorageClient {
       if (service.isThrottlingException() || service.statusCode() == 429) {
         return FailureClass.THROTTLED;
       }
-      if (service.statusCode() >= 500) {
+      if (service.statusCode() == 500 || service.statusCode() == 502 || service.statusCode() == 503 || service.statusCode() == 504) {
         return FailureClass.SOURCE_UNAVAILABLE;
       }
       return FailureClass.SOURCE_ERROR;
     }
-    // the SDK could not get an answer at all: a connection refused, a timeout, a reset
-    return e.retryable() || e instanceof SdkClientException ? FailureClass.SOURCE_UNAVAILABLE : FailureClass.SOURCE_ERROR;
+    // The SDK could not get an answer at all. Only a failure on the wire (a connection refused, a timeout, a reset)
+    // is the store being unavailable; a failure to sign, to find credentials or to read the config is not, and
+    // would not pass if tried again.
+    for (Throwable cause = e; cause != null; cause = cause.getCause() == cause ? null : cause.getCause()) {
+      if (cause instanceof IOException) {
+        return FailureClass.SOURCE_UNAVAILABLE;
+      }
+    }
+    return FailureClass.SOURCE_ERROR;
   }
 
   @Override
@@ -353,14 +407,13 @@ public class S3StorageClient extends BaseStorageClient {
     public InputStream getContentStream(TraversalParams params) {
       String objKey = s3Obj.key();
       GetObjectRequest objectRequest = GetObjectRequest.builder().bucket(getBucketOrContainerName(params)).key(objKey).build();
-      return s3.getObject(objectRequest);
+      return getWithRetry(params, objKey, () -> s3.getObject(objectRequest));
     }
 
     @Override
     protected byte[] getFileContent(TraversalParams params) {
-      return s3.getObjectAsBytes(
-          GetObjectRequest.builder().bucket(getBucketOrContainerName(params)).key(s3Obj.key()).build()
-      ).asByteArray();
+      GetObjectRequest request = GetObjectRequest.builder().bucket(getBucketOrContainerName(params)).key(s3Obj.key()).build();
+      return getWithRetry(params, s3Obj.key(), () -> s3.getObjectAsBytes(request).asByteArray());
     }
 
     private static URI getFullPathHelper(S3Object s3Obj, TraversalParams params) {

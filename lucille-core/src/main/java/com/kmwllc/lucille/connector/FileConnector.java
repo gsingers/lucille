@@ -218,6 +218,8 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     super(config);
 
     this.concurrent = ConfigUtils.getOrDefault(config, "concurrent", false);
+    // checked here rather than at the first traversal, so that a bad value is found before the run starts
+    SourceRetryPolicy.fromConfig(config);
 
     List<String> paths = config.getStringList("paths");
     this.storageURIs = new ArrayList<>();
@@ -369,10 +371,8 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       }
     }
 
-    handBack(budget.getHandedBack(), context);
-    context.addSourceCalls(budget.getDirectoriesListed());
-    // what the source refused or failed on, so that the Coordinator can delay the handed-back parts
-    context.addRefusedCalls(budget.getRefusedCalls());
+    handBack(budget.getHandedBack(), unitPaths, recursive, context);
+    // listings and refusals went to the context as they happened; what ended the unit early goes now
     if (budget.getSourceError() != null) {
       context.recordSourceError(budget.getSourceError().failureClass(), budget.getSourceError().cause());
     }
@@ -406,24 +406,30 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
    * over is mostly small: the siblings of the directories it was in when it stopped. Units of one small directory
    * each cost more to dispatch than to execute.
    */
-  private void handBack(List<URI> directories, UnitContext context) {
+  private void handBack(List<URI> directories, List<URI> unitPaths, boolean recursive, UnitContext context) {
     int groupSize = handBackGroupSize();
 
     for (int from = 0; from < directories.size(); from += groupSize) {
       List<URI> group = directories.subList(from, Math.min(from + groupSize, directories.size()));
       String first = group.get(0).toString();
 
+      // A directory found beneath the unit's own is walked whole when it is handed back. One of the unit's own
+      // directories, handed back because it could not be listed, is handed back as the unit had it: a unit for the
+      // files in a directory must not come back as a unit for its whole subtree.
+      boolean recursiveGroup = recursive || !unitPaths.containsAll(group);
+      String keySuffix = recursiveGroup ? "" : "#files";
+
       // a single directory is described as the planner would describe it, and so is the same unit as the planner's
       if (group.size() == 1) {
-        context.handBack(first, WorkUnit.newPayload().put(UNIT_PATH, first).put(UNIT_RECURSIVE, true));
+        context.handBack(first + keySuffix, WorkUnit.newPayload().put(UNIT_PATH, first).put(UNIT_RECURSIVE, recursiveGroup));
         continue;
       }
 
-      ObjectNode payload = WorkUnit.newPayload().put(UNIT_RECURSIVE, true);
+      ObjectNode payload = WorkUnit.newPayload().put(UNIT_RECURSIVE, recursiveGroup);
       ArrayNode paths = payload.putArray(UNIT_PATHS);
       group.forEach(directory -> paths.add(directory.toString()));
       // the key has to be the same whenever the same directories are handed back together, and different otherwise
-      String key = first + "+" + (group.size() - 1) + "~" + DigestUtils.sha256Hex(paths.toString()).substring(0, 16);
+      String key = first + "+" + (group.size() - 1) + keySuffix + "~" + DigestUtils.sha256Hex(payload.toString()).substring(0, 16);
       context.handBack(key, payload);
     }
   }
@@ -446,7 +452,21 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     Long maxMillis = config.hasPath("partitioning.maxUnitSecs")
         ? TimeUnit.SECONDS.toMillis(config.getInt("partitioning.maxUnitSecs")) : null;
     // a unit that has been given up on stops listing as well
-    return new TraversalBudget(maxDirectories, maxMillis, context::isCancelled);
+    TraversalBudget budget = new TraversalBudget(maxDirectories, maxMillis, context::isCancelled);
+    // the unit's account is kept as it goes, so that the Crawler's progress reports carry it
+    budget.setListener(new TraversalBudget.Listener() {
+      @Override
+      public void listed() {
+        context.addSourceCalls(1);
+      }
+
+      @Override
+      public void refused() {
+        context.addRefusedCalls(1);
+      }
+    });
+    budget.setMaxConcurrency(context::maxSourceConcurrency);
+    return budget;
   }
 
   /**

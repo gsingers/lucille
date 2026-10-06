@@ -62,7 +62,9 @@ public class SourceConcurrencyController {
     int before = current;
 
     if (refusedCalls > 0) {
-      if (!everDecreased || now - lastDecreaseMillis >= holdMillis) {
+      if (current == floor) {
+        log.info("The source refused {} calls; source concurrency is already at its floor of {}.", refusedCalls, floor);
+      } else if (!everDecreased || now - lastDecreaseMillis >= holdMillis) {
         current = Math.max(floor, current / 2);
         everDecreased = true;
         lastDecreaseMillis = now;
@@ -87,8 +89,16 @@ public class SourceConcurrencyController {
     return max;
   }
 
-  /** The figure divided among the given number of units in flight, at least one call each. */
-  public int perUnit(int unitsInFlight) {
-    return Math.max(1, current / Math.max(1, unitsInFlight));
+  /**
+   * How many units may be in flight for the figure: as many as there are partitions to run them on, but never more
+   * than there are calls, since a unit makes at least one call at a time.
+   */
+  public int unitsInFlight(int partitions) {
+    return Math.max(1, Math.min(partitions, current));
+  }
+
+  /** The figure divided among the units in flight, at least one call each. */
+  public int perUnit(int partitions) {
+    return Math.max(1, current / unitsInFlight(partitions));
   }
 }

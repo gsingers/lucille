@@ -765,6 +765,27 @@ public class CoordinatorPublisherTest {
   }
 
   @Test
+  public void testSourceConcurrencyBoundsUnitsInFlight() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    // one call at a time for the whole run: one unit at a time, though there are two partitions
+    publisher.setMaxUnitsInFlight(1);
+    WorkUnitSink sink = publisher.getSink();
+    sink.emit("u0", WorkUnit.newPayload());
+    sink.emit("u1", WorkUnit.newPayload());
+    assertEquals(List.of("u0"), dispatchedKeys());
+
+    publisher.handleEvent(unitEvent("u0", 1, 1, Event.Type.UNIT_DONE));
+    assertEquals(List.of("u0", "u1"), dispatchedKeys());
+
+    // raising it uses the room at once
+    sink.emit("u2", WorkUnit.newPayload());
+    assertEquals(List.of("u0", "u1"), dispatchedKeys());
+    publisher.setMaxUnitsInFlight(2);
+    assertEquals(List.of("u0", "u1", "u2"), dispatchedKeys());
+    assertThrows(IllegalArgumentException.class, () -> publisher.setMaxUnitsInFlight(0));
+  }
+
+  @Test
   public void testRefusalsInProgressReportsAreCountedOnce() throws Exception {
     CoordinatorPublisher publisher = publisher(1);
     publisher.getSink().emit("u0", WorkUnit.newPayload());
@@ -793,6 +814,101 @@ public class CoordinatorPublisherTest {
     String message = CrawlConfig.newMessage().put("attempt", attempt).put("epoch", epoch).put("execution", execution)
         .put("sourceCalls", 100).put("refusedCalls", refused).put("numPublished", 3).toString();
     return new Event("connector1/" + unitKey, RUN_ID, message, Event.Type.UNIT_PROGRESS);
+  }
+
+  @Test
+  public void testRefusalsHandedDownThroughPartsEndTheRunEventually() throws Exception {
+    // crawl.maxThrottledAttempts is 3: a part of a part of a unit, each ended by a refusal, is the third
+    long[] now = {1_000_000};
+    CoordinatorPublisher publisher = publisherWithClock(now);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+    String[] keys = {"u0", "p1", "p2"};
+
+    for (int i = 0; i < 3; i++) {
+      String parent = keys[i];
+      String child = "p" + (i + 1);
+      publisher.handleEvent(childrenEvent(parent, 1, 1, "x" + i, child));
+      ObjectNode done = CrawlConfig.newMessage().put("attempt", 1).put("epoch", 1).put("execution", "x" + i)
+          .put("numChildren", 1).put("errorClass", "THROTTLED").put("errorCause", "S3Exception: 429");
+      publisher.handleEvent(new Event("connector1/" + parent, RUN_ID, done.toString(), Event.Type.UNIT_DONE));
+      if (i < 2) {
+        assertNull(publisher.failureReason());
+        // each part waits longer than the last: 5-10 s, then 10-20 s
+        now[0] += 5_000L << i;
+        publisher.onWaitIteration();
+        assertEquals(List.of("u0", "p1", "p2").subList(0, i + 1), dispatchedKeys());
+        now[0] += 5_001L << i;
+        publisher.onWaitIteration();
+        assertEquals(List.of("u0", "p1", "p2").subList(0, i + 2), dispatchedKeys());
+      }
+    }
+
+    assertNotNull(publisher.failureReason());
+    assertTrue(publisher.failureReason(), publisher.failureReason().contains("refused by the source 3 times"));
+  }
+
+  @Test
+  public void testUnitRefusedEarlierThatCompletesWholePassesNothingOn() throws Exception {
+    long[] now = {1_000_000};
+    CoordinatorPublisher publisher = publisherWithClock(now);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+    publisher.handleEvent(failedEvent("u0", 1, 1, FailureClass.THROTTLED));
+    now[0] += 10_001;
+    publisher.onWaitIteration();
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+
+    // this time it completed, and handed back parts for size: they are not held back for its earlier refusal
+    publisher.handleEvent(childrenEvent("u0", 2, 1, "x", "p1"));
+    publisher.handleEvent(doneEvent("u0", 2, 1, "x", 1));
+    assertEquals(0, publisher.numUnitsDelayed());
+    assertEquals(List.of("u0", "u0", "p1"), dispatchedKeys());
+  }
+
+  @Test
+  public void testRefusalsInTheLogAreNotCountedAgainOnReplay() throws Exception {
+    ObjectNode done = CrawlConfig.newMessage().put("attempt", 1).put("epoch", 1).put("execution", "x").put("refusedCalls", 40);
+    messenger.log.addAll(List.of(
+        created(unit("u0", 1, 1)),
+        new Event("connector1/u0", RUN_ID, done.toString(), Event.Type.UNIT_DONE)));
+
+    CoordinatorPublisher publisher = publisher(2);
+    publisher.recover();
+
+    assertEquals(1, publisher.numUnitsDone());
+    assertEquals(0, publisher.numCallsRefused());
+  }
+
+  @Test
+  public void testUnitThatHandsItselfBackIsNotDone() throws Exception {
+    long[] now = {1_000_000};
+    CoordinatorPublisher publisher = publisherWithClock(now);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // the unit could not list the one directory it was given, and hands it back under its own key
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "u0"));
+    ObjectNode done = CrawlConfig.newMessage().put("attempt", 1).put("epoch", 1).put("execution", "x")
+        .put("numChildren", 1).put("refusedCalls", 6).put("errorClass", "THROTTLED").put("errorCause", "S3Exception: 429");
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, done.toString(), Event.Type.UNIT_DONE));
+
+    // it is not done, and it is not dropped as already known: it waits as a unit its source refused
+    assertEquals(0, publisher.numUnitsDone());
+    assertEquals(1, publisher.numUnitsDelayed());
+    assertTrue(publisher.hasOutstandingWork());
+    assertEquals(6, publisher.numCallsRefused());
+    now[0] += 10_001;
+    publisher.onWaitIteration();
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+    assertEquals(2, messenger.dispatched.get(1).attempt());
+
+    // and when the source keeps refusing it, the run fails as it would for a unit that keeps failing
+    publisher.handleEvent(childrenEvent("u0", 2, 1, "y", "u0"));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, done.put("attempt", 2).put("execution", "y").toString(), Event.Type.UNIT_DONE));
+    now[0] += 30_000;
+    publisher.onWaitIteration();
+    publisher.handleEvent(childrenEvent("u0", 3, 1, "z", "u0"));
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, done.put("attempt", 3).put("execution", "z").toString(), Event.Type.UNIT_DONE));
+    assertNotNull(publisher.failureReason());
+    assertTrue(publisher.failureReason(), publisher.failureReason().contains("refused"));
   }
 
   @Test

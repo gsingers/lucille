@@ -7,6 +7,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 /**
  * Limits how much of a tree one traversal walks, and collects the directories it leaves unwalked.
@@ -25,6 +26,19 @@ public class TraversalBudget {
   private final long maxDirectories;
   private final long deadlineMillis;
   private final BooleanSupplier cancelled;
+  // told of each listing and each refusal as it happens, so that progress reports carry them before the unit ends
+  private volatile Listener listener = Listener.NONE;
+  // how many calls the unit may have in flight, by the run's latest word; null when nothing bounds them
+  private volatile Supplier<Integer> maxConcurrency = () -> null;
+
+  /** Hears of the traversal's listings and refusals as they happen. */
+  public interface Listener {
+    Listener NONE = new Listener() { };
+
+    default void listed() { }
+
+    default void refused() { }
+  }
   private final AtomicLong directoriesListed = new AtomicLong();
   private final AtomicLong refusedCalls = new AtomicLong();
   private final List<URI> handedBack = Collections.synchronizedList(new ArrayList<>());
@@ -71,6 +85,7 @@ public class TraversalBudget {
         return false;
       }
       if (directoriesListed.compareAndSet(listed, listed + 1)) {
+        listener.listed();
         return true;
       }
     }
@@ -90,6 +105,24 @@ public class TraversalBudget {
   /** Records a call that the source refused or could not answer, and that was or will be tried again. */
   public void callRefused() {
     refusedCalls.incrementAndGet();
+    listener.refused();
+  }
+
+  public void setListener(Listener listener) {
+    this.listener = listener == null ? Listener.NONE : listener;
+  }
+
+  /**
+   * Sets where the traversal learns how many calls it may have in flight at once. A storage client that lists with
+   * a pool of threads should cap the pool at {@link #getMaxConcurrency()} and look again between directories.
+   */
+  public void setMaxConcurrency(Supplier<Integer> maxConcurrency) {
+    this.maxConcurrency = maxConcurrency == null ? () -> null : maxConcurrency;
+  }
+
+  /** Returns how many calls this traversal may have in flight at once, or null if nothing bounds them. */
+  public Integer getMaxConcurrency() {
+    return maxConcurrency.get();
   }
 
   public long getRefusedCalls() {

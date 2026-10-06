@@ -41,6 +41,7 @@ public class CrawlerPool {
   private final int heartbeatSecs;
   private final boolean exitOnTimeout;
   private ScheduledExecutorService watchdog;
+  private ScheduledExecutorService progress;
   // what "exit" means; replaced in tests, which cannot have the JVM exit
   private Runnable exitAction = () -> System.exit(1);
 
@@ -110,8 +111,11 @@ public class CrawlerPool {
         .namingPattern(ThreadNameUtils.createName("CrawlerWatchdog")).daemon(true).build();
     watchdog = Executors.newSingleThreadScheduledExecutor(threadFactory);
 
-    // progress reports, every heartbeat, so that the Coordinator hears of refused calls before a unit ends
-    watchdog.scheduleWithFixedDelay(() -> {
+    // Progress reports, every heartbeat, so that the Coordinator hears of refused calls before a unit ends. On a
+    // thread of their own: each is a round trip to Kafka, which must not hold up the watchdog when Kafka is slow.
+    progress = Executors.newSingleThreadScheduledExecutor(new BasicThreadFactory.Builder()
+        .namingPattern(ThreadNameUtils.createName("CrawlerProgress")).daemon(true).build());
+    progress.scheduleWithFixedDelay(() -> {
       for (Crawler crawler : crawlers) {
         if (!stopped) {
           crawler.reportProgress();
@@ -169,6 +173,9 @@ public class CrawlerPool {
     stopped = true;
     if (watchdog != null) {
       watchdog.shutdownNow();
+    }
+    if (progress != null) {
+      progress.shutdownNow();
     }
     for (Crawler crawler : crawlers) {
       crawler.terminate();

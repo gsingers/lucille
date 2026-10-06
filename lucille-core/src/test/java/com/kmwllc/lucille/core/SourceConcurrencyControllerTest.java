@@ -50,9 +50,14 @@ public class SourceConcurrencyControllerTest {
     SourceConcurrencyController controller = new SourceConcurrencyController(2400, 2400, 240, 24, 10_000);
     assertEquals(100, controller.perUnit(24));
     assertEquals(2400, controller.perUnit(1));
-    // never less than one call per unit, whatever the division says
-    assertEquals(1, controller.perUnit(5000));
-    assertEquals(2400, controller.perUnit(0));
+    assertEquals(24, controller.unitsInFlight(24));
+
+    // fewer calls than partitions: fewer units in flight, one call each, rather than a fraction of a call
+    SourceConcurrencyController small = new SourceConcurrencyController(10, 3, 1, 1, 10_000);
+    assertEquals(3, small.unitsInFlight(16));
+    assertEquals(1, small.perUnit(16));
+    assertEquals(1, small.unitsInFlight(0));
+    assertEquals(3, small.perUnit(1));
   }
 
   @Test

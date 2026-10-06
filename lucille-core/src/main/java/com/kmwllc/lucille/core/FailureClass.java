@@ -23,6 +23,8 @@ public enum FailureClass {
   /** Anything else: an exception in the connector or in Lucille. */
   CONNECTOR_ERROR;
 
+  private static final int MAX_CAUSE_DEPTH = 32;
+
   /** Whether a failure of this class is the source's, and may pass if tried again later. */
   public boolean isSourceFailure() {
     return this == THROTTLED || this == SOURCE_UNAVAILABLE || this == SOURCE_ERROR;
@@ -40,7 +42,8 @@ public enum FailureClass {
    * here without this method knowing the SDK.
    */
   public static FailureClass of(Throwable t) {
-    for (Throwable cause = t; cause != null; cause = cause.getCause() == cause ? null : cause.getCause()) {
+    int depth = 0;
+    for (Throwable cause = t; cause != null && depth++ < MAX_CAUSE_DEPTH; cause = cause.getCause()) {
       if (cause instanceof SourceException source) {
         return source.getFailureClass();
       }
@@ -58,7 +61,8 @@ public enum FailureClass {
   /** Returns the innermost cause of a failure, which is usually the one that says what happened. */
   public static Throwable rootCause(Throwable t) {
     Throwable cause = t;
-    while (cause.getCause() != null && cause.getCause() != cause) {
+    // bounded, since a chain of causes can be made to loop
+    for (int depth = 0; cause.getCause() != null && depth < MAX_CAUSE_DEPTH; depth++) {
       cause = cause.getCause();
     }
     return cause;

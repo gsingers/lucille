@@ -82,6 +82,7 @@ public class CoordinatorPublisher extends PublisherImpl {
   private final String configHash;
   private final int epoch;
   private final int maxOutstandingUnits;
+  private volatile int maxUnitsInFlight = Integer.MAX_VALUE;
   private final int maxAttempts;
   private final int maxThrottledAttempts;
   private final long throttleBackoffMillis;
@@ -283,8 +284,23 @@ public class CoordinatorPublisher extends PublisherImpl {
   // Whether more work may be put in flight: not too many units outstanding, and no more Documents pending than
   // publisher.maxPendingDocs allows. Crawlers publish without limit, so holding back units is the back-pressure.
   private boolean dispatchWindowOpen() {
-    return outstandingUnits.size() < maxOutstandingUnits
+    return outstandingUnits.size() < Math.min(maxOutstandingUnits, maxUnitsInFlight)
         && (getMaxPendingDocs() == null || numPending() < getMaxPendingDocs());
+  }
+
+  /**
+   * Bounds the units in flight by the run's source concurrency: a unit makes at least one call at a time, so no more
+   * units than calls. Called by the Coordinator whenever the figure changes; more room is used at once.
+   */
+  public void setMaxUnitsInFlight(int max) {
+    if (max < 1) {
+      throw new IllegalArgumentException("At least one unit must be allowed in flight.");
+    }
+    if (max != maxUnitsInFlight) {
+      log.info("Units in flight bounded to {} by the source concurrency.", max);
+      maxUnitsInFlight = max;
+      dispatchQueuedUnits();
+    }
   }
 
   /**
@@ -624,8 +640,12 @@ public class CoordinatorPublisher extends PublisherImpl {
   }
 
   // A unit's refusals arrive as running totals, in progress reports and then in its completion; only what is new
-  // since the last report is counted, so that a refusal is counted once.
+  // since the last report is counted, so that a refusal is counted once. What an earlier Coordinator saw is its own
+  // business: nothing is counted while replaying.
   private void countRefusedSoFar(WorkUnit unit, ObjectNode message) {
+    if (replaying) {
+      return;
+    }
     String key = unit.unitId() + "#" + message.path(EXECUTION).asText();
     long total = message.path(REFUSED_CALLS).asLong(0);
     Long before = refusedSoFar.put(key, total);
@@ -662,26 +682,47 @@ public class CoordinatorPublisher extends PublisherImpl {
       return;
     }
 
+    // A unit that could not list the very directory it was given hands that directory back, under its own key. It
+    // has done nothing that counts, so it is not done: it is a unit whose source refused it, and is treated as one.
+    FailureClass endedBy = FailureClass.parse(message.path(ERROR_CLASS).asText(null));
+    if (children != null && children.stream().anyMatch(child -> unit.unitId().equals(childUnitId(child)))) {
+      countRefusedSoFar(unit, message);
+      refusedSoFar.keySet().removeIf(key -> key.startsWith(unit.unitId() + "#"));
+      log.info("Unit {} handed itself back ({}: {}); treating it as a failure of the source.", unit.unitId(), endedBy,
+          message.path(ERROR_CAUSE).asText());
+      failUnit(unit, "Could not list its own directory: " + message.path(ERROR_CAUSE).asText(),
+          endedBy != null && endedBy.isSourceFailure() ? endedBy : FailureClass.SOURCE_ERROR);
+      return;
+    }
+
     doneUnits.add(unit.unitId());
     outstandingUnits.remove(unit.unitId());
     costOf.remove(unit.unitId());
     plainFailures.remove(unit.unitId());
-    throttledFailures.remove(unit.unitId());
     freePartitionOf(unit.unitId());
     unitsDone.inc();
     countRefusedSoFar(unit, message);
     refusedSoFar.keySet().removeIf(key -> key.startsWith(unit.unitId() + "#"));
 
     // A unit that completed because its source refused the rest hands that rest back. It is not sent straight back
-    // to the same source; it waits as a failed unit would.
-    FailureClass endedBy = FailureClass.parse(message.path(ERROR_CLASS).asText(null));
-    long childDelayMillis = endedBy != null && endedBy.isOverload() && !replaying ? backoffMillis(1) : 0;
+    // to the same source; it waits as a failed unit would, and the parts carry the count of refusals that led to
+    // them, so that a part refused in its turn waits longer, and a subtree the source will never serve ends the run
+    // at crawl.maxThrottledAttempts instead of being handed back for ever.
+    // A unit that completed whole, whatever it was refused before, passes nothing on: its parts are not under suspicion.
+    int throttles = endedBy != null && endedBy.isOverload() ? throttledFailures.getOrDefault(unit.unitId(), 0) + 1 : 0;
+    throttledFailures.remove(unit.unitId());
+    if (!replaying && throttles >= maxThrottledAttempts && children != null && !children.isEmpty()) {
+      failure = "Unit " + unit.unitId() + " and what it came from were refused by the source " + throttles + " times: "
+          + message.path(ERROR_CAUSE).asText();
+      return;
+    }
+    long childDelayMillis = throttles > 0 && !replaying ? backoffMillis(throttles) : 0;
 
     int numCreated = 0;
     synchronized (dispatchLock) {
       if (children != null) {
         for (JsonNode child : children) {
-          numCreated += createHandedBackUnit(child, childDelayMillis) ? 1 : 0;
+          numCreated += createHandedBackUnit(child, childDelayMillis, throttles) ? 1 : 0;
         }
       }
     }
@@ -703,13 +744,17 @@ public class CoordinatorPublisher extends PublisherImpl {
    * executed twice hands the same parts back twice, and the second time they are already known. Returns whether a
    * unit was created.
    */
-  private boolean createHandedBackUnit(JsonNode child, long delayMillis) {
+  private String childUnitId(JsonNode child) {
+    return child.path(CHILD_KEY).isTextual() ? connectorName + "/" + child.path(CHILD_KEY).asText() : null;
+  }
+
+  private boolean createHandedBackUnit(JsonNode child, long delayMillis, int inheritedThrottles) {
     if (!child.path(CHILD_KEY).isTextual() || !child.path(CHILD_PAYLOAD).isObject()) {
       log.warn("Ignoring a handed-back part with no key or payload: {}", child);
       return false;
     }
 
-    String unitId = connectorName + "/" + child.path(CHILD_KEY).asText();
+    String unitId = childUnitId(child);
     if (isKnown(unitId)) {
       return false;
     }
@@ -724,6 +769,9 @@ public class CoordinatorPublisher extends PublisherImpl {
     if (replaying) {
       outstandingUnits.put(unitId, unit);
     } else {
+      if (inheritedThrottles > 0) {
+        throttledFailures.put(unitId, inheritedThrottles);
+      }
       enqueue(unit, costOf(unitId, 0), delayMillis);
     }
     return true;

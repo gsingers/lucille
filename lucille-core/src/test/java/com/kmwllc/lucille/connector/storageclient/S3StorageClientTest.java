@@ -174,6 +174,41 @@ public class S3StorageClientTest {
   }
 
   @Test
+  public void testListingRefusedPartWayThroughIsRetriedWhole() throws Exception {
+    // the store serves the first page of the root's listing, then refuses the next, once
+    S3Client serving = mockClientWithPrefixes();
+    AtomicInteger rootListings = new AtomicInteger();
+    S3Client mockClient = mock(S3Client.class, RETURNS_DEEP_STUBS);
+    when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenAnswer(invocation -> {
+      ListObjectsV2Request request = invocation.getArgument(0);
+      ListObjectsV2Iterable whole = serving.listObjectsV2Paginator(request);
+      if (!request.prefix().isEmpty() || rootListings.incrementAndGet() > 1) {
+        return whole;
+      }
+      // the real paginator is lazy: the failure comes while the pages are being read, after the first was consumed
+      ListObjectsV2Iterable failing = mock(ListObjectsV2Iterable.class);
+      when(failing.stream()).thenAnswer(i -> Stream.concat(whole.stream(), Stream.generate(() -> {
+        throw S3Exception.builder().statusCode(503).message("unavailable").build();
+      })));
+      return failing;
+    });
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = TraversalBudget.unlimited();
+
+    clientWith(mockClient).traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(QUICK_RETRIES, URI.create("s3://bucket/"), "", true, budget));
+
+    // the root's object was published by the attempt that failed and again by the one that passed; nothing is lost,
+    // and the prefixes found by the failed attempt were not carried over to be listed twice
+    List<String> published = messenger.getDocsSentForProcessing().stream().map(doc -> doc.getString(FILE_PATH)).toList();
+    assertEquals(List.of("s3://bucket/root.txt", "s3://bucket/root.txt", "s3://bucket/a/file.txt", "s3://bucket/b/file.txt"), published);
+    assertEquals(2, rootListings.get());
+    assertEquals(3, budget.getDirectoriesListed());
+    assertEquals(1, budget.getRefusedCalls());
+    assertNull(budget.getSourceError());
+  }
+
+  @Test
   public void testRefusedListingIsRetriedWithoutABudgetToo() throws Exception {
     AtomicInteger calls = new AtomicInteger();
     TestMessenger messenger = new TestMessenger();
@@ -258,7 +293,12 @@ public class S3StorageClientTest {
     assertEquals(FailureClass.SOURCE_UNAVAILABLE, S3StorageClient.classify(S3Exception.builder().statusCode(503).build()));
     assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(S3Exception.builder().statusCode(403).build()));
     assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(NoSuchKeyException.builder().statusCode(404).build()));
-    assertEquals(FailureClass.SOURCE_UNAVAILABLE, S3StorageClient.classify(SdkClientException.create("connection reset")));
+    assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(S3Exception.builder().statusCode(501).build()));
+    // the SDK could not get an answer: only a failure on the wire is the store being unavailable
+    assertEquals(FailureClass.SOURCE_UNAVAILABLE, S3StorageClient.classify(
+        SdkClientException.create("Unable to execute HTTP request", new java.net.SocketException("Connection reset"))));
+    // a failure to sign or to find credentials would not pass if tried again
+    assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(SdkClientException.create("Unable to load credentials")));
   }
 
   // A bucket with one object and two prefixes at its root, and one object under each prefix.

@@ -379,6 +379,15 @@ public class PartitionedFileConnectorTest {
       again.close();
       assertEquals(List.of(b.toUri().toString()), new ArrayList<>(bContext.handedBack.keySet()));
       assertEquals(FailureClass.SOURCE_ERROR, bContext.errorClass);
+
+      // a unit for the files directly in b/ comes back as that, not as a unit for b/'s whole subtree
+      FileConnector files = new FileConnector(config);
+      RecordingUnitContext filesContext = new RecordingUnitContext();
+      files.executeUnit(unit(b.toUri() + "#files", WorkUnit.newPayload().put("path", b.toUri().toString()).put("recursive", false)),
+          new PublisherImpl(config, new TestMessenger(), "run1", "pipeline1"), filesContext);
+      files.close();
+      assertEquals(List.of(b.toUri() + "#files"), new ArrayList<>(filesContext.handedBack.keySet()));
+      assertFalse(filesContext.handedBack.get(b.toUri() + "#files").get("recursive").asBoolean());
     } finally {
       b.toFile().setReadable(true, true);
     }
