@@ -214,7 +214,8 @@ public class S3StorageClient extends BaseStorageClient {
         if (retry == 0) {
           firstFailureMillis = System.currentTimeMillis();
         }
-        if (budget != null) {
+        // only a refusal for load is a sign to slow down; access denied or not found is not
+        if (budget != null && failureClass.isOverload()) {
           budget.callRefused();
         }
 
@@ -264,7 +265,8 @@ public class S3StorageClient extends BaseStorageClient {
         if (retry == 0) {
           firstFailureMillis = System.currentTimeMillis();
         }
-        if (budget != null) {
+        // only a refusal for load is a sign to slow down; access denied or not found is not
+        if (budget != null && failureClass.isOverload()) {
           budget.callRefused();
         }
         long waitMillis = failureClass.isOverload() ? params.getRetryPolicy().nextWaitMillis(retry + 1, firstFailureMillis) : -1;

@@ -124,7 +124,7 @@ java \
   com.kmwllc.lucille.core.Crawler
 ```
 
-Workers and Indexers are started as above. See [Distributing the Crawl]({{< relref "docs/architecture/overview/distributed-crawl" >}}) for the configuration this needs and for how such a run recovers from failures.
+Workers and Indexers are started as above. See [Running a Distributed Crawl]({{< relref "docs/architecture/overview/distributed-crawl-operations" >}}) for the configuration this needs, and [Distributing the Crawl]({{< relref "docs/architecture/overview/distributed-crawl" >}}) for how such a run works and recovers from failures.
 
 ---
 

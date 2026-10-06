@@ -286,6 +286,21 @@ public class S3StorageClientTest {
   }
 
   @Test
+  public void testAnErrorThatIsNotOverloadIsNotCountedAsARefusal() throws Exception {
+    // access denied on every listing: the unit gives up at once, and nothing tells the run to slow down
+    AtomicInteger calls = new AtomicInteger();
+    TraversalBudget budget = TraversalBudget.unlimited();
+
+    clientWith(refusingClient(403, Integer.MAX_VALUE, calls)).traverse(
+        new PublisherImpl(ConfigFactory.empty(), new TestMessenger(), "run1", "pipeline1"),
+        new TraversalParams(QUICK_RETRIES, URI.create("s3://bucket/"), "", true, budget));
+
+    assertEquals(1, calls.get());
+    assertEquals(0, budget.getRefusedCalls());
+    assertEquals(FailureClass.SOURCE_ERROR, budget.getSourceError().failureClass());
+  }
+
+  @Test
   public void testClassification() {
     assertEquals(FailureClass.THROTTLED, S3StorageClient.classify(S3Exception.builder().statusCode(429).build()));
     assertEquals(FailureClass.THROTTLED, S3StorageClient.classify(S3Exception.builder().statusCode(400)
