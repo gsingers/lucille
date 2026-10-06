@@ -16,4 +16,13 @@ public interface WorkUnitSink {
    * @throws ConnectorException if the unit could not be dispatched, or the run has failed and planning should stop.
    */
   void emit(String unitKey, ObjectNode payload) throws ConnectorException;
+
+  /**
+   * As {@link #emit(String, ObjectNode)}, with a hint of how much the unit will cost to execute relative to the
+   * others, for a connector that knows. The Coordinator starts the units it expects to cost most first. A figure
+   * from an earlier run of the same unit, when the Coordinator has one, takes precedence over the hint.
+   */
+  default void emit(String unitKey, ObjectNode payload, long costHint) throws ConnectorException {
+    emit(unitKey, payload);
+  }
 }

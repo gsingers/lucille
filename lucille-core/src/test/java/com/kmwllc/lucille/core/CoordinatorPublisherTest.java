@@ -16,6 +16,8 @@ import com.typesafe.config.ConfigFactory;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import org.junit.Before;
@@ -43,10 +45,23 @@ public class CoordinatorPublisherTest {
     final List<WorkUnit> dispatched = new CopyOnWriteArrayList<>();
     final ArrayDeque<Event> log = new ArrayDeque<>();
 
+    final List<Integer> partitions = new CopyOnWriteArrayList<>();
+
     @Override
-    public void dispatchUnit(WorkUnit unit) {
+    public int numWorkPartitions() {
+      return 2;
+    }
+
+    @Override
+    public void dispatchUnit(WorkUnit unit, int partition) {
       sent.add("DISPATCH " + unit.unitId());
       dispatched.add(unit);
+      partitions.add(partition);
+    }
+
+    @Override
+    public Map<String, Long> readUnitCosts(String runId, String pipelineName) {
+      return Map.of();
     }
 
     @Override
@@ -93,7 +108,7 @@ public class CoordinatorPublisherTest {
   }
 
   private CoordinatorPublisher publisher(int epoch) throws Exception {
-    return new CoordinatorPublisher(CONFIG, messenger, RUN_ID, connector, "test", epoch);
+    return new CoordinatorPublisher(CONFIG, messenger, RUN_ID, connector, "test", epoch, Map.of());
   }
 
   // What a Crawler sends for an execution of a unit that handed parts back: the parts, then the completion.
@@ -184,7 +199,7 @@ public class CoordinatorPublisherTest {
   @Test
   public void testHandedBackPartsWaitWhileTooManyDocumentsArePending() throws Exception {
     Config config = ConfigFactory.parseString("publisher.maxPendingDocs: 1").withFallback(CONFIG);
-    CoordinatorPublisher publisher = new CoordinatorPublisher(config, messenger, RUN_ID, connector, "test", 1);
+    CoordinatorPublisher publisher = new CoordinatorPublisher(config, messenger, RUN_ID, connector, "test", 1, Map.of());
     publisher.getSink().emit("u0", WorkUnit.newPayload());
     publisher.handleEvent(docEvent("doc1", Event.Type.CREATE));
 
@@ -310,7 +325,7 @@ public class CoordinatorPublisherTest {
         publisher.outstandingUnitIds().stream().sorted().toList());
     assertTrue(messenger.sent.isEmpty());
 
-    // all three are dispatched under the new epoch, as far as there is room; crawl.maxOutstandingUnits is 2
+    // all three are dispatched under the new epoch, as far as there is room: two partitions
     publisher.redispatchOutstandingUnits();
     assertEquals(2, messenger.dispatched.size());
     messenger.dispatched.forEach(unit -> assertEquals(2, unit.epoch()));
@@ -499,29 +514,153 @@ public class CoordinatorPublisherTest {
   }
 
   @Test
-  public void testDispatchWaitsWhileTooManyUnitsAreOutstanding() throws Exception {
+  public void testOneUnitInFlightPerPartition() throws Exception {
     CoordinatorPublisher publisher = publisher(1);
     WorkUnitSink sink = publisher.getSink();
     sink.emit("u0", WorkUnit.newPayload());
     sink.emit("u1", WorkUnit.newPayload());
+    // the work topic has two partitions, so the third unit waits here rather than behind one of the others
+    sink.emit("u2", WorkUnit.newPayload());
 
-    // crawl.maxOutstandingUnits is 2, so the third unit has to wait
+    assertEquals(List.of("u0", "u1"), dispatchedKeys());
+    assertEquals(List.of(0, 1), messenger.partitions);
+    assertEquals(2, publisher.numPartitionsBusy());
+    assertEquals(3, publisher.numUnitsOutstanding());
+
+    // it goes to whichever partition comes free, and the planner was not held up by the wait
+    publisher.handleEvent(unitEvent("u1", 1, 1, Event.Type.UNIT_DONE));
+    assertEquals(List.of("u0", "u1", "u2"), dispatchedKeys());
+    assertEquals(List.of(0, 1, 1), messenger.partitions);
+
+    // a report on an earlier dispatch of a unit does not free the partition its current dispatch is on
+    publisher.handleEvent(unitEvent("u0", 1, 1, Event.Type.UNIT_FAILED));
+    assertEquals(List.of("u0", "u1", "u2", "u0"), dispatchedKeys());
+    assertEquals(List.of(0, 1, 1, 0), messenger.partitions);
+    publisher.handleEvent(unitEvent("u0", 1, 1, Event.Type.UNIT_DONE));
+    assertEquals(2, publisher.numPartitionsBusy());
+
+    publisher.handleEvent(unitEvent("u0", 2, 1, Event.Type.UNIT_DONE));
+    publisher.handleEvent(unitEvent("u2", 1, 1, Event.Type.UNIT_DONE));
+    assertEquals(0, publisher.numPartitionsBusy());
+    assertFalse(publisher.hasOutstandingWork());
+  }
+
+  @Test
+  public void testMostExpensiveUnitsAreDispatchedFirst() throws Exception {
+    // an earlier run measured some of the units
+    CoordinatorPublisher publisher = new CoordinatorPublisher(CONFIG, messenger, RUN_ID, connector, "test", 1,
+        Map.of("connector1/u1", 100L, "connector1/u2", 50L, "connector1/u0", 5L));
+    WorkUnitSink sink = publisher.getSink();
+
+    // both partitions busy, so the rest of the plan queues up
+    sink.emit("a", WorkUnit.newPayload());
+    sink.emit("b", WorkUnit.newPayload());
+    sink.emit("u0", WorkUnit.newPayload());
+    sink.emit("u1", WorkUnit.newPayload());
+    sink.emit("u2", WorkUnit.newPayload());
+    // the connector's own guess counts for a unit the earlier run did not measure
+    sink.emit("u3", WorkUnit.newPayload(), 70);
+    sink.emit("u4", WorkUnit.newPayload());
+    assertEquals(List.of("a", "b"), dispatchedKeys());
+
+    for (String done : List.of("a", "b", "u1", "u3", "u2")) {
+      publisher.handleEvent(unitEvent(done, 1, 1, Event.Type.UNIT_DONE));
+    }
+    // largest first; the unmeasured, unguessed unit last, after the one planned before it
+    assertEquals(List.of("a", "b", "u1", "u3", "u2", "u0", "u4"), dispatchedKeys());
+  }
+
+  @Test
+  public void testUnitDispatchedAgainKeepsItsCost() throws Exception {
+    CoordinatorPublisher publisher = new CoordinatorPublisher(CONFIG, messenger, RUN_ID, connector, "test", 1,
+        Map.of("connector1/u1", 100L));
+    WorkUnitSink sink = publisher.getSink();
+    sink.emit("u1", WorkUnit.newPayload());
+    sink.emit("a", WorkUnit.newPayload());
+    sink.emit("b", WorkUnit.newPayload());
+    sink.emit("c", WorkUnit.newPayload());
+
+    // u1 fails: it goes back to the queue, ahead of b and c, which are cheaper
+    publisher.handleEvent(unitEvent("u1", 1, 1, Event.Type.UNIT_FAILED));
+    assertEquals(List.of("u1", "a", "u1"), dispatchedKeys());
+    assertEquals(2, messenger.dispatched.get(2).attempt());
+  }
+
+  @Test
+  public void testPlanningIsNotDoneWhilePlannedUnitsAreQueued() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    WorkUnitSink sink = publisher.getSink();
+    for (String unitKey : List.of("u0", "u1", "u2", "u3")) {
+      sink.emit(unitKey, WorkUnit.newPayload());
+    }
+    assertEquals(List.of("u0", "u1"), dispatchedKeys());
+    assertEquals(2, publisher.numPlannedUnitsQueued());
+
+    // A planned unit is in the log only once dispatched. If planning were recorded as done now and the Coordinator
+    // died, its successor would not plan again, and u2 and u3 would never exist.
     Thread planner = new Thread(() -> {
       try {
-        sink.emit("u2", WorkUnit.newPayload());
-      } catch (ConnectorException e) {
+        publisher.logPlanningDone();
+      } catch (Exception e) {
         throw new RuntimeException(e);
       }
     });
     planner.start();
     planner.join(300);
     assertTrue(planner.isAlive());
-    assertEquals(2, messenger.dispatched.size());
+    assertFalse(publisher.isPlanningDone());
+    assertFalse(messenger.sent.contains("PLANNING_DONE connector1"));
 
     publisher.handleEvent(unitEvent("u0", 1, 1, Event.Type.UNIT_DONE));
+    publisher.handleEvent(unitEvent("u1", 1, 1, Event.Type.UNIT_DONE));
     planner.join(TimeUnit.SECONDS.toMillis(5));
     assertFalse(planner.isAlive());
-    assertEquals(3, messenger.dispatched.size());
+    assertTrue(publisher.isPlanningDone());
+    assertEquals(0, publisher.numPlannedUnitsQueued());
+    // and the record of it comes after every planned unit's
+    assertTrue(messenger.sent.indexOf("UNIT_CREATED connector1/u3") < messenger.sent.indexOf("PLANNING_DONE connector1"));
+
+    // a part handed back is not a planned unit: it is in the log as part of its parent's report
+    publisher.handleEvent(childrenEvent("u2", 1, 1, "x", "p1", "p2", "p3"));
+    publisher.handleEvent(doneEvent("u2", 1, 1, "x", 3));
+    assertEquals(0, publisher.numPlannedUnitsQueued());
+    assertTrue(publisher.numUnitsOutstanding() > 2);
+  }
+
+  @Test
+  public void testPlannedUnitHandedBackMeanwhileIsNotQueuedTwice() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    WorkUnitSink sink = publisher.getSink();
+    sink.emit("u0", WorkUnit.newPayload());
+    sink.emit("u1", WorkUnit.newPayload());
+
+    // a Crawler hands back a part that the planner then also comes to
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p1"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 1));
+    sink.emit("p1", WorkUnit.newPayload());
+
+    publisher.handleEvent(unitEvent("u1", 1, 1, Event.Type.UNIT_DONE));
+    publisher.handleEvent(unitEvent("p1", 1, 1, Event.Type.UNIT_DONE));
+    assertEquals(List.of("u0", "u1", "p1"), dispatchedKeys());
+    assertFalse(publisher.hasOutstandingWork());
+    assertEquals(0, publisher.numPartitionsBusy());
+  }
+
+  @Test
+  public void testDispatchFailureReportedByTheMessengerIsTheUnitsFailure() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // the messenger could not log or send the unit, and says so as a Crawler would
+    WorkUnit dispatched = messenger.dispatched.get(0);
+    publisher.handleEvent(dispatched.reportEvent(Event.Type.UNIT_FAILED, "coordinator", "could not be sent"));
+
+    assertNull(publisher.failureReason());
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+    assertEquals(2, messenger.dispatched.get(1).attempt());
+    // and it counts against the unit's attempts: crawl.maxAttempts is 2
+    publisher.handleEvent(messenger.dispatched.get(1).reportEvent(Event.Type.UNIT_FAILED, "coordinator", "could not be sent"));
+    assertTrue(publisher.failureReason().contains("could not be sent"));
   }
 
   @Test

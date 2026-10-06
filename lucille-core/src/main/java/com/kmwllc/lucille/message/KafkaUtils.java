@@ -359,6 +359,8 @@ public class KafkaUtils {
     consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
     consumerProps.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, maxPollRecords);
     consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+    // the topics this consumer reads are created explicitly; asking after one must not create it
+    consumerProps.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, "false");
     return new KafkaConsumer<>(consumerProps);
   }
 }

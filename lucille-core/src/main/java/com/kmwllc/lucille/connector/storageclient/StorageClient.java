@@ -47,6 +47,22 @@ public interface StorageClient {
   void traverse(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr) throws Exception;
 
   /**
+   * Traverses several paths, as {@link #traverse(Publisher, TraversalParams, FileConnectorStateManager)} would each
+   * in turn. A distributed crawl calls this for a work unit that covers several directories, which is what a unit
+   * is once directories have been handed back and regrouped. The default takes them one after another. A client
+   * that lists with a pool of threads should override it to walk the paths together: run one at a time, a unit of
+   * many small directories keeps one thread busy and the rest idle. The paths share whatever budget their params
+   * carry.
+   *
+   * @param params one TraversalParams per path, in the order to be traversed if they are taken in turn.
+   */
+  default void traverseAll(Publisher publisher, List<TraversalParams> params, FileConnectorStateManager stateMgr) throws Exception {
+    for (TraversalParams p : params) {
+      traverse(publisher, p, stateMgr);
+    }
+  }
+
+  /**
    * Lists the directories directly under the given path, leaving out any that <code>params</code> says to skip.
    * A traversal of the path that is not recursive, followed by a recursive traversal of each directory returned,
    * visits the same files as a recursive traversal of the path. Used to split a traversal into parts.

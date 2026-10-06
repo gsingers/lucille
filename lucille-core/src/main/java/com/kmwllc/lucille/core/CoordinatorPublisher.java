@@ -8,11 +8,12 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kmwllc.lucille.message.CoordinatorMessenger;
 import com.kmwllc.lucille.util.LogUtils;
 import com.typesafe.config.Config;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
@@ -29,6 +30,13 @@ import org.slf4j.LoggerFactory;
  * back, in which case its report names the parts and this class creates a unit for each. Either way this class is
  * the only thing that creates units, so it can tell when it is asked for one it already has.
  *
+ * Units are dispatched to the partitions of the work topic, one unit in flight per partition. A partition is read
+ * by one Crawler thread, which takes its units in order, so a second unit sent to a partition would wait behind the
+ * first however many other Crawlers were idle. Instead the units wait here, in a queue ordered by what they are
+ * expected to cost, and each goes to whichever partition is next to come free. That way the largest units start
+ * first, each on a Crawler of its own, and no unit waits behind a long one, provided there are at least as many
+ * Crawler threads as partitions. A thread that reads several partitions takes their units in turn.
+ *
  * Everything this class decides is written to the run's Event log before it takes effect, and everything it knows
  * is derived from that log. A Coordinator that replaces one that stopped can therefore rebuild the same state by
  * handling the logged Events again, which is what {@link #recover()} does.
@@ -42,9 +50,9 @@ public class CoordinatorPublisher extends PublisherImpl {
   private static final Set<String> HOOKS = Set.of(HOOK_PRE_EXECUTE, HOOK_PREPARE_RUN, HOOK_FINALIZE_RUN, HOOK_POST_EXECUTE);
 
   // fields of the message carried by a unit's Events
-  static final String ATTEMPT = "attempt";
-  static final String EPOCH = "epoch";
-  static final String CRAWLER = "crawler";
+  public static final String ATTEMPT = "attempt";
+  public static final String EPOCH = "epoch";
+  public static final String CRAWLER = "crawler";
   static final String EXECUTION = "execution";
   static final String CHILDREN = "children";
   static final String CHILD_KEY = "key";
@@ -53,7 +61,7 @@ public class CoordinatorPublisher extends PublisherImpl {
   static final String NUM_PUBLISHED = "numPublished";
   static final String SOURCE_CALLS = "sourceCalls";
   static final String DURATION_MS = "durationMs";
-  static final String ERROR = "error";
+  public static final String ERROR = "error";
 
   private static final int UNDISPATCHED_EPOCH = 0;
 
@@ -68,17 +76,42 @@ public class CoordinatorPublisher extends PublisherImpl {
   private final int maxOutstandingUnits;
   private final int maxAttempts;
 
+  // Planning may emit far more units than can be in flight. They wait here; past this many, the planner waits.
+  static final int MAX_QUEUED_UNITS = 100_000;
+
   // Units that have been dispatched and are not done, by unit ID. Holds the most recent dispatch of each.
   private final ConcurrentHashMap<String, WorkUnit> outstandingUnits = new ConcurrentHashMap<>();
+  // The partition each dispatched unit went to, and which partitions have a unit in flight. Guarded by dispatchLock.
+  private final Map<String, Integer> unitPartitions = new HashMap<>();
+  private final boolean[] partitionBusy;
+  // partitions in the order they are tried, and where in that order the last dispatch was
+  private final int[] partitionOrder;
+  private int partitionCursor = 0;
   private final Set<String> doneUnits = ConcurrentHashMap.newKeySet();
   private final Set<String> hooksDone = ConcurrentHashMap.newKeySet();
   private volatile boolean planningDone = false;
   private volatile String failure = null;
 
-  // Units that exist but have not been dispatched, because too much work is in flight. Only the thread that handles
-  // Events adds to or takes from the queue; queuedUnitIds is what other threads may read.
-  private final ArrayDeque<WorkUnit> queuedUnits = new ArrayDeque<>();
+  // Units that exist but have not been dispatched: the most expensive first, and among equals the first queued.
+  // Guarded by dispatchLock; queuedUnitIds is what other threads may read.
+  private final PriorityQueue<QueuedUnit> queuedUnits = new PriorityQueue<>(
+      Comparator.comparingLong(QueuedUnit::cost).reversed().thenComparingLong(QueuedUnit::sequence));
   private final Set<String> queuedUnitIds = ConcurrentHashMap.newKeySet();
+  // Of the queued units, those the planner emitted. Unlike handed-back units, which a parent's report names, a
+  // planned unit is in the log only once dispatched, so planning is not recorded as done while any is queued.
+  private final Set<String> queuedPlannedUnits = ConcurrentHashMap.newKeySet();
+  private long nextSequence = 0;
+  // What each unit cost in an earlier run of this config, by unit ID: the best guide to what it will cost now.
+  private final Map<String, Long> unitCosts;
+  // the cost each queued or outstanding unit was given, so that a unit dispatched again keeps its place
+  private final ConcurrentHashMap<String, Long> costOf = new ConcurrentHashMap<>();
+
+  // Dispatching is done by the thread that handles Events and by the planner, which must not interleave.
+  private final Object dispatchLock = new Object();
+
+  private record QueuedUnit(WorkUnit unit, long cost, long sequence) { }
+
+  private record Dispatch(WorkUnit unit, int partition) { }
 
   // What executions of outstanding units have handed back so far, by unit ID and then by execution. A unit that is
   // executed twice reports twice, and only the execution whose completion is accepted counts.
@@ -87,7 +120,7 @@ public class CoordinatorPublisher extends PublisherImpl {
   // True while handling Events that an earlier Coordinator already acted on. Nothing is dispatched then.
   private boolean replaying = false;
 
-  // Signalled whenever a unit completes, for a planner waiting to dispatch.
+  // Signalled whenever a unit completes, for a planner waiting for room in the queue.
   private final Object dispatchWindow = new Object();
 
   // When waitForCompletion() last went round its loop, or 0 when it is not running.
@@ -98,8 +131,11 @@ public class CoordinatorPublisher extends PublisherImpl {
   private final Counter unitsFailed;
   private final Counter unitsHandedBack;
 
+  /**
+   * @param unitCosts what the units cost in an earlier run, by unit ID, or empty. See crawl.costsFromRun.
+   */
   public CoordinatorPublisher(Config config, CoordinatorMessenger messenger, String runId, Connector connector,
-      String metricsPrefix, int epoch) throws Exception {
+      String metricsPrefix, int epoch, Map<String, Long> unitCosts) throws Exception {
     super(config, messenger, runId, connector.getPipelineName(), metricsPrefix, false);
     this.messenger = messenger;
     this.runId = runId;
@@ -111,6 +147,12 @@ public class CoordinatorPublisher extends PublisherImpl {
     CrawlConfig crawlConfig = new CrawlConfig(config);
     this.maxOutstandingUnits = crawlConfig.maxOutstandingUnits;
     this.maxAttempts = crawlConfig.maxAttempts;
+    if (messenger.numWorkPartitions() < 1) {
+      throw new IllegalStateException("The work topic has no partitions; nothing could be dispatched.");
+    }
+    this.partitionOrder = CrawlConfig.interleavedPartitionOrder(messenger.numWorkPartitions());
+    this.partitionBusy = new boolean[partitionOrder.length];
+    this.unitCosts = unitCosts;
 
     MetricRegistry metrics = SharedMetricRegistries.getOrCreate(LogUtils.METRICS_REG);
     this.unitsDispatched = metrics.counter(metricsPrefix + ".units.dispatched");
@@ -150,9 +192,11 @@ public class CoordinatorPublisher extends PublisherImpl {
    * the earlier dispatches, which carry an older epoch.
    */
   public void redispatchOutstandingUnits() {
-    for (WorkUnit unit : new ArrayList<>(outstandingUnits.values())) {
-      enqueue(unit.withEpoch(epoch).withAttempt(1));
-      outstandingUnits.remove(unit.unitId());
+    synchronized (dispatchLock) {
+      for (WorkUnit unit : new ArrayList<>(outstandingUnits.values())) {
+        outstandingUnits.remove(unit.unitId());
+        enqueue(unit.withEpoch(epoch).withAttempt(1), costOf(unit.unitId(), 0));
+      }
     }
     dispatchQueuedUnits();
   }
@@ -162,21 +206,40 @@ public class CoordinatorPublisher extends PublisherImpl {
    * from an earlier Coordinator's planning or from a Crawler handing it back, is ignored.
    */
   public WorkUnitSink getSink() {
-    return (unitKey, payload) -> {
-      String unitId = connectorName + "/" + unitKey;
-      if (isKnown(unitId)) {
-        return;
+    return new WorkUnitSink() {
+      @Override
+      public void emit(String unitKey, ObjectNode payload) throws ConnectorException {
+        emit(unitKey, payload, 0);
       }
 
-      try {
-        awaitDispatchWindow();
-        logAndDispatch(new WorkUnit(runId, connectorName, pipelineName, unitId, 1, epoch, configHash, payload));
-      } catch (ConnectorException e) {
-        throw e;
-      } catch (Exception e) {
-        throw new ConnectorException("Could not dispatch unit " + unitId, e);
+      @Override
+      public void emit(String unitKey, ObjectNode payload, long costHint) throws ConnectorException {
+        String unitId = connectorName + "/" + unitKey;
+        if (isKnown(unitId)) {
+          return;
+        }
+
+        awaitQueueRoom();
+        synchronized (dispatchLock) {
+          // looked at again under the lock: a Crawler may have handed the same unit back meanwhile
+          if (isKnown(unitId)) {
+            return;
+          }
+          enqueue(new WorkUnit(runId, connectorName, pipelineName, unitId, 1, epoch, configHash, payload),
+              costOf(unitId, costHint));
+          queuedPlannedUnits.add(unitId);
+        }
+        dispatchQueuedUnits();
+        if (failure != null) {
+          throw new ConnectorException("Planning stopped: " + failure);
+        }
       }
     };
+  }
+
+  // what an earlier run measured for the unit, or failing that what the connector guessed
+  private long costOf(String unitId, long hint) {
+    return unitCosts.getOrDefault(unitId, hint);
   }
 
   private boolean isKnown(String unitId) {
@@ -191,12 +254,18 @@ public class CoordinatorPublisher extends PublisherImpl {
   }
 
   /**
-   * Blocks the planner while too much work is in flight.
+   * Blocks the planner while the queue is full. Planning is otherwise not held back: a planned unit waits in the
+   * queue, a few hundred bytes each, until there is a Crawler to take it.
    */
-  private void awaitDispatchWindow() throws Exception {
+  private void awaitQueueRoom() throws ConnectorException {
     synchronized (dispatchWindow) {
-      while (failure == null && !dispatchWindowOpen()) {
-        dispatchWindow.wait(100);
+      while (failure == null && queuedUnitIds.size() >= MAX_QUEUED_UNITS) {
+        try {
+          dispatchWindow.wait(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new ConnectorException("Interrupted while planning.");
+        }
       }
     }
 
@@ -207,38 +276,121 @@ public class CoordinatorPublisher extends PublisherImpl {
 
   // The unit is logged before it is dispatched. If the Coordinator stops between the two, its successor finds the
   // unit outstanding and dispatches it. In the other order, a unit could be executing that no log knows of.
-  private void logAndDispatch(WorkUnit unit) throws Exception {
-    outstandingUnits.put(unit.unitId(), unit);
-    messenger.logAndDispatchUnit(new Event(unit.unitId(), runId, unit.toJson(), Event.Type.UNIT_CREATED), unit);
+  private void logAndDispatch(Dispatch dispatch) throws Exception {
+    WorkUnit unit = dispatch.unit();
+    messenger.logAndDispatchUnit(new Event(unit.unitId(), runId, unit.toJson(), Event.Type.UNIT_CREATED), unit,
+        dispatch.partition());
     unitsDispatched.inc();
+    log.debug("Dispatched unit {} (attempt {}, cost {}) to partition {}.", unit.unitId(), unit.attempt(),
+        costOf.getOrDefault(unit.unitId(), 0L), dispatch.partition());
   }
 
-  private void enqueue(WorkUnit unit) {
+  // Called with dispatchLock held.
+  private void enqueue(WorkUnit unit, long cost) {
     queuedUnitIds.add(unit.unitId());
-    queuedUnits.add(unit);
+    costOf.put(unit.unitId(), cost);
+    queuedUnits.add(new QueuedUnit(unit, cost, nextSequence++));
   }
 
   /**
-   * Dispatches queued units for as long as more work may be put in flight. The thread that handles Events must not
-   * wait for room, since it is the one that makes room, so what cannot be dispatched yet stays queued.
+   * Returns the next partition with no unit in flight, or -1 if every partition has one. Partitions are tried in
+   * an order that reaches different Crawlers in turn, carrying on from wherever the last dispatch went.
    */
-  private void dispatchQueuedUnits() {
-    while (failure == null && !queuedUnits.isEmpty() && dispatchWindowOpen()) {
-      WorkUnit unit = queuedUnits.poll();
-      try {
-        logAndDispatch(unit);
-      } catch (Exception e) {
-        failure = "Unit " + unit.unitId() + " could not be dispatched: " + e.getMessage();
+  private int nextFreePartition() {
+    for (int i = 0; i < partitionOrder.length; i++) {
+      int partition = partitionOrder[(partitionCursor + i) % partitionOrder.length];
+      if (!partitionBusy[partition]) {
+        partitionCursor = (partitionCursor + i + 1) % partitionOrder.length;
+        return partition;
       }
-      queuedUnitIds.remove(unit.unitId());
+    }
+    return -1;
+  }
+
+  // A unit that has been reported on, by a Crawler or by the messenger, no longer has a partition to itself.
+  private void freePartitionOf(String unitId) {
+    synchronized (dispatchLock) {
+      Integer partition = unitPartitions.remove(unitId);
+      if (partition != null) {
+        partitionBusy[partition] = false;
+      }
     }
   }
 
+  /**
+   * Dispatches queued units, most expensive first, for as long as there is a free partition and more work may be
+   * put in flight. The thread that handles Events must not wait for room, since it is the one that makes room, so
+   * what cannot be dispatched yet stays queued.
+   *
+   * The units and partitions are taken under the lock, and the sends are made without it: a send can block for as
+   * long as the producer's max.block.ms when Kafka is unreachable, and the thread that handles Events must not be
+   * kept from freeing partitions for that long, or the Coordinator looks stuck.
+   */
+  private void dispatchQueuedUnits() {
+    List<Dispatch> ready = new ArrayList<>();
+
+    synchronized (dispatchLock) {
+      while (failure == null && !queuedUnits.isEmpty() && dispatchWindowOpen()) {
+        int partition = nextFreePartition();
+        if (partition < 0) {
+          break;
+        }
+
+        WorkUnit unit = queuedUnits.poll().unit();
+        queuedUnitIds.remove(unit.unitId());
+        queuedPlannedUnits.remove(unit.unitId());
+        outstandingUnits.put(unit.unitId(), unit);
+        unitPartitions.put(unit.unitId(), partition);
+        partitionBusy[partition] = true;
+        ready.add(new Dispatch(unit, partition));
+      }
+    }
+
+    for (Dispatch dispatch : ready) {
+      try {
+        logAndDispatch(dispatch);
+      } catch (Exception e) {
+        failure = "Unit " + dispatch.unit().unitId() + " could not be dispatched: " + e.getMessage();
+      }
+    }
+  }
+
+  /** Returns how many partitions have a unit in flight. */
+  int numPartitionsBusy() {
+    synchronized (dispatchLock) {
+      int busy = 0;
+      for (boolean b : partitionBusy) {
+        busy += b ? 1 : 0;
+      }
+      return busy;
+    }
+  }
+
+  /**
+   * Records that planning has finished, once every planned unit is in the log. A planned unit is logged when it is
+   * dispatched, and dispatch waits for a partition, so this waits for the planned units still queued. If the
+   * Coordinator dies first, planning is not on record as done and its successor plans again; the units it comes to
+   * that are already known are ignored.
+   */
   public void logPlanningDone() throws Exception {
+    synchronized (dispatchWindow) {
+      while (failure == null && !queuedPlannedUnits.isEmpty()) {
+        dispatchWindow.wait(100);
+      }
+    }
+    if (failure != null) {
+      throw new ConnectorException("Planning stopped: " + failure);
+    }
+
     // every unit has to have been accepted before planning is recorded as done
     messenger.flush();
     planningDone = true;
     messenger.sendEvent(new Event(connectorName, runId, null, Event.Type.PLANNING_DONE));
+  }
+
+  /** Returns the number of planned units waiting to be dispatched. */
+  int numPlannedUnitsQueued() {
+    return queuedPlannedUnits.size();
   }
 
   public boolean isPlanningDone() {
@@ -416,18 +568,23 @@ public class CoordinatorPublisher extends PublisherImpl {
 
     doneUnits.add(unit.unitId());
     outstandingUnits.remove(unit.unitId());
+    costOf.remove(unit.unitId());
+    freePartitionOf(unit.unitId());
     unitsDone.inc();
 
     int numCreated = 0;
-    if (children != null) {
-      for (JsonNode child : children) {
-        numCreated += createHandedBackUnit(child) ? 1 : 0;
+    synchronized (dispatchLock) {
+      if (children != null) {
+        for (JsonNode child : children) {
+          numCreated += createHandedBackUnit(child) ? 1 : 0;
+        }
       }
     }
 
-    log.info("Unit {} done by {}: {} docs, {} source calls, {} ms, {} handed back. {} units outstanding.", unit.unitId(),
-        message.path(CRAWLER).asText(), message.path(NUM_PUBLISHED).asLong(), message.path(SOURCE_CALLS).asLong(),
-        message.path(DURATION_MS).asLong(), numCreated, numUnitsOutstanding());
+    log.info("Unit {} done by {}: {} docs, {} source calls, {} ms, {} handed back. {} units outstanding, {} queued.",
+        unit.unitId(), message.path(CRAWLER).asText(), message.path(NUM_PUBLISHED).asLong(),
+        message.path(SOURCE_CALLS).asLong(), message.path(DURATION_MS).asLong(), numCreated, outstandingUnits.size(),
+        queuedUnitIds.size());
 
     dispatchQueuedUnits();
     synchronized (dispatchWindow) {
@@ -461,7 +618,7 @@ public class CoordinatorPublisher extends PublisherImpl {
     if (replaying) {
       outstandingUnits.put(unitId, unit);
     } else {
-      enqueue(unit);
+      enqueue(unit, costOf(unitId, 0));
     }
     return true;
   }
@@ -474,7 +631,7 @@ public class CoordinatorPublisher extends PublisherImpl {
     }
   }
 
-  // Dispatches the unit again, or fails the connector if it has had all its attempts.
+  // Queues the unit to be dispatched again, or fails the connector if it has had all its attempts.
   private void failUnit(WorkUnit unit, String error) {
     handedBack.remove(unit.unitId());
 
@@ -485,6 +642,7 @@ public class CoordinatorPublisher extends PublisherImpl {
     }
 
     unitsFailed.inc();
+    freePartitionOf(unit.unitId());
 
     if (unit.attempt() >= maxAttempts) {
       failure = "Unit " + unit.unitId() + " failed after " + unit.attempt() + " attempts: " + error;
@@ -493,11 +651,11 @@ public class CoordinatorPublisher extends PublisherImpl {
 
     log.warn("Unit {} failed on attempt {} of {}; dispatching it again. Error: {}", unit.unitId(), unit.attempt(),
         maxAttempts, error);
-    try {
-      logAndDispatch(unit.withAttempt(unit.attempt() + 1));
-    } catch (Exception e) {
-      failure = "Unit " + unit.unitId() + " failed and could not be dispatched again: " + e.getMessage();
+    synchronized (dispatchLock) {
+      outstandingUnits.remove(unit.unitId());
+      enqueue(unit.withAttempt(unit.attempt() + 1), costOf.getOrDefault(unit.unitId(), 0L));
     }
+    dispatchQueuedUnits();
   }
 
   private ObjectNode parse(Event event) {

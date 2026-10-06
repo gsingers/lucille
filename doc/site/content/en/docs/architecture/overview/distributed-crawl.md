@@ -67,7 +67,13 @@ In every other mode, the Runner knows a Connector is finished because it publish
 
 A Connector is complete when planning has finished, no unit is outstanding or waiting to be dispatched, and no Document is pending.
 
-The Coordinator applies back-pressure by holding units back. It dispatches no more while `crawl.maxOutstandingUnits` units are incomplete, or while more Documents are pending than `publisher.maxPendingDocs` allows. Units that were handed back wait in the Coordinator's memory until there is room, a few hundred bytes each.
+### How units are dispatched
+
+The work topic's partitions are the Coordinator's picture of the Crawlers: each partition is read by one Crawler thread at a time, in order. The Coordinator keeps **one unit in flight per partition**. Every other unit, planned or handed back, waits in the Coordinator's queue, a few hundred bytes each, and goes to whichever partition next comes free. A unit therefore never waits behind a long unit on a Crawler that happens to have been dealt both, while other Crawlers are idle.
+
+The queue is ordered by **expected cost, largest first**, so the big units start at once, each on a Crawler of its own, and the small ones fill in behind them. Cost comes from an earlier run of the same config: `-costsFrom <runId>` (or `crawl.costsFromRun`) reads that run's unit reports, in which each Crawler said how many calls to the source its unit made. On a recrawl that is a near-exact model. A Connector can also give a cost hint with each unit it plans. Without either, units go in planning order.
+
+Dispatch also stops while `crawl.maxOutstandingUnits` units are incomplete, or while more Documents are pending than `publisher.maxPendingDocs` allows. Crawlers publish without limit, so holding units back is the back-pressure. Planning is not held back, except when the queue reaches 100,000 units.
 
 As each unit finishes, the Coordinator logs the Crawler that executed it, the Documents it published, the calls it made to the source (for `FileConnector`, directories listed), how long it took and how many parts it handed back.
 
@@ -147,6 +153,7 @@ With the Docker image, set `LUCILLE_ROLE=crawler` for a Crawler, and `LUCILLE_OP
 | `-force` | With `-resume`, take over even if the run's heartbeat is recent. |
 | `-resumeIfExists` | With `-distributedCrawl` and `-runId`, start the run if it is new and continue it if it is not. For a Runner that is restarted automatically. |
 | `-listRuns` | List the distributed crawls on record, with the state of each, and exit. |
+| `-costsFrom <id>` | With `-distributedCrawl` or `-resume`, dispatch the largest units first, as measured by this earlier run of the same config. |
 
 A minimal config adds a `partitioning` block to the Connector. The `crawl` block is optional; see `application-example.conf` for every setting and its default.
 
@@ -173,11 +180,11 @@ crawl {
 How fast a crawl goes is decided by how the work is cut into units, more than by how many Crawlers there are.
 
 - **Concurrency is the number of units in flight.** A unit is executed by one Crawler thread, which walks it alone. The number in flight is the smallest of: the total Crawler threads, `crawl.workTopicPartitions`, and `crawl.maxOutstandingUnits`.
+- **Start the largest units first.** `-costsFrom` with the previous run's ID. On a tree where a few subtrees hold most of the work, this alone can halve the run, because those subtrees no longer start late or share a Crawler.
 - **The largest unit is a floor.** No number of Crawlers finishes a run faster than its longest unit takes. Crawlers beyond `total work / largest unit` add nothing. `partitioning.maxDirectoriesPerUnit` puts a ceiling on the largest unit, whatever the shape of the tree.
 - **A unit's cost is the number of directories it lists, not the number of files it finds.** A deep tree of nearly empty directories is slower than a flat one holding ten times the files.
 - **Each unit costs several milliseconds of messaging on top of its own work** (about 8 ms against a broker on the same machine): two flushes, a report, a commit and the next poll. Units should take seconds or more. A `depth` that yields thousands of units of a few hundred files each makes a crawl slower than not distributing it at all.
-- **Units cannot be moved once dealt.** They are dealt to the work topic's partitions in turn, and a partition is read by one Crawler thread, one unit at a time. A Crawler that has finished its own units does not take those queued behind another's long unit. Keeping units small is what keeps that wait short.
-- **Set `crawl.workTopicPartitions` to the number of Crawler threads you intend to run,** or a small multiple of it. The topic is created with that many partitions the first time any component needs it; changing the setting later does not change an existing topic.
+- **Set `crawl.workTopicPartitions` to the number of Crawler threads you intend to run.** One unit is in flight per partition. With more partitions than threads, a thread reads several partitions and a unit can wait behind another on the same thread; with fewer, some threads have nothing to read. The topic is created with that many partitions the first time any component needs it; changing the setting later does not change an existing topic.
 - **Crawlers have their own consumer group.** `crawl.consumerGroupId` must differ from `kafka.consumerGroupId`, or every Crawler that joins or leaves would interrupt the Workers. A config in which they are the same is rejected.
 
 In practice, for a tree whose shape you do not know: use `depth: 0` or `1` with `maxDirectoriesPerUnit` set so that a unit takes seconds, not milliseconds. A few hundred directories is a reasonable start for a source where a listing takes around ten milliseconds. Then read the per-unit lines the Coordinator logs: if most units take well under a second, raise the limit; if a few take minutes, lower it or add `maxUnitSecs`.
@@ -194,6 +201,7 @@ A distributed crawl adds two shared topics, and what is written to them directs 
 - **A unit cannot widen what a Crawler reads.** A Crawler builds Connectors only from its own config file. The unit supplies a location. `FileConnector` accepts it only if it lies inside the paths that Connector was configured with, is not under a directory in `pathsToSkip`, and is not reached through a symbolic link. `SequenceConnector` accepts only a range inside the configured sequence.
 - **Units that do not belong to a live run are discarded.** That covers a unit whose run no Coordinator has announced, one that names a pipeline the Crawler does not have, and one whose run ID could not be part of a topic name. A Crawler reports nothing about such a unit, so it cannot be made to write to a topic of someone else's choosing.
 - **A run's event topic is as sensitive as it already was.** Anyone who can write to it can make a run finish early, in any mode, by reporting Documents or units as done. Because `FileConnector` expires files that no unit reported seeing, a run that is made to finish early can publish tombstones for files that were never reached. The event topic should be writable only by Lucille's own components.
+- **A unit that could not be dispatched is retried.** If writing its `UNIT_CREATED` Event or sending it to the work topic fails, the Coordinator treats that as the unit failing and dispatches it again, up to `crawl.maxAttempts`.
 - **A unit's failure message is shared.** When a unit fails, the exception's class and message, cut to 500 characters, are sent to the Coordinator and appear in its log and in the run summary. A Connector whose exceptions quote credentials would expose them there.
 - **Credentials stay in config.** Units, Events and control records carry no credentials. The config hash carried by each unit leaves out any setting whose name suggests a credential.
 - **Run IDs** given with `-runId` may contain letters, digits, `.`, `_` and `-`, up to 128 characters.

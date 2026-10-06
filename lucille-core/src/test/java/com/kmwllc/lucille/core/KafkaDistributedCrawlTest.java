@@ -187,7 +187,7 @@ public class KafkaDistributedCrawlTest {
     WorkUnit unit = new WorkUnit("run1", "connector1", pipeline, "connector1/u0", 1, 1, "hash", WorkUnit.newPayload());
     KafkaCoordinatorMessenger coordinator = new KafkaCoordinatorMessenger(config, false);
     coordinator.initialize("run1", pipeline);
-    coordinator.dispatchUnit(unit);
+    coordinator.dispatchUnit(unit, 0);
     coordinator.close();
 
     // one Crawler receives the unit and goes away without acknowledging it
@@ -398,6 +398,65 @@ public class KafkaDistributedCrawlTest {
     assertTrue(executedOnce("u0", "u1", "u2", "u4", "u5"));
     assertEquals(0, exits.get());
     ScriptedPartitionedConnector.hang.countDown();
+  }
+
+  @Test
+  public void testUnitIsDispatchedAfterTheWorkTopicHasBeenIdle() throws Exception {
+    // the producer forgets a topic it has not sent to for this long, and must fetch its metadata again at the next send
+    Config idle = ConfigFactory.parseString("""
+        kafka.producer { "metadata.max.idle.ms": 1000, "max.block.ms": 5000 }
+        """).withFallback(config);
+    // u0 hands a part back, but not until the other units are done and the work topic has been idle for a while.
+    // Four of them at least: the two Crawler threads share four partitions, and a unit dealt to the other partition
+    // of the thread that holds u0 waits behind it.
+    ScriptedPartitionedConnector.handBacks.put("u0", List.of("p1"));
+    ScriptedPartitionedConnector.gate = new CountDownLatch(1);
+    ScriptedPartitionedConnector.gatedUnits.add("u0");
+    new Thread(() -> {
+      try {
+        waitFor("the other units to be done", () -> ScriptedPartitionedConnector.completed.size() >= 4);
+        Thread.sleep(3000);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      } finally {
+        ScriptedPartitionedConnector.gate.countDown();
+      }
+    }).start();
+
+    RunResult result = Runner.run(idle, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
+
+    // the dispatch of p1 is the first send to the work topic after the gap
+    assertTrue(result.getStatus());
+    assertEquals(21, numSucceeded(result));
+    assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5", "p1"));
+  }
+
+  @Test
+  public void testUnitCostsAreReadFromAnEarlierRun() throws Exception {
+    String earlier = "run-" + pipeline;
+    ScriptedPartitionedConnector.handBacks.put("u0", List.of("p1"));
+    assertTrue(Runner.run(config, Runner.RunType.DISTRIBUTED_CRAWL, earlier).getStatus());
+
+    KafkaCoordinatorMessenger messenger = new KafkaCoordinatorMessenger(config, false);
+    try {
+      messenger.initialize("run-costs-" + pipeline, pipeline);
+      Map<String, Long> costs = messenger.readUnitCosts(earlier, pipeline);
+      // every unit reported one source call
+      assertEquals(7, costs.size());
+      assertEquals(Long.valueOf(1), costs.get("connector1/u3"));
+      assertEquals(Long.valueOf(1), costs.get("connector1/p1"));
+      assertTrue(messenger.readUnitCosts("no-such-run", pipeline).isEmpty());
+    } finally {
+      messenger.close();
+    }
+
+    // and a run that is told to use them completes as any other
+    ScriptedPartitionedConnector.reset();
+    ScriptedPartitionedConnector.handBacks.put("u0", List.of("p1"));
+    Config costed = ConfigFactory.parseString("crawl.costsFromRun: \"" + earlier + "\"").withFallback(config);
+    RunResult result = Runner.run(costed, Runner.RunType.DISTRIBUTED_CRAWL, "run-costed-" + pipeline);
+    assertTrue(result.getStatus());
+    assertEquals(21, numSucceeded(result));
   }
 
   @Test

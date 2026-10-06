@@ -10,6 +10,7 @@ import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -102,6 +103,9 @@ import com.typesafe.config.Config;
  *   Local paths and S3 only. Not set by default, so a unit walks all of its subtree.</li>
  *   <li>partitioning.maxUnitSecs (Int, Optional) : As maxDirectoriesPerUnit, but a limit on how long a unit goes on
  *   listing directories. Either limit, when reached, ends the unit's descent.</li>
+ *   <li>partitioning.handBackGroupSize (Int, Optional) : How many of the directories a unit hands back make one new
+ *   unit. Defaults to maxDirectoriesPerUnit, or 64 when that is not set. A storage client that walks a unit's
+ *   directories in parallel can take groups of hundreds or thousands.</li>
  *   <li>gcp.pathToServiceKey (String, Required) : Path to the Google Cloud service key JSON.</li>
  *   <li>gcp.maxNumOfPages (Int, Optional) : Maximum number of file references to hold in memory. Defaults to 100.</li>
  *   <li>s3.accessKeyId (String, Optional) : AWS access key ID (omit to use default credentials).</li>
@@ -188,7 +192,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
               .optionalBoolean("performDeletions", "enabled")
               .optionalNumber("pathLength", "runsBeforeExpiration").build(),
           SpecBuilder.parent("partitioning")
-              .optionalNumber("depth", "maxDirectoriesPerUnit", "maxUnitSecs").build(),
+              .optionalNumber("depth", "maxDirectoriesPerUnit", "maxUnitSecs", "handBackGroupSize").build(),
           GCP_PARENT_SPEC,
           AZURE_PARENT_SPEC,
           S3_PARENT_SPEC)
@@ -266,7 +270,8 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       if (partitioningDepth() < 0) {
         throw new IllegalArgumentException("partitioning.depth cannot be negative.");
       }
-      for (String limit : List.of("partitioning.maxDirectoriesPerUnit", "partitioning.maxUnitSecs")) {
+      for (String limit : List.of("partitioning.maxDirectoriesPerUnit", "partitioning.maxUnitSecs",
+          "partitioning.handBackGroupSize")) {
         if (config.hasPath(limit) && config.getInt(limit) < 1) {
           throw new IllegalArgumentException(limit + " must be at least 1.");
         }
@@ -349,9 +354,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       if (stateManager != null) {
         stateManager.openForPartialTraversal();
       }
-      for (URI unitPath : unitPaths) {
-        traverseWithinBudget(publisher, unitPath, recursive, budget);
-      }
+      traverseWithinBudget(publisher, unitPaths, recursive, budget);
     } catch (ClassNotFoundException | SQLException e) {
       throw new ConnectorException("Error connecting to the state database.", e);
     } finally {
@@ -364,15 +367,25 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     context.addSourceCalls(budget.getDirectoriesListed());
   }
 
-  private void traverseWithinBudget(Publisher publisher, URI path, boolean recursive, TraversalBudget budget)
+  // The paths of a unit are given to each storage client together, so that a client able to walk several at once
+  // can. Paths in different providers go to different clients, one after another.
+  private void traverseWithinBudget(Publisher publisher, List<URI> paths, boolean recursive, TraversalBudget budget)
       throws ConnectorException {
-    try {
-      TraversalParams params = new TraversalParams(config, path, getDocIdPrefix(), recursive, budget);
-      getStorageClient(path).traverse(publisher, params, stateManager);
-    } catch (ConnectorException e) {
-      throw e;
-    } catch (Exception e) {
-      throw new ConnectorException("Error occurred while traversing " + path + ".", e);
+    Map<StorageClient, List<TraversalParams>> byClient = new LinkedHashMap<>();
+    for (URI path : paths) {
+      byClient.computeIfAbsent(getStorageClient(path), client -> new ArrayList<>())
+          .add(new TraversalParams(config, path, getDocIdPrefix(), recursive, budget));
+    }
+
+    for (Map.Entry<StorageClient, List<TraversalParams>> entry : byClient.entrySet()) {
+      try {
+        entry.getKey().traverseAll(publisher, entry.getValue(), stateManager);
+      } catch (ConnectorException e) {
+        throw e;
+      } catch (Exception e) {
+        throw new ConnectorException("Error occurred while traversing " + entry.getValue().get(0).getURI()
+            + (entry.getValue().size() > 1 ? " and " + (entry.getValue().size() - 1) + " more" : "") + ".", e);
+      }
     }
   }
 
@@ -383,8 +396,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
    * each cost more to dispatch than to execute.
    */
   private void handBack(List<URI> directories, UnitContext context) {
-    int groupSize = config.hasPath("partitioning.maxDirectoriesPerUnit")
-        ? config.getInt("partitioning.maxDirectoriesPerUnit") : DEFAULT_HAND_BACK_GROUP_SIZE;
+    int groupSize = handBackGroupSize();
 
     for (int from = 0; from < directories.size(); from += groupSize) {
       List<URI> group = directories.subList(from, Math.min(from + groupSize, directories.size()));
@@ -403,6 +415,17 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       String key = first + "+" + (group.size() - 1) + "~" + DigestUtils.sha256Hex(paths.toString()).substring(0, 16);
       context.handBack(key, payload);
     }
+  }
+
+  // How many directories are handed back as one unit: as many as a unit may list, unless the config says otherwise.
+  // A client that walks a unit's directories in parallel does well with far larger groups than it lists in sequence.
+  private int handBackGroupSize() {
+    for (String setting : List.of("partitioning.handBackGroupSize", "partitioning.maxDirectoriesPerUnit")) {
+      if (config.hasPath(setting)) {
+        return config.getInt(setting);
+      }
+    }
+    return DEFAULT_HAND_BACK_GROUP_SIZE;
   }
 
   // The limits on one unit's traversal. With neither limit configured the budget only counts directories listed.

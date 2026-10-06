@@ -547,11 +547,11 @@ public class DistributedCrawlTest {
     // Units that did not come from a Coordinator: one naming a pipeline the Crawlers do not have, one whose run ID
     // could not be part of a topic name, and one for a run that no Coordinator has ever announced.
     messenger.dispatchUnit(new WorkUnit("ghost-run", "connector1", "pipeline1", "connector1/forged3", 1, 1, "hash",
-        WorkUnit.newPayload().put("unit", 0)));
+        WorkUnit.newPayload().put("unit", 0)), 0);
     messenger.dispatchUnit(new WorkUnit("run1", "connector1", "other_pipeline", "connector1/forged1", 1, 1, "hash",
-        WorkUnit.newPayload().put("unit", 0)));
+        WorkUnit.newPayload().put("unit", 0)), 0);
     messenger.dispatchUnit(new WorkUnit("run1/../x", "connector1", "pipeline1", "connector1/forged2", 1, 1, "hash",
-        WorkUnit.newPayload().put("unit", 0)));
+        WorkUnit.newPayload().put("unit", 0)), 0);
     RunResult result = run(config, "run1");
 
     // they are discarded without being executed, and the Crawlers carry on with the real units

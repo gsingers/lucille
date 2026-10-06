@@ -7,7 +7,9 @@ import com.kmwllc.lucille.message.RunControl;
 import com.kmwllc.lucille.util.ThreadNameUtils;
 import com.typesafe.config.Config;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -47,6 +49,7 @@ public class CrawlCoordinator {
   // true from when this Coordinator takes charge of the run until it announces the end of the run
   private volatile boolean runActive = false;
   private volatile CoordinatorPublisher currentPublisher;
+  private final Map<String, Map<String, Long>> unitCostsByPipeline = new HashMap<>();
   // what a Coordinator that finds itself stuck does after it stops sending heartbeats; replaced in tests
   private Runnable stuckAction = () -> System.exit(1);
 
@@ -343,7 +346,26 @@ public class CrawlCoordinator {
 
   private CoordinatorPublisher newPublisher(Connector connector) throws Exception {
     String metricsPrefix = runId + "." + connector.getName() + "." + connector.getPipelineName();
-    return new CoordinatorPublisher(config, messengerFactory.apply(resuming), runId, connector, metricsPrefix, epoch);
+    CoordinatorMessenger messenger = messengerFactory.apply(resuming);
+    return new CoordinatorPublisher(config, messenger, runId, connector, metricsPrefix, epoch,
+        unitCosts(messenger, connector.getPipelineName()));
+  }
+
+  // What the units cost in the run crawl.costsFromRun names, read once per pipeline. A run that cannot be read is
+  // a reason to dispatch in planning order, not to stop.
+  private Map<String, Long> unitCosts(CoordinatorMessenger messenger, String pipelineName) {
+    if (crawlConfig.costsFromRun == null) {
+      return Map.of();
+    }
+    return unitCostsByPipeline.computeIfAbsent(pipelineName, pipeline -> {
+      try {
+        return messenger.readUnitCosts(crawlConfig.costsFromRun, pipeline);
+      } catch (Exception e) {
+        log.warn("Could not read unit costs from run {}; units will be dispatched in planning order.",
+            crawlConfig.costsFromRun, e);
+        return Map.of();
+      }
+    });
   }
 
   private static void close(Object closeable, String description) {

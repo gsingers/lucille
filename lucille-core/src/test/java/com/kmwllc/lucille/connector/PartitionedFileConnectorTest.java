@@ -296,6 +296,28 @@ public class PartitionedFileConnectorTest {
   }
 
   @Test
+  public void testHandBackGroupSizeCanDifferFromTheBudget() throws Exception {
+    // one directory a unit, but handed back two to a unit: root lists root and hands back a/ and b/ together
+    Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 1, handBackGroupSize: 2 }");
+    FileConnector connector = new FileConnector(config);
+    RecordingUnitContext context = new RecordingUnitContext();
+    Map<String, ObjectNode> units = plan(config);
+    Map.Entry<String, ObjectNode> rootUnit = units.entrySet().iterator().next();
+
+    connector.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()),
+        new PublisherImpl(config, new TestMessenger(), "run1", "pipeline1"), context);
+    connector.close();
+
+    assertEquals(1, context.handedBack.size());
+    ObjectNode payload = context.handedBack.values().iterator().next();
+    assertEquals(2, payload.get("paths").size());
+    assertEquals(root.resolve("a").toUri().toString(), payload.get("paths").get(0).asText());
+    assertTrue(context.handedBack.keySet().iterator().next().startsWith(root.resolve("a").toUri() + "+1~"));
+
+    assertThrows(IllegalArgumentException.class, () -> new FileConnector(config("partitioning { handBackGroupSize: 0 }")));
+  }
+
+  @Test
   public void testUnitForSeveralDirectoriesIsHeldToTheConfiguredPaths() throws Exception {
     Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 2 }");
     FileConnector connector = new FileConnector(config);

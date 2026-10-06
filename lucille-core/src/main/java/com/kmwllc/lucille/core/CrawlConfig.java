@@ -34,13 +34,18 @@ import org.apache.kafka.clients.admin.NewTopic;
  *   <li>consumerGroupId (String, Optional) : Consumer group for Crawlers. Must differ from kafka.consumerGroupId. Defaults to "lucille_crawlers".</li>
  *   <li>threads (Int, Optional) : Units executed concurrently by one Crawler process. Defaults to 1.</li>
  *   <li>maxOutstandingUnits (Int, Optional) : The Coordinator dispatches no more units while this many are incomplete. Defaults to 64.</li>
- *   <li>maxAttempts (Int, Optional) : Times a unit is dispatched before its failure fails the connector. Defaults to 3.</li>
+ *   <li>maxAttempts (Int, Optional) : Times a unit is dispatched before its failure fails the connector. A dispatch that
+ *   fails on the Coordinator's side, because Kafka would not take the unit's Event or the unit, counts too. Defaults to 3.</li>
  *   <li>heartbeatSecs (Int, Optional) : Period of the Coordinator's heartbeat. Defaults to 10.</li>
  *   <li>orphanTimeoutSecs (Int, Optional) : Crawlers give up on a run whose heartbeat is older than this. A Coordinator
  *   whose own Event loop has been stuck for this long stops and exits. Defaults to 120.</li>
  *   <li>maxUnitSecs (Int, Optional) : A unit that has been executing for this long is reported as failed, so that it
  *   is dispatched again, and its Crawler thread is replaced. The thread itself cannot be stopped and is left behind.
  *   Not set by default, so a unit may take any length of time.</li>
+ *   <li>costsFromRun (String, Optional) : The ID of an earlier run of this config whose unit reports say what each unit
+ *   cost. The Coordinator dispatches the units it expects to cost most first, which keeps a few large units from
+ *   setting the length of the run. Not set by default; units are then dispatched in the order they are planned.
+ *   Also given on the command line as -costsFrom.</li>
  *   <li>exitOnTimeout (Boolean, Optional) : Whether a Crawler process exits after reporting a unit that passed
  *   maxUnitSecs, instead of replacing the thread. Exiting is the only way to free what a stuck thread holds, and
  *   suits a deployment that restarts Crawlers. Defaults to false.</li>
@@ -52,7 +57,8 @@ public final class CrawlConfig {
       .optionalString("workTopic", "controlTopic", "consumerGroupId")
       .optionalNumber("workTopicPartitions", "topicReplicationFactor", "threads", "maxOutstandingUnits", "maxAttempts",
           "heartbeatSecs", "orphanTimeoutSecs", "maxUnitSecs")
-      .optionalBoolean("exitOnTimeout").build();
+      .optionalBoolean("exitOnTimeout")
+      .optionalString("costsFromRun").build();
 
   // Config keys whose values are left out of the config hash, so that a hash published to Kafka cannot be used to
   // confirm a guess at a credential.
@@ -85,6 +91,8 @@ public final class CrawlConfig {
   // null when not configured, in which case a unit is never timed out
   public final Integer maxUnitSecs;
   public final boolean exitOnTimeout;
+  // null when not configured
+  public final String costsFromRun;
 
   public CrawlConfig(Config config) {
     this.workTopic = ConfigUtils.getOrDefault(config, "crawl.workTopic", "lucille_work");
@@ -100,6 +108,10 @@ public final class CrawlConfig {
     this.orphanTimeoutSecs = atLeastOne(config, "crawl.orphanTimeoutSecs", 120);
     this.maxUnitSecs = config.hasPath("crawl.maxUnitSecs") ? atLeastOne(config, "crawl.maxUnitSecs", 1) : null;
     this.exitOnTimeout = config.hasPath("crawl.exitOnTimeout") && config.getBoolean("crawl.exitOnTimeout");
+    this.costsFromRun = config.hasPath("crawl.costsFromRun") ? config.getString("crawl.costsFromRun") : null;
+    if (costsFromRun != null && !isValidRunId(costsFromRun)) {
+      throw new IllegalArgumentException("crawl.costsFromRun is not a valid run ID.");
+    }
 
     if (orphanTimeoutSecs <= heartbeatSecs) {
       throw new IllegalArgumentException("crawl.orphanTimeoutSecs must be greater than crawl.heartbeatSecs.");
@@ -162,6 +174,29 @@ public final class CrawlConfig {
     }
 
     return sha256(entries.toString());
+  }
+
+  /**
+   * Returns the partitions 0 to numPartitions - 1 in the order units should be dealt to them. Kafka gives each
+   * consumer of a topic a run of neighbouring partitions, so dealing to 0, 1, 2, ... would send every unit to one
+   * Crawler until its run of partitions was used up. This order visits partitions far apart from each other first
+   * (0, then half way, then the quarters, and so on), so that consecutive units reach different Crawlers however
+   * many of them share the topic.
+   */
+  public static int[] interleavedPartitionOrder(int numPartitions) {
+    int bits = 32 - Integer.numberOfLeadingZeros(Math.max(numPartitions - 1, 0));
+    int[] order = new int[numPartitions];
+    int next = 0;
+
+    // the numbers below the next power of two, each with its bits reversed, less any that are not partitions
+    for (int i = 0; i < (1 << bits); i++) {
+      int reversed = bits == 0 ? 0 : Integer.reverse(i) >>> (32 - bits);
+      if (reversed < numPartitions) {
+        order[next++] = reversed;
+      }
+    }
+
+    return order;
   }
 
   /**

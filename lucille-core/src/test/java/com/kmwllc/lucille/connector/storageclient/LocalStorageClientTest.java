@@ -646,6 +646,27 @@ public class LocalStorageClientTest {
     localStorageClient.shutdown();
   }
 
+  // A client that does not override the traversal of several paths gets them one after another, sharing a budget.
+  @Test
+  public void testTraverseSeveralPaths() throws Exception {
+    Config connectorConfig = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("excludes", List.of(".*\\.DS_Store$"))));
+    URI root = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault").toAbsolutePath().toUri();
+    URI subdir1 = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault/subdir1").toAbsolutePath().toUri();
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    localStorageClient.init();
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = new TraversalBudget(1, null);
+
+    localStorageClient.traverseAll(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"), List.of(
+        new TraversalParams(connectorConfig, subdir1, "", false, budget),
+        new TraversalParams(connectorConfig, root, "", false, budget)), null);
+
+    // subdir1 used up the budget, so root was handed back unlisted
+    assertEquals(4, messenger.getDocsSentForProcessing().size());
+    assertEquals(List.of(root), budget.getHandedBack());
+    localStorageClient.shutdown();
+  }
+
   @Test
   public void testListSubdirectories() throws Exception {
     LocalStorageClient localStorageClient = new LocalStorageClient();

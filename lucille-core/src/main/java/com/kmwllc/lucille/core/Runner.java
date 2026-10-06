@@ -13,6 +13,7 @@ import com.kmwllc.lucille.util.LogUtils;
 import com.kmwllc.lucille.util.ThreadNameUtils;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigValueFactory;
 import com.typesafe.config.ConfigRenderOptions;
 import com.typesafe.config.ConfigValue;
 import java.util.Map.Entry;
@@ -240,6 +241,8 @@ public class Runner {
             .desc("With -resume, continue the run even if its original Runner may still be alive").build())
         .addOption(Option.builder("resumeifexists").hasArg(false)
             .desc("With -distributedCrawl and -runId, continue the run if it was started before, else start it").build())
+        .addOption(Option.builder("costsfrom").hasArg(true).argName("id")
+            .desc("With -distributedCrawl: dispatch the largest units first, as measured by this earlier run. Sets crawl.costsFromRun.").build())
         .addOption(Option.builder("listruns").hasArg(false)
             .desc("List the distributed crawls on record and exit").build())
         .addOption(Option.builder("validate").hasArg(false)
@@ -280,6 +283,15 @@ public class Runner {
     if (cli.hasOption("listruns")) {
       listRuns(config);
       return;
+    }
+
+    if (cli.hasOption("costsfrom")) {
+      if (!cli.hasOption("distributedcrawl") && !cli.hasOption("resume")) {
+        printHelp(cliOptions, "-costsFrom requires -distributedCrawl or -resume");
+        SystemHelper.exit(1);
+        return;
+      }
+      config = config.withValue("crawl.costsFromRun", ConfigValueFactory.fromAnyRef(cli.getOptionValue("costsfrom")));
     }
 
     // A Runner that may be restarted has to be told its run ID: one it generated would be lost with it.

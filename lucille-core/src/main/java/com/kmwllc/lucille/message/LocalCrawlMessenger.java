@@ -21,12 +21,20 @@ import java.util.concurrent.TimeUnit;
  */
 public class LocalCrawlMessenger implements CoordinatorMessenger, CrawlerMessenger, RunControl {
 
+  private static final int DEFAULT_WORK_PARTITIONS = 16;
+  private final int numWorkPartitions;
+
   private final LocalMessenger delegate;
   private final BlockingQueue<WorkUnit> workUnits = new LinkedBlockingQueue<>();
   private final RunControlTracker tracker;
   private final Map<String, Status> latestControl = new ConcurrentHashMap<>();
 
   public LocalCrawlMessenger(LocalMessenger delegate, long orphanTimeoutMillis) {
+    this(delegate, orphanTimeoutMillis, DEFAULT_WORK_PARTITIONS);
+  }
+
+  public LocalCrawlMessenger(LocalMessenger delegate, long orphanTimeoutMillis, int numWorkPartitions) {
+    this.numWorkPartitions = numWorkPartitions;
     this.delegate = delegate;
     this.tracker = new RunControlTracker(orphanTimeoutMillis);
   }
@@ -56,7 +64,13 @@ public class LocalCrawlMessenger implements CoordinatorMessenger, CrawlerMesseng
   // CoordinatorMessenger
 
   @Override
-  public void dispatchUnit(WorkUnit unit) {
+  public int numWorkPartitions() {
+    // there is one queue, which every Crawler reads, so the number only decides how many units may be in flight
+    return numWorkPartitions;
+  }
+
+  @Override
+  public void dispatchUnit(WorkUnit unit, int partition) {
     workUnits.add(unit);
   }
 

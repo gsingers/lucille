@@ -46,6 +46,22 @@ public record WorkUnit(String runId, String connectorName, String pipelineName, 
     return unit;
   }
 
+  /**
+   * Returns an Event reporting on this dispatch of the unit, as a Crawler's report would: the message names the
+   * attempt and epoch, so that the Coordinator can tell the report is about this dispatch and not an earlier one.
+   *
+   * @param reporter who is reporting; a Crawler gives its name.
+   * @param error why the unit failed, or null for a UNIT_DONE.
+   */
+  public Event reportEvent(Event.Type type, String reporter, String error) {
+    ObjectNode message = CrawlConfig.newMessage().put(CoordinatorPublisher.ATTEMPT, attempt)
+        .put(CoordinatorPublisher.EPOCH, epoch).put(CoordinatorPublisher.CRAWLER, reporter);
+    if (error != null) {
+      message.put(CoordinatorPublisher.ERROR, error);
+    }
+    return new Event(unitId, runId, message.toString(), type);
+  }
+
   public static ObjectNode newPayload() {
     return MAPPER.createObjectNode();
   }

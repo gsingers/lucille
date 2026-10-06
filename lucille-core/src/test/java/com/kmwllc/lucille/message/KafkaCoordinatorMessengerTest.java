@@ -4,6 +4,17 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertNull;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.kmwllc.lucille.core.CrawlConfig;
+import com.kmwllc.lucille.core.Event;
+import com.kmwllc.lucille.core.WorkUnit;
+import java.time.Duration;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.errors.TimeoutException;
+import org.apache.kafka.common.serialization.StringSerializer;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.Mockito.mock;
@@ -56,10 +67,123 @@ public class KafkaCoordinatorMessengerTest {
   // A messenger that knows which topic it reads, as it would after the part of initialize() that needs a broker.
   private static KafkaCoordinatorMessenger messenger(boolean replay) throws Exception {
     KafkaCoordinatorMessenger messenger = new KafkaCoordinatorMessenger(CONFIG, replay);
-    Field eventTopicName = KafkaCoordinatorMessenger.class.getDeclaredField("eventTopicName");
-    eventTopicName.setAccessible(true);
-    eventTopicName.set(messenger, TOPIC);
+    setField(messenger, "eventTopicName", TOPIC);
     return messenger;
+  }
+
+  private static void setField(KafkaCoordinatorMessenger messenger, String name, Object value) throws Exception {
+    Field field = KafkaCoordinatorMessenger.class.getDeclaredField(name);
+    field.setAccessible(true);
+    field.set(messenger, value);
+  }
+
+  // A messenger whose sends complete only when the test says so, reading an event topic that has nothing in it.
+  private KafkaCoordinatorMessenger messengerWith(MockProducer<String, String> producer) throws Exception {
+    KafkaCoordinatorMessenger messenger = messenger(false);
+    setField(messenger, "stringProducer", producer);
+    setField(messenger, "documentProducer", new MockProducer<>(true, null, new StringSerializer(), new StringSerializer()));
+    when(consumer.partitionsFor(TOPIC)).thenReturn(ONE_PARTITION);
+    when(consumer.poll(any(Duration.class))).thenReturn(ConsumerRecords.empty());
+    messenger.assignEventConsumer(consumer, 10_000);
+    return messenger;
+  }
+
+  private static void waitForSends(MockProducer<String, String> producer, int count) throws Exception {
+    long deadline = System.currentTimeMillis() + 5000;
+    while (producer.history().size() < count && System.currentTimeMillis() < deadline) {
+      Thread.sleep(10);
+    }
+    assertEquals(count, producer.history().size());
+  }
+
+  private static Event unitFailed(Event event, WorkUnit unit) throws Exception {
+    assertEquals(Event.Type.UNIT_FAILED, event.getType());
+    assertEquals(unit.unitId(), event.getDocumentId());
+    ObjectNode message = CrawlConfig.parseMessage(event.getMessage());
+    assertEquals(unit.attempt(), message.get("attempt").asInt());
+    assertEquals(unit.epoch(), message.get("epoch").asInt());
+    return event;
+  }
+
+  @Test
+  public void testUnitIsSentOnceItsEventIsAccepted() throws Exception {
+    MockProducer<String, String> producer = new MockProducer<>(false, null, new StringSerializer(), new StringSerializer());
+    KafkaCoordinatorMessenger messenger = messengerWith(producer);
+    WorkUnit unit = new WorkUnit("run1", "c", "pipeline1", "c/u0", 2, 3, "hash", WorkUnit.newPayload());
+
+    messenger.logAndDispatchUnit(new Event(unit.unitId(), "run1", unit.toJson(), Event.Type.UNIT_CREATED), unit, 5);
+
+    // only the Event has been handed to the producer
+    waitForSends(producer, 1);
+    assertEquals(TOPIC, producer.history().get(0).topic());
+    Thread.sleep(100);
+    assertEquals(1, producer.history().size());
+
+    // once it is accepted, the unit follows, to the partition asked for
+    producer.completeNext();
+    waitForSends(producer, 2);
+    ProducerRecord<String, String> work = producer.history().get(1);
+    assertEquals("lucille_work", work.topic());
+    assertEquals(Integer.valueOf(5), work.partition());
+    assertEquals(unit.unitId(), work.key());
+    assertEquals(unit, WorkUnit.fromJson(work.value()));
+
+    producer.completeNext();
+    assertNull(messenger.pollEvent());
+    messenger.close();
+  }
+
+  @Test
+  public void testUnitWhoseSendFailsIsReportedAsFailed() throws Exception {
+    MockProducer<String, String> producer = new MockProducer<>(false, null, new StringSerializer(), new StringSerializer());
+    KafkaCoordinatorMessenger messenger = messengerWith(producer);
+    WorkUnit unit = new WorkUnit("run1", "c", "pipeline1", "c/u0", 1, 1, "hash", WorkUnit.newPayload());
+    Event created = new Event(unit.unitId(), "run1", unit.toJson(), Event.Type.UNIT_CREATED);
+
+    // the Event cannot be written: the unit is not sent, and its failure is reported ahead of anything from the topic
+    messenger.logAndDispatchUnit(created, unit, 0);
+    waitForSends(producer, 1);
+    producer.errorNext(new TimeoutException("broker away"));
+    Thread.sleep(100);
+    assertEquals(1, producer.history().size());
+    Event report = unitFailed(messenger.pollEvent(), unit);
+    assertTrue(report.getMessage().contains("UNIT_CREATED"));
+    assertNull(messenger.pollEvent());
+
+    // the Event is written but the unit cannot be sent: reported the same way, about the same dispatch
+    WorkUnit again = unit.withAttempt(2);
+    messenger.logAndDispatchUnit(new Event(again.unitId(), "run1", again.toJson(), Event.Type.UNIT_CREATED), again, 0);
+    waitForSends(producer, 2);
+    producer.completeNext();
+    waitForSends(producer, 3);
+    producer.errorNext(new TimeoutException("broker away again"));
+    Event second = unitFailed(messenger.pollEvent(), again);
+    assertTrue(second.getMessage().contains("work topic"));
+    assertNull(messenger.pollEvent());
+
+    // neither failure is the run's
+    messenger.flush();
+    messenger.close();
+  }
+
+  @Test
+  public void testFlushCompletesEventsAndThenUnits() throws Exception {
+    MockProducer<String, String> producer = new MockProducer<>(false, null, new StringSerializer(), new StringSerializer());
+    KafkaCoordinatorMessenger messenger = messengerWith(producer);
+
+    for (int i = 0; i < 3; i++) {
+      WorkUnit unit = new WorkUnit("run1", "c", "pipeline1", "c/u" + i, 1, 1, "hash", WorkUnit.newPayload());
+      messenger.logAndDispatchUnit(new Event(unit.unitId(), "run1", unit.toJson(), Event.Type.UNIT_CREATED), unit, i);
+    }
+
+    // the units are handed to the producer only as their Events complete, which flush() has to see through
+    messenger.flush();
+
+    assertEquals(6, producer.history().size());
+    assertEquals(3, producer.history().stream().filter(record -> record.topic().equals("lucille_work")).count());
+    assertTrue(producer.history().subList(0, 3).stream().allMatch(record -> record.topic().equals(TOPIC)));
+    assertNull(messenger.pollEvent());
+    messenger.close();
   }
 
   @Test
@@ -123,7 +247,7 @@ public class KafkaCoordinatorMessengerTest {
     // Kafka gives each consumer of a topic a run of neighbouring partitions. Units dealt to partitions 0, 1, 2, ...
     // would all go to the first consumer until its run was used up.
     for (int partitions : new int[] {1, 2, 3, 5, 8, 16, 24, 32}) {
-      int[] order = KafkaCoordinatorMessenger.interleavedPartitionOrder(partitions);
+      int[] order = CrawlConfig.interleavedPartitionOrder(partitions);
 
       // every partition is used, once
       assertEquals(partitions, order.length);
@@ -132,7 +256,7 @@ public class KafkaCoordinatorMessengerTest {
     }
 
     // 32 partitions shared by 2 consumers, as 0-15 and 16-31: five units reach both consumers, not one
-    int[] order = KafkaCoordinatorMessenger.interleavedPartitionOrder(32);
+    int[] order = CrawlConfig.interleavedPartitionOrder(32);
     assertEquals(2, Arrays.stream(order).limit(2).map(p -> p / 16).distinct().count());
     assertEquals(List.of(3L, 2L), List.of(
         Arrays.stream(order).limit(5).filter(p -> p < 16).count(),
@@ -146,7 +270,7 @@ public class KafkaCoordinatorMessengerTest {
     }
 
     // the same holds when the number of partitions is not a power of two
-    int[] twentyFour = KafkaCoordinatorMessenger.interleavedPartitionOrder(24);
+    int[] twentyFour = CrawlConfig.interleavedPartitionOrder(24);
     for (int consumers : new int[] {2, 3, 4}) {
       int blockSize = 24 / consumers;
       assertEquals("consumers: " + consumers, consumers,
