@@ -106,6 +106,7 @@ How fast a crawl goes depends on how the work is cut into units more than on how
 - **For a recrawl, pass `-costsFrom` with the previous run's ID.** The largest units then start first. This is mainly useful with unbounded or planned units: in a bounded run every unit's cost is capped by the limit, and a handed-back group's key includes a hash of the group, so its cost seldom carries over.
 - **A unit's cost is the directories it lists, not the files it finds.** A deep tree of nearly empty directories is slower than a flat one with ten times the files.
 - **A distributed crawl can exceed a source's rate limits by a factor of Crawlers × threads.** Retries and backoff keep that from failing the run; `maxSourceConcurrency` keeps it from happening.
+- **Add Crawlers until listings per second stop rising.** Past that point more Crawlers only add latency. Where the point lies depends on the source and everything in front of it, so measure it rather than assume it; then set `maxSourceConcurrency` near the requests in flight there.
 - **A source that lists fast, such as a local disk,** is often traversed faster by one Connector thread than by any number of Crawlers.
 
 ## Restarting a Coordinator automatically

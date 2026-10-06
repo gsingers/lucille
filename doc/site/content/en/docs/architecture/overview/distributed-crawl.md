@@ -296,9 +296,19 @@ Bounding spread the work and brought the floor down, but the run was much slower
 
 Bounded units were 18% faster. The unbounded run was held to the length of its largest subtree, and two of its Crawlers sat idle once their share was done; the bounded run kept all four busy, its 154 handed-back units ran in a median 0.4 s, and it kept twice as many requests in flight at the store. Both runs listed the same directories and published the same Documents.
 
-**Other runs.** Bounded units completed every run at 4, 8, 16 and 24 Crawlers on the same tree, with `partitioning.maxUnitSecs: 30`, with no unit failed or dispatched again and every directory listed once. In a second like-for-like pair at four Crawlers, on another day, bounded units again finished first: 251 s against 270 s.
+**Adding Crawlers.** On another day, the same tree with bounded units (`partitioning.maxUnitSecs: 30`), 200 listing threads per Crawler and `crawl.maxSourceConcurrency: 4800`:
 
-Under heavy load the longest units ran for up to three minutes against the 30-second limit, for the reason given [above](#bounded-cut-as-the-tree-is-discovered): the limit stops a unit starting new listings, not the listings already in flight.
+| Crawlers | Listing threads | Units | Traversal | Listings/s | Listing latency, client | Requests in flight at the store (median) |
+|---|---|---|---|---|---|---|
+| 4 | 800 | unbounded | 270 s | 2,556 | 150 ms | 744 |
+| 4 | 800 | bounded | 251 s | 2,749 | 160 ms | 786 |
+| 8 | 1,600 | bounded | 158 s | 4,367 | 190 ms | 1,539 |
+| 16 | 3,200 | bounded | 218 s | 3,165 | 600 ms | 2,710 |
+| 24 | 4,800 | bounded | 217 s | 3,180 | 720 ms | 3,738 |
+
+Every run listed every directory once and published the same Documents, with no request throttled and no unit failed or dispatched again. Doubling from four Crawlers to eight cut the traversal from 251 s to 158 s. Beyond eight, listing latency rose about fourfold and throughput fell back: the limit there was upstream of the crawl, in that environment, and where it lies will differ from one deployment to another. The crawl itself behaved the same at every size; the way to find the useful number of Crawlers for a source is to add them until listings per second stop rising. The four-Crawler pair is a second like-for-like comparison, and again went to bounded units: 251 s against 270 s.
+
+At 16 and 24 Crawlers, with listings slow, the longest units ran for up to three minutes against the 30-second limit, for the reason given [above](#bounded-cut-as-the-tree-is-discovered): the limit stops a unit starting new listings, not the listings already in flight.
 
 For unbounded units, the order matters as much as the size: largest-first dispatch from an earlier run's costs alone took the unbounded run from 345 s to 277 s.
 
