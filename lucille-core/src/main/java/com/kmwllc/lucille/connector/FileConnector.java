@@ -39,6 +39,7 @@ import com.kmwllc.lucille.connector.storageclient.TraversalBudget;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams;
 import com.kmwllc.lucille.connector.storageclient.TraversalParams.PublishMode;
 import com.kmwllc.lucille.core.ConnectorException;
+import com.kmwllc.lucille.core.FailureClass;
 import com.kmwllc.lucille.core.PartitionableConnector;
 import com.kmwllc.lucille.core.Publisher;
 import com.kmwllc.lucille.core.UnitContext;
@@ -47,6 +48,7 @@ import com.kmwllc.lucille.core.WorkUnitSink;
 import com.kmwllc.lucille.core.spec.Spec;
 import com.kmwllc.lucille.core.spec.SpecBuilder;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
 
 /**
  * Traverses local and cloud storage (S3, GCP, Azure) from one or more roots and publishes a Document for each file encountered.
@@ -104,9 +106,12 @@ import com.typesafe.config.Config;
  *   Local paths and S3 only. Not set by default, so a unit walks all of its subtree.</li>
  *   <li>partitioning.maxUnitSecs (Int, Optional) : As maxDirectoriesPerUnit, but a limit on how long a unit goes on
  *   listing directories. Either limit, when reached, ends the unit's descent.</li>
- *   <li>sourceRetrySecs (Int, Optional) : How long, in all, to go on retrying a listing that the source refused for
+ *   <li>sourceRetrySecs (Int, Optional) : How long, in all, to go on retrying a call that the source refused for
  *   rate (HTTP 429) or could not answer (5xx, connection failures), with exponential backoff. Defaults to 180. In a
- *   distributed crawl, a listing given up on after this long ends the unit, which hands back what it has not listed.</li>
+ *   distributed crawl, a listing given up on after this long ends the unit, which hands back what it has not listed.
+ *   On S3 this covers every call (listing, fetching, moving), a listing resumes from the page that failed, and the
+ *   SDK's own retries are off unless this is 0. A listing that gets a page through starts its time again, so a long
+ *   listing that fails now and then is not given up on.</li>
  *   <li>sourceRetryCapSecs (Int, Optional) : The longest single wait between those retries. Defaults to 20.</li>
  *   <li>partitioning.handBackGroupSize (Int, Optional) : How many of the directories a unit hands back make one new
  *   unit. Defaults to maxDirectoriesPerUnit, or 64 when that is not set. A storage client that walks a unit's
@@ -239,7 +244,9 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
             ? new FileConnectorStateManager(config.getConfig("state"), getName())
             : null;
 
-    this.storageClientMap = StorageClient.createClients(config);
+    // FileConnector retries refused calls by default, where other users of storage clients keep the SDK's retries
+    this.storageClientMap = StorageClient.createClients(config.withFallback(ConfigFactory.parseMap(
+        Map.of(SourceRetryPolicy.RETRY_SECS, SourceRetryPolicy.DEFAULT_RETRY_SECS))));
 
 
     // incremental mode requires state tracking in order to function correctly
@@ -355,8 +362,10 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     executedUnit = true;
 
     initializeStorageClients();
-    // one budget for the whole unit: once it is used up, the directories not yet reached are handed back unlisted
-    TraversalBudget budget = newUnitBudget(context);
+    // one budget for the whole unit: once it is used up, the directories not yet reached are handed back unlisted,
+    // a group at a time as the groups fill
+    HandBacks handBacks = new HandBacks(unitPaths, recursive, handBackGroupSize(), context);
+    TraversalBudget budget = newUnitBudget(context, handBacks);
 
     try {
       if (stateManager != null) {
@@ -371,11 +380,8 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       }
     }
 
-    handBack(budget.getHandedBack(), unitPaths, recursive, context);
-    // listings and refusals went to the context as they happened; what ended the unit early goes now
-    if (budget.getSourceError() != null) {
-      context.recordSourceError(budget.getSourceError().failureClass(), budget.getSourceError().cause());
-    }
+    // listings, refusals, a failure of the source and the full groups went to the context as they happened
+    handBacks.finish();
   }
 
   // The paths of a unit are given to each storage client together, so that a client able to walk several at once
@@ -405,12 +411,43 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
    * of as many directories as a unit may list. One unit for each directory would be simpler, but what a unit leaves
    * over is mostly small: the siblings of the directories it was in when it stopped. Units of one small directory
    * each cost more to dispatch than to execute.
+   *
+   * Each group goes to the context as soon as it is full, so that the Crawler can have it dispatched while the unit
+   * is still executing; the last, partial group when the unit ends. The groups are the ones handing every directory
+   * back at the end would make, so the same directories handed back in the same order get the same keys.
    */
-  private void handBack(List<URI> directories, List<URI> unitPaths, boolean recursive, UnitContext context) {
-    int groupSize = handBackGroupSize();
+  static final class HandBacks {
 
-    for (int from = 0; from < directories.size(); from += groupSize) {
-      List<URI> group = directories.subList(from, Math.min(from + groupSize, directories.size()));
+    private final List<URI> unitPaths;
+    private final boolean recursive;
+    private final int groupSize;
+    private final UnitContext context;
+    private final List<URI> directories = new ArrayList<>();
+    private int handedBackUpTo = 0;
+
+    HandBacks(List<URI> unitPaths, boolean recursive, int groupSize, UnitContext context) {
+      this.unitPaths = unitPaths;
+      this.recursive = recursive;
+      this.groupSize = groupSize;
+      this.context = context;
+    }
+
+    synchronized void add(URI directory) {
+      directories.add(directory);
+      if (directories.size() - handedBackUpTo >= groupSize) {
+        handBackGroup(directories.subList(handedBackUpTo, handedBackUpTo + groupSize));
+        handedBackUpTo += groupSize;
+      }
+    }
+
+    synchronized void finish() {
+      for (int from = handedBackUpTo; from < directories.size(); from += groupSize) {
+        handBackGroup(directories.subList(from, Math.min(from + groupSize, directories.size())));
+      }
+      handedBackUpTo = directories.size();
+    }
+
+    private void handBackGroup(List<URI> group) {
       String first = group.get(0).toString();
 
       // A directory found beneath the unit's own is walked whole when it is handed back. One of the unit's own
@@ -422,7 +459,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       // a single directory is described as the planner would describe it, and so is the same unit as the planner's
       if (group.size() == 1) {
         context.handBack(first + keySuffix, WorkUnit.newPayload().put(UNIT_PATH, first).put(UNIT_RECURSIVE, recursiveGroup));
-        continue;
+        return;
       }
 
       ObjectNode payload = WorkUnit.newPayload().put(UNIT_RECURSIVE, recursiveGroup);
@@ -446,7 +483,7 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
   }
 
   // The limits on one unit's traversal. With neither limit configured the budget only counts directories listed.
-  private TraversalBudget newUnitBudget(UnitContext context) {
+  private TraversalBudget newUnitBudget(UnitContext context, HandBacks handBacks) {
     Integer maxDirectories = config.hasPath("partitioning.maxDirectoriesPerUnit")
         ? config.getInt("partitioning.maxDirectoriesPerUnit") : null;
     Long maxMillis = config.hasPath("partitioning.maxUnitSecs")
@@ -461,8 +498,24 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       }
 
       @Override
-      public void refused() {
-        context.addRefusedCalls(1);
+      public void refused(FailureClass failureClass) {
+        context.addRefusedCalls(1, failureClass);
+      }
+
+      @Override
+      public void requested() {
+        context.addRequests(1);
+      }
+
+      // before the directory the source failed on is handed back, so that the Crawler holds that back
+      @Override
+      public void sourceError(TraversalBudget.SourceError error) {
+        context.recordSourceError(error.failureClass(), error.cause());
+      }
+
+      @Override
+      public void handedBack(URI directory) {
+        handBacks.add(directory);
       }
     });
     budget.setMaxConcurrency(context::maxSourceConcurrency);

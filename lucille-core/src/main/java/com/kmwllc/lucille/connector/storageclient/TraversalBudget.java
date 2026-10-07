@@ -31,16 +31,24 @@ public class TraversalBudget {
   // how many calls the unit may have in flight, by the run's latest word; null when nothing bounds them
   private volatile Supplier<Integer> maxConcurrency = () -> null;
 
-  /** Hears of the traversal's listings and refusals as they happen. */
+  /** Hears of the traversal's listings, refusals, failure and hand-backs as they happen. */
   public interface Listener {
     Listener NONE = new Listener() { };
 
     default void listed() { }
 
-    default void refused() { }
+    default void refused(FailureClass failureClass) { }
+
+    default void requested() { }
+
+    default void sourceError(SourceError error) { }
+
+    default void handedBack(URI directory) { }
   }
   private final AtomicLong directoriesListed = new AtomicLong();
   private final AtomicLong refusedCalls = new AtomicLong();
+  private final AtomicLong throttledCalls = new AtomicLong();
+  private final AtomicLong requests = new AtomicLong();
   private final List<URI> handedBack = Collections.synchronizedList(new ArrayList<>());
   // set once the source has failed for good on some directory; nothing more is listed after that
   private volatile SourceError sourceError;
@@ -96,16 +104,46 @@ public class TraversalBudget {
    */
   public void handBack(URI directory) {
     handedBack.add(directory);
+    listener.handedBack(directory);
   }
 
   public long getDirectoriesListed() {
     return directoriesListed.get();
   }
 
-  /** Records a call that the source refused or could not answer, and that was or will be tried again. */
-  public void callRefused() {
+  /**
+   * Records a call that the source refused or could not answer, and that was or will be tried again. The class
+   * matters to the run: a throttle slows it down at once, a call the source could not answer only when many do.
+   */
+  public void callRefused(FailureClass failureClass) {
     refusedCalls.incrementAndGet();
-    listener.refused();
+    if (failureClass == FailureClass.THROTTLED) {
+      throttledCalls.incrementAndGet();
+    }
+    listener.refused(failureClass);
+  }
+
+  /** Records a refused call whose class is not known, as a throttle, since that is the safe thing to take it for. */
+  public void callRefused() {
+    callRefused(FailureClass.THROTTLED);
+  }
+
+  /** Returns how many of the refused calls the source throttled. */
+  public long getThrottledCalls() {
+    return throttledCalls.get();
+  }
+
+  /**
+   * Records a request made to the source, whatever came of it: each page of a listing, each fetch, each failed
+   * attempt. Refusals are set against these, so that a few among many are not taken for overload.
+   */
+  public void requestMade() {
+    requests.incrementAndGet();
+    listener.requested();
+  }
+
+  public long getRequests() {
+    return requests.get();
   }
 
   public void setListener(Listener listener) {
@@ -136,7 +174,9 @@ public class TraversalBudget {
    */
   public void sourceError(FailureClass failureClass, Throwable cause) {
     Throwable root = FailureClass.rootCause(cause);
-    sourceError = new SourceError(failureClass, root.getClass().getSimpleName() + ": " + root.getMessage());
+    SourceError error = new SourceError(failureClass, root.getClass().getSimpleName() + ": " + root.getMessage());
+    sourceError = error;
+    listener.sourceError(error);
   }
 
   /** Takes back the count of a directory that mayList() allowed but that could not be listed after all. */

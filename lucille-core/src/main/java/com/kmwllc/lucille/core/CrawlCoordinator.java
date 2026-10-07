@@ -52,9 +52,10 @@ public class CrawlCoordinator {
   private final Map<String, Map<String, Long>> unitCostsByPipeline = new HashMap<>();
   // null unless crawl.maxSourceConcurrency is set
   private final SourceConcurrencyController sourceConcurrency;
-  // refusals counted at the last heartbeat, over every connector so far; the publisher's own count restarts per connector
-  private long refusedAtLastHeartbeat = 0;
-  private long refusedBeforeCurrentPublisher = 0;
+  // calls, refusals and throttles counted at the last heartbeat, over every connector so far; the publisher's own
+  // counts restart per connector
+  private long[] callsAtLastHeartbeat = new long[4];
+  private final long[] callsBeforeCurrentPublisher = new long[4];
   private final Object refusedLock = new Object();
   // what a Coordinator that finds itself stuck does after it stops sending heartbeats; replaced in tests
   private Runnable stuckAction = () -> System.exit(1);
@@ -86,7 +87,7 @@ public class CrawlCoordinator {
     this.sourceConcurrency = crawlConfig.maxSourceConcurrency == null ? null : new SourceConcurrencyController(
         crawlConfig.maxSourceConcurrency, crawlConfig.initialSourceConcurrency, crawlConfig.sourceConcurrencyStep,
         // down to one call at a time: units in flight follow the figure, so one call is one unit
-        1, TimeUnit.SECONDS.toMillis(crawlConfig.sourceConcurrencyHoldSecs));
+        1, TimeUnit.SECONDS.toMillis(crawlConfig.sourceConcurrencyHoldSecs), crawlConfig.sourceUnavailableRate);
   }
 
   private enum Mode { START, RESUME, START_OR_RESUME }
@@ -249,27 +250,40 @@ public class CrawlCoordinator {
   }
 
   /**
-   * Once per heartbeat: the calls Crawlers reported as refused since the last heartbeat decide whether the run's
-   * source concurrency goes up or down.
+   * Once per heartbeat: the calls Crawlers reported since the last heartbeat, and how many of them the source
+   * throttled or could not answer, decide whether the run's source concurrency goes up or down.
    */
   private void adjustSourceConcurrency() {
     if (sourceConcurrency == null) {
       return;
     }
     CoordinatorPublisher publisher;
-    long refusedNow;
+    long[] now = new long[4];
     synchronized (refusedLock) {
       publisher = currentPublisher;
-      refusedNow = refusedBeforeCurrentPublisher + (publisher == null ? 0 : publisher.numCallsRefused());
+      long[] current = publisher == null ? new long[4] : callTotals(publisher);
+      for (int i = 0; i < now.length; i++) {
+        now[i] = callsBeforeCurrentPublisher[i] + current[i];
+      }
     }
+    long[] before = callsAtLastHeartbeat;
+    callsAtLastHeartbeat = now;
     // only while units are running: an interval with no calls says nothing about the source, and must not raise it
     if (publisher == null || publisher.numPartitionsBusy() == 0) {
-      refusedAtLastHeartbeat = refusedNow;
       return;
     }
-    sourceConcurrency.adjust(Math.max(0, refusedNow - refusedAtLastHeartbeat));
-    refusedAtLastHeartbeat = refusedNow;
+    // refusals are set against every request where the connector counts them, and against its source calls if not
+    long calls = Math.max(Math.max(0, now[0] - before[0]), Math.max(0, now[3] - before[3]));
+    long refused = Math.max(0, now[1] - before[1]);
+    long throttled = Math.min(refused, Math.max(0, now[2] - before[2]));
+    sourceConcurrency.adjust(new SourceConcurrencyController.Interval(calls, throttled, refused - throttled));
     publisher.setMaxUnitsInFlight(sourceConcurrency.unitsInFlight(publisher.numPartitions()));
+  }
+
+  // what the publisher has counted: source calls, calls refused, of those calls throttled, and requests
+  private static long[] callTotals(CoordinatorPublisher publisher) {
+    return new long[] {publisher.numSourceCalls(), publisher.numCallsRefused(), publisher.numCallsThrottled(),
+        publisher.numRequests()};
   }
 
   // Each unit's share of the run's source concurrency: the run's figure over the units that can be in flight.
@@ -395,7 +409,10 @@ public class CrawlCoordinator {
       // the refusals this connector's publisher counted carry over to the run's running total
       synchronized (refusedLock) {
         if (publisher != null) {
-          refusedBeforeCurrentPublisher += publisher.numCallsRefused();
+          long[] counted = callTotals(publisher);
+          for (int i = 0; i < counted.length; i++) {
+            callsBeforeCurrentPublisher[i] += counted[i];
+          }
         }
         currentPublisher = null;
       }
@@ -494,10 +511,10 @@ public class CrawlCoordinator {
     publisher.logHookDone(CoordinatorPublisher.HOOK_POST_EXECUTE);
 
     double durationSecs = stopWatch.getTime(TimeUnit.MILLISECONDS) / 1000.0;
-    log.info(String.format("Connector %s feeding to pipeline %s complete: %d units, %d calls refused by the source, "
-        + "%d units dispatched again after the source refused them. Time: %.2f secs.", connector.getName(),
-        connector.getPipelineName(), publisher.numUnitsDone(), publisher.numCallsRefused(), publisher.numUnitsThrottled(),
-        durationSecs));
+    log.info(String.format("Connector %s feeding to pipeline %s complete: %d units, %d calls to the source, %d refused "
+        + "(%d throttled), %d units dispatched again after the source refused them. Time: %.2f secs.", connector.getName(),
+        connector.getPipelineName(), publisher.numUnitsDone(), publisher.numSourceCalls(), publisher.numCallsRefused(),
+        publisher.numCallsThrottled(), publisher.numUnitsThrottled(), durationSecs));
     return new ConnectorResult(connector, publisher, true, null, durationSecs);
   }
 

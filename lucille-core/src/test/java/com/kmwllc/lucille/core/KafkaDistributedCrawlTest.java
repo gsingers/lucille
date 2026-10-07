@@ -164,6 +164,27 @@ public class KafkaDistributedCrawlTest {
   }
 
   @Test
+  public void testRunWithSeveralDocumentProducersPerCrawler() throws Exception {
+    // Crawlers that spread Documents over three producers, and report units on a producer apart from the CREATEs
+    crawlerPool.stop();
+    crawlerPool.join(10_000);
+    Config manyDocs = ConfigFactory.parseString("crawl.documentProducers: 3, connectors: [{name: \"connector1\", "
+        + "class: \"com.kmwllc.lucille.connector.ScriptedPartitionedConnector\", pipeline: \"" + pipeline + "\", "
+        + "numUnits: 6, docsPerUnit: 200}]").withFallback(config);
+    ScriptedPartitionedConnector.reset();
+    crawlerPool = new CrawlerPool(manyDocs, CrawlerMessengerFactory.getKafkaFactory(manyDocs));
+    crawlerPool.start();
+
+    RunResult result = Runner.run(manyDocs, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);
+
+    // every Document reached the pipeline and was counted, so every CREATE reached the Coordinator before its unit's
+    // completion did
+    assertTrue(result.getStatus());
+    assertEquals(1200, numSucceeded(result));
+    assertTrue(executedOnce("u0", "u1", "u2", "u3", "u4", "u5"));
+  }
+
+  @Test
   public void testUnitThatThrowsAnErrorIsExecutedAgain() throws Exception {
     ScriptedPartitionedConnector.errorOnce.add("u1");
     RunResult result = Runner.run(config, Runner.RunType.DISTRIBUTED_CRAWL, "run-" + pipeline);

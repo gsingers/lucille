@@ -68,7 +68,7 @@ crawl {
 | `handBackGroupSize` | `maxDirectoriesPerUnit`, or 64 | How many handed-back directories make one unit. A storage client that walks a group in parallel does well with hundreds. |
 | `unitSize` | — | `SequenceConnector`: numbers per unit. |
 
-`sourceRetrySecs` (default 180) and `sourceRetryCapSecs` (default 20), at the Connector's top level, set how long and how often a refused listing is retried.
+`sourceRetrySecs` (default 180) and `sourceRetryCapSecs` (default 20), at the Connector's top level, set how long and how often a refused call is retried. On S3 they cover every call, and the SDK's own retries are off unless `sourceRetrySecs` is 0.
 
 `crawl` (per run):
 
@@ -83,9 +83,12 @@ crawl {
 | `maxAttempts` | 3 | Ordinary failures of one unit before the run fails. |
 | `maxThrottledAttempts` | 20 | Failures caused by the source refusing, counted apart. |
 | `throttleBackoffSecs`, `throttleBackoffCapSecs` | 10, 120 | Wait before a refused unit is dispatched again: between half and all of the first, doubling, up to the cap. |
-| `maxSourceConcurrency` | unset | The most concurrent calls the run may make against its source. Only overload refusals (`THROTTLED`, `SOURCE_UNAVAILABLE`) lower the current figure, which also bounds units in flight. |
-| `initialSourceConcurrency`, `sourceConcurrencyStep` | a quarter, a tenth of the maximum | Where the figure starts and how much a clean heartbeat adds. |
+| `maxSourceConcurrency` | unset | The most concurrent calls the run may make against its source. Any throttled call halves the current figure, which also bounds units in flight. |
+| `sourceUnavailableRate` | 0.001 | Calls the source could not answer (5xx, connection failures) halve the figure only above this share of a heartbeat's requests (every page, fetch and failed attempt, where the connector counts them; its source calls otherwise). 0: any does. |
+| `initialSourceConcurrency`, `sourceConcurrencyStep` | a quarter, a tenth of the maximum | Where the figure starts and how much a clean heartbeat adds. To skip the climb, set the start at or above what the Crawlers can issue. |
 | `sourceConcurrencyHoldSecs` | `throttleBackoffCapSecs` | After a cut, how long before another. |
+| `documentProducers` | 1 | Kafka producers each Crawler thread sends Documents on. Each has one sending thread and its own `buffer.memory`; raise it when traversal threads wait on the producer (a profile shows them in `BufferPool.allocate`). Tune `kafka.producer` (`compression.type`, `linger.ms`, `batch.size`) first. |
+| `dispatchHandBacksEarly` | true | Crawlers send handed-back parts every heartbeat, and they are dispatched while the unit still runs. A unit that then fails is executed again whole. |
 | `costsFromRun` | unset | As `-costsFrom`. |
 | `heartbeatSecs` | 10 | The Coordinator's heartbeat period. |
 | `orphanTimeoutSecs` | 120 | Crawlers give up on a run silent for this long; a Coordinator whose loop is stuck this long exits. |
@@ -159,8 +162,8 @@ A distributed crawl adds two shared topics, and what is written to them directs 
 - **Start Crawlers before the run.** A Crawler receives nothing until it has joined its consumer group, which can take tens of seconds when other members have recently come or gone.
 - **The event topic is the run's only record.** Replicate it (`topicReplicationFactor`); a run whose event topic is lost cannot be resumed.
 - **Without `crawl.maxUnitSecs`, a unit that hangs keeps its Crawler** until `runner.connectorTimeout`.
-- **Retries apply in every run mode.** A `FileConnector` that is not distributed also retries refused S3 listings for `sourceRetrySecs` before failing.
-- **Handing back needs listings that can be stopped.** The unit limits apply to local paths and S3; other providers walk the whole subtree. One directory holding millions of files is still one unit's work.
+- **Retries apply in every run mode.** A `FileConnector` that is not distributed also retries refused S3 calls for `sourceRetrySecs` before failing, and a listing that gets a page through starts that time again. Pipeline stages and other Connectors that read S3 keep the SDK's own retries.
+- **Handing back needs listings that can be stopped.** The unit limits apply to local paths and S3; other providers walk the whole subtree. One directory holding millions of files is still one unit's work, and is listed one page after another however many Crawlers there are: the longest such listing is a floor under the run's length.
 - **Changing `partitioning` changes the units.** Resuming with different settings is refused, like any change to a Connector's config.
 - **`FileConnector` state needs a shared database.** `state.connectionString` must name a database every Crawler and the Coordinator can reach. Expiry and `sendTombstones` are applied by the Coordinator after all units are done.
 - **Crawlers and the Coordinator must share the Connector config.** Each unit carries its hash; a Crawler whose config differs fails the unit rather than crawl something else, and after `maxAttempts` the run fails. Credentials are left out of the hash, so they may differ between machines.

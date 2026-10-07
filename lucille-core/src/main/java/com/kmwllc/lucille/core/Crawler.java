@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -46,6 +47,7 @@ class Crawler implements Runnable {
   private final CrawlerMessenger messenger;
   private final String crawlerName;
   private final long heartbeatWaitMillis;
+  private final boolean dispatchHandBacksEarly;
   private final Set<String> pipelineNames;
 
   private final Timer unitTimer;
@@ -77,6 +79,7 @@ class Crawler implements Runnable {
     CrawlConfig crawlConfig = new CrawlConfig(config);
     this.heartbeatWaitMillis =
         TimeUnit.SECONDS.toMillis(Math.min(crawlConfig.orphanTimeoutSecs, 3L * crawlConfig.heartbeatSecs));
+    this.dispatchHandBacksEarly = crawlConfig.dispatchHandBacksEarly;
     this.pipelineNames = config.getConfigList("pipelines").stream()
         .map(pipeline -> pipeline.getString("name")).collect(Collectors.toSet());
 
@@ -223,6 +226,8 @@ class Crawler implements Runnable {
           .put(CoordinatorPublisher.EXECUTION, execution.id)
           .put(CoordinatorPublisher.NUM_PUBLISHED, numPublished)
           .put(CoordinatorPublisher.SOURCE_CALLS, execution.sourceCalls.get())
+          .put(CoordinatorPublisher.REQUESTS, execution.requests.get())
+          .put(CoordinatorPublisher.THROTTLED_CALLS, execution.throttledCalls.get())
           .put(CoordinatorPublisher.REFUSED_CALLS, execution.refusedCalls.get())
           .put(CoordinatorPublisher.DURATION_MS, durationMillis);
       if (error == null) {
@@ -231,8 +236,13 @@ class Crawler implements Runnable {
           message.put(CoordinatorPublisher.ERROR_CLASS, execution.errorClass.name())
               .put(CoordinatorPublisher.ERROR_CAUSE, truncate(execution.errorCause));
         }
-        sendHandedBack(unit, execution);
-        sendUnitEvent(unit, message.put(CoordinatorPublisher.NUM_CHILDREN, execution.handedBack.size()), Event.Type.UNIT_DONE);
+        // under the execution's lock, so that a progress report sending parts early cannot send them after this
+        synchronized (execution) {
+          execution.completing = true;
+          sendHandedBack(unit, execution,
+              List.copyOf(execution.handedBack.subList(execution.sentHandedBack, execution.handedBack.size())), false);
+          sendUnitEvent(unit, message.put(CoordinatorPublisher.NUM_CHILDREN, execution.handedBack.size()), Event.Type.UNIT_DONE);
+        }
         log.info("Unit {} done: {} docs in {} ms, {} parts handed back, {} calls refused{}.", unit.unitId(), numPublished,
             durationMillis, execution.handedBack.size(), execution.refusedCalls.get(),
             execution.errorClass == null ? "" : ", ended by " + execution.errorClass);
@@ -240,6 +250,7 @@ class Crawler implements Runnable {
         message.put(CoordinatorPublisher.ERROR, error)
             .put(CoordinatorPublisher.ERROR_CLASS, FailureClass.of(failure).name())
             .put(CoordinatorPublisher.ERROR_CAUSE, describe(FailureClass.rootCause(failure)));
+        execution.stopSendingEarly();
         sendUnitEvent(unit, message, Event.Type.UNIT_FAILED);
       }
     }
@@ -263,13 +274,23 @@ class Crawler implements Runnable {
     // what the last UNIT_PROGRESS said, so that one is sent only when there is something new to say
     long reportedSourceCalls = 0;
     long reportedRefusedCalls = 0;
+    long reportedThrottledCalls = 0;
+    long reportedRequests = 0;
+    // How many of the handed-back parts have been sent early, and whether the completion has taken over sending the
+    // rest. Guarded by the Execution's own lock.
+    int sentHandedBack = 0;
+    boolean completing = false;
 
     Execution(String runId) {
       this.runId = runId;
     }
     final List<ObjectNode> handedBack = new CopyOnWriteArrayList<>();
+    // a part handed back twice is one part; counting it twice would make the Coordinator expect one it never gets
+    private final Set<String> handedBackKeys = ConcurrentHashMap.newKeySet();
     final AtomicLong sourceCalls = new AtomicLong();
     final AtomicLong refusedCalls = new AtomicLong();
+    final AtomicLong throttledCalls = new AtomicLong();
+    final AtomicLong requests = new AtomicLong();
     volatile FailureClass errorClass;
     volatile String errorCause;
     // set once the unit has a publisher, which is what learns that the unit was lost or its run stopped
@@ -278,9 +299,22 @@ class Crawler implements Runnable {
 
     @Override
     public void handBack(String unitKey, ObjectNode payload) {
+      if (!handedBackKeys.add(unitKey)) {
+        return;
+      }
       ObjectNode child = CrawlConfig.newMessage().put(CoordinatorPublisher.CHILD_KEY, unitKey);
       child.set(CoordinatorPublisher.CHILD_PAYLOAD, payload);
       handedBack.add(child);
+    }
+
+    /**
+     * Ends early sending before the unit is reported as failed, so that no early part follows the failure: the
+     * Coordinator would take it as handed back by the next attempt. Waits for an early send under way.
+     */
+    void stopSendingEarly() {
+      synchronized (this) {
+        completing = true;
+      }
     }
 
     @Override
@@ -290,7 +324,22 @@ class Crawler implements Runnable {
 
     @Override
     public void addRefusedCalls(long calls) {
+      addRefusedCalls(calls, FailureClass.THROTTLED);
+    }
+
+    @Override
+    public void addRequests(long count) {
+      requests.addAndGet(count);
+    }
+
+    @Override
+    public void addRefusedCalls(long calls, FailureClass failureClass) {
+      // refusals before throttles, and reports read them the other way round, so a report never has more throttles
+      // than refusals
       refusedCalls.addAndGet(calls);
+      if (failureClass == FailureClass.THROTTLED) {
+        throttledCalls.addAndGet(calls);
+      }
     }
 
     @Override
@@ -312,35 +361,62 @@ class Crawler implements Runnable {
   }
 
   // Sent ahead of the unit's completion, a batch at a time so that no Event grows with the size of a directory.
-  private void sendHandedBack(WorkUnit unit, Execution execution) throws Exception {
+  // Each batch sent is counted in the execution, so that if a send fails, what follows does not send it again.
+  private void sendHandedBack(WorkUnit unit, Execution execution, List<ObjectNode> parts, boolean early) throws Exception {
     List<ObjectNode> batch = new ArrayList<>();
     int batchChars = 0;
 
-    for (ObjectNode part : execution.handedBack) {
+    for (ObjectNode part : parts) {
       batch.add(part);
       batchChars += part.toString().length();
       if (batch.size() >= HANDED_BACK_PER_EVENT || batchChars >= HANDED_BACK_CHARS_PER_EVENT) {
-        sendHandedBack(unit, execution, batch);
+        sendHandedBackBatch(unit, execution, batch, early);
+        execution.sentHandedBack += batch.size();
         batch = new ArrayList<>();
         batchChars = 0;
       }
     }
 
     if (!batch.isEmpty()) {
-      sendHandedBack(unit, execution, batch);
+      sendHandedBackBatch(unit, execution, batch, early);
+      execution.sentHandedBack += batch.size();
     }
   }
 
-  private void sendHandedBack(WorkUnit unit, Execution execution, List<ObjectNode> parts) throws Exception {
+  private void sendHandedBackBatch(WorkUnit unit, Execution execution, List<ObjectNode> parts, boolean early) throws Exception {
     ObjectNode message = unitMessage(unit).put(CoordinatorPublisher.EXECUTION, execution.id);
+    if (early) {
+      message.put(CoordinatorPublisher.EARLY, true);
+    }
     message.putArray(CoordinatorPublisher.CHILDREN).addAll(parts);
     sendUnitEvent(unit, message, Event.Type.UNIT_CHILDREN);
+  }
+
+  /**
+   * Sends what the unit has handed back since the last time, marked to be dispatched at once. Nothing is sent once
+   * the source has failed the unit: what it hands back from then on is what the source refused, which waits for the
+   * unit to complete and is then delayed. The parts are counted before the failure is looked for, so that a part
+   * handed back after the failure was recorded is never among them.
+   */
+  private void sendHandedBackEarly(WorkUnit unit, Execution execution) throws Exception {
+    synchronized (execution) {
+      int available = execution.handedBack.size();
+      if (execution.completing || execution.errorClass != null || execution.isCancelled()
+          || available <= execution.sentHandedBack) {
+        return;
+      }
+      // a copy: sending advances sentHandedBack
+      List<ObjectNode> parts = List.copyOf(execution.handedBack.subList(execution.sentHandedBack, available));
+      sendHandedBack(unit, execution, parts, true);
+      log.info("Unit {} handed back {} parts while executing.", unit.unitId(), parts.size());
+    }
   }
 
   /**
    * Sends a UNIT_PROGRESS report for the unit being executed, if there is one and it has done anything since the
    * last report: the calls it has made to its source and how many were refused. Called from the pool's timer every
    * heartbeat, so that the Coordinator learns of refusals while a long unit is still running, not only when it ends.
+   * With crawl.dispatchHandBacksEarly, also sends the parts the unit has handed back since, to be dispatched at once.
    */
   void reportProgress() {
     WorkUnit unit = executingUnit;
@@ -350,23 +426,37 @@ class Crawler implements Runnable {
     }
 
     long sourceCalls = execution.sourceCalls.get();
+    long requests = execution.requests.get();
+    long throttledCalls = execution.throttledCalls.get();
     long refusedCalls = execution.refusedCalls.get();
+    boolean callsChanged;
     synchronized (reportLock) {
-      if (executingUnit != unit || executingUnitReported
-          || (sourceCalls == execution.reportedSourceCalls && refusedCalls == execution.reportedRefusedCalls)) {
+      if (executingUnit != unit || executingUnitReported) {
         return;
       }
+      // the throttles too: a report can catch a refusal before its throttle, and the throttle must still go out
+      callsChanged = sourceCalls != execution.reportedSourceCalls || refusedCalls != execution.reportedRefusedCalls
+          || throttledCalls != execution.reportedThrottledCalls || requests != execution.reportedRequests;
+      execution.reportedRequests = requests;
       execution.reportedSourceCalls = sourceCalls;
       execution.reportedRefusedCalls = refusedCalls;
+      execution.reportedThrottledCalls = throttledCalls;
     }
 
     try {
-      ObjectNode message = unitMessage(unit)
-          .put(CoordinatorPublisher.EXECUTION, execution.id)
-          .put(CoordinatorPublisher.SOURCE_CALLS, sourceCalls)
-          .put(CoordinatorPublisher.REFUSED_CALLS, refusedCalls)
-          .put(CoordinatorPublisher.NUM_PUBLISHED, execution.publisher == null ? 0 : execution.publisher.numPublished());
-      sendUnitEvent(unit, message, Event.Type.UNIT_PROGRESS);
+      if (callsChanged) {
+        ObjectNode message = unitMessage(unit)
+            .put(CoordinatorPublisher.EXECUTION, execution.id)
+            .put(CoordinatorPublisher.SOURCE_CALLS, sourceCalls)
+            .put(CoordinatorPublisher.REQUESTS, requests)
+            .put(CoordinatorPublisher.REFUSED_CALLS, refusedCalls)
+            .put(CoordinatorPublisher.THROTTLED_CALLS, throttledCalls)
+            .put(CoordinatorPublisher.NUM_PUBLISHED, execution.publisher == null ? 0 : execution.publisher.numPublished());
+        sendUnitEvent(unit, message, Event.Type.UNIT_PROGRESS);
+      }
+      if (dispatchHandBacksEarly) {
+        sendHandedBackEarly(unit, execution);
+      }
     } catch (Exception e) {
       log.warn("Could not report progress on unit {}.", unit.unitId(), e);
     }
@@ -390,18 +480,21 @@ class Crawler implements Runnable {
       return false;
     }
 
+    Execution execution;
     synchronized (reportLock) {
       if (executingUnit != unit || executingUnitReported) {
         return false;
       }
       executingUnitReported = true;
-      currentExecution.timedOut = true;
+      execution = currentExecution;
+      execution.timedOut = true;
     }
 
     log.error("Unit {} has been executing for more than {} ms; reporting it as failed and retiring its Crawler.",
         unit.unitId(), maxUnitMillis);
     abandonedUnits.inc();
     running = false;
+    execution.stopSendingEarly();
     try {
       ObjectNode message = unitMessage(unit)
           .put(CoordinatorPublisher.ERROR, "Timed out: still executing after " + maxUnitMillis + " ms.")

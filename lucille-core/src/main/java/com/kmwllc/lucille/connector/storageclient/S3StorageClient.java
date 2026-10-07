@@ -8,6 +8,7 @@ import static com.kmwllc.lucille.connector.FileConnector.S3_SECRET_ACCESS_KEY;
 import com.kmwllc.lucille.connector.FileConnectorStateManager;
 import com.kmwllc.lucille.core.Publisher;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -17,6 +18,7 @@ import com.kmwllc.lucille.core.SourceException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.Iterator;
 import java.util.List;
 import java.util.function.Supplier;
 import java.util.Objects;
@@ -36,6 +38,7 @@ import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
 /**
@@ -52,9 +55,24 @@ public class S3StorageClient extends BaseStorageClient {
   static final Region ANONYMOUS_DEFAULT_REGION = Region.US_EAST_1;
 
   protected S3Client s3;
+  private final SourceRetryPolicy retryPolicy;
 
   public S3StorageClient(Config s3CloudOptions) {
+    this(s3CloudOptions, SourceRetryPolicy.fromConfig(ConfigFactory.empty()));
+  }
+
+  /**
+   * @param retryPolicy how long to retry a call the store refuses or cannot answer, outside a traversal (moving a
+   *     file, fetching one by URI); a traversal's calls follow its own params. The SDK's own retries are off whenever
+   *     this policy retries, so that refusals are seen and counted.
+   */
+  public S3StorageClient(Config s3CloudOptions, SourceRetryPolicy retryPolicy) {
     super(s3CloudOptions);
+    this.retryPolicy = retryPolicy;
+  }
+
+  SourceRetryPolicy retryPolicy() {
+    return retryPolicy;
   }
 
   @Override
@@ -79,10 +97,10 @@ public class S3StorageClient extends BaseStorageClient {
     try {
       S3ClientBuilder builder = S3Client.builder();
 
-      // Lucille retries a refused listing itself, for longer and with a count of the refusals that a distributed
-      // crawl acts on. The SDK's own retries would hide the first few refusals of every burst from that count, so
-      // they are turned off whenever Lucille's policy is on.
-      if (SourceRetryPolicy.fromConfig(config).maxMillis() > 0) {
+      // Lucille retries every call it makes to the store itself, for longer and with a count of the refusals that a
+      // distributed crawl acts on. The SDK's own retries would hide the first few refusals of every burst from that
+      // count, so they are turned off whenever Lucille's policy is on.
+      if (retryPolicy.maxMillis() > 0) {
         builder = builder.overrideConfiguration(o -> o.retryStrategy(DefaultRetryStrategy.doNotRetry()));
       }
 
@@ -175,63 +193,116 @@ public class S3StorageClient extends BaseStorageClient {
 
   /**
    * Lists one prefix, publishing its objects, and returns the prefixes beneath it that are to be traversed. A
-   * request the store refuses or cannot answer is tried again for as long as the params' retry policy allows; the
-   * objects published before the failure are published again on the retry, under the same IDs.
+   * request the store refuses or cannot answer is tried again for as long as the params' retry policy allows. A
+   * retry resumes from the page that failed, with that page's continuation token, so the objects on the pages
+   * already read are not published again. A failure after a page was read is a new failure, with the policy's full
+   * time to pass.
    *
    * @throws SourceException once the retries are used up, saying what kind of failure it was.
    */
   private List<String> listPrefix(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr,
       String prefix) throws SourceException {
-    ListObjectsV2Request request = ListObjectsV2Request.builder()
+    ListObjectsV2Request firstPage = ListObjectsV2Request.builder()
         .bucket(getBucketOrContainerName(params))
         .prefix(prefix)
         .delimiter("/")
         .maxKeys(maxNumOfPages)
         .build();
-    TraversalBudget budget = params.getBudget();
+    List<String> prefixesBeneath = new ArrayList<>();
+    String nextPage = null;
     long firstFailureMillis = 0;
+    int retry = 0;
 
-    for (int retry = 0; ; retry++) {
-      List<String> prefixesBeneath = new ArrayList<>();
+    while (true) {
+      String failedPage = nextPage;
+      ListObjectsV2Request request = nextPage == null ? firstPage : firstPage.toBuilder().continuationToken(nextPage).build();
       try {
-        s3.listObjectsV2Paginator(request).stream().forEachOrdered(resp -> {
-          resp.contents().forEach(obj -> {
-            S3FileReference fileRef = new S3FileReference(obj, params);
-            processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
-          });
-
-          if (params.isRecursive()) {
-            resp.commonPrefixes().forEach(cp -> {
-              if (!isSkippedDirectory(uriForDirectory(cp.prefix(), params), params)) {
-                prefixesBeneath.add(cp.prefix());
-              }
-            });
+        Iterator<ListObjectsV2Response> pages = s3.listObjectsV2Paginator(request).stream().iterator();
+        while (pages.hasNext()) {
+          ListObjectsV2Response page = pages.next();
+          if (params.getBudget() != null) {
+            params.getBudget().requestMade();
           }
-        });
+          publishPage(publisher, params, stateMgr, page, prefixesBeneath);
+          nextPage = page.nextContinuationToken();
+        }
         return prefixesBeneath;
       } catch (SdkException e) {
-        FailureClass failureClass = classify(e);
-        if (retry == 0) {
+        if (!Objects.equals(failedPage, nextPage)) {
+          retry = 0;
+        }
+        if (retry++ == 0) {
           firstFailureMillis = System.currentTimeMillis();
         }
-        // only a refusal for load is a sign to slow down; access denied or not found is not
-        if (budget != null && failureClass.isOverload()) {
-          budget.callRefused();
-        }
-
-        long waitMillis = failureClass.isOverload() ? params.getRetryPolicy().nextWaitMillis(retry + 1, firstFailureMillis) : -1;
-        if (waitMillis < 0 || (budget != null && budget.isCancelled())) {
-          throw new SourceException(failureClass, "Could not list " + uriForDirectory(prefix, params) + " after "
-              + retry + " retries.", e);
-        }
-
-        log.info("Listing {} was refused ({}); retry {} in {} ms.", prefix, failureClass, retry + 1, waitMillis);
-        if (!sleepUnlessCancelled(waitMillis, budget)) {
-          // interrupted: the thread is being stopped, and must not spin on the SDK until the horizon
-          throw new SourceException(failureClass, "Interrupted while waiting to list " + uriForDirectory(prefix, params)
-              + " again.", e);
+        try {
+          awaitRetry("Listing " + prefix, params.getRetryPolicy(), params.getBudget(), e, retry, firstFailureMillis);
+        } catch (SdkException giveUp) {
+          throw new SourceException(classify(e), "Could not list " + uriForDirectory(prefix, params) + " after "
+              + (retry - 1) + " retries.", e);
         }
       }
+    }
+  }
+
+  private void publishPage(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr,
+      ListObjectsV2Response page, List<String> prefixesBeneath) {
+    page.contents().forEach(obj -> processAndPublishFileIfValid(publisher, new S3FileReference(obj, params), params, stateMgr));
+
+    if (params.isRecursive()) {
+      page.commonPrefixes().forEach(cp -> {
+        if (!isSkippedDirectory(uriForDirectory(cp.prefix(), params), params)) {
+          prefixesBeneath.add(cp.prefix());
+        }
+      });
+    }
+  }
+
+  /**
+   * Makes a call, trying it again while the store refuses it or cannot answer, for as long as the policy allows.
+   * Anything else the store answers with (access denied, not found) is thrown at once, as is the last failure.
+   *
+   * @param budget the traversal's budget, which counts the refusals and can cancel the waiting; null outside one.
+   */
+  private <T> T withRetry(String what, SourceRetryPolicy policy, TraversalBudget budget, Supplier<T> call) {
+    long firstFailureMillis = 0;
+    for (int retry = 1; ; retry++) {
+      try {
+        T result = call.get();
+        if (budget != null) {
+          budget.requestMade();
+        }
+        return result;
+      } catch (SdkException e) {
+        if (retry == 1) {
+          firstFailureMillis = System.currentTimeMillis();
+        }
+        awaitRetry(what, policy, budget, e, retry, firstFailureMillis);
+      }
+    }
+  }
+
+  /**
+   * Counts a failed call as a refusal if it was one, then waits before the given retry; or, if the call is not to
+   * be tried again, throws its failure. Only a refusal for load is a sign to slow down; access denied or not found
+   * is not, and is not retried.
+   */
+  private static void awaitRetry(String what, SourceRetryPolicy policy, TraversalBudget budget, SdkException e,
+      int retry, long firstFailureMillis) {
+    FailureClass failureClass = classify(e);
+    if (budget != null) {
+      budget.requestMade();
+      if (failureClass.isOverload()) {
+        budget.callRefused(failureClass);
+      }
+    }
+    long waitMillis = failureClass.isOverload() ? policy.nextWaitMillis(retry, firstFailureMillis) : -1;
+    if (waitMillis < 0 || (budget != null && budget.isCancelled())) {
+      throw e;
+    }
+    log.info("{} was refused ({}); retry {} in {} ms.", what, failureClass, retry, waitMillis);
+    if (!sleepUnlessCancelled(waitMillis, budget)) {
+      // interrupted: the thread is being stopped, and must not spin on the SDK until the horizon
+      throw e;
     }
   }
 
@@ -250,35 +321,11 @@ public class S3StorageClient extends BaseStorageClient {
   }
 
   /**
-   * Fetches an object, trying again on a refusal as a listing is tried again. A traversal that gives up on an
-   * object's content skips the object (the base client logs it); the refusals are counted all the same.
+   * Fetches an object during a traversal, trying again on a refusal as a listing is tried again. A traversal that
+   * gives up on an object's content skips the object (the base client logs it); the refusals are counted all the same.
    */
   private <T> T getWithRetry(TraversalParams params, String key, Supplier<T> fetch) {
-    TraversalBudget budget = params.getBudget();
-    long firstFailureMillis = 0;
-
-    for (int retry = 0; ; retry++) {
-      try {
-        return fetch.get();
-      } catch (SdkException e) {
-        FailureClass failureClass = classify(e);
-        if (retry == 0) {
-          firstFailureMillis = System.currentTimeMillis();
-        }
-        // only a refusal for load is a sign to slow down; access denied or not found is not
-        if (budget != null && failureClass.isOverload()) {
-          budget.callRefused();
-        }
-        long waitMillis = failureClass.isOverload() ? params.getRetryPolicy().nextWaitMillis(retry + 1, firstFailureMillis) : -1;
-        if (waitMillis < 0 || (budget != null && budget.isCancelled())) {
-          throw e;
-        }
-        log.info("Fetching {} was refused ({}); retry {} in {} ms.", key, failureClass, retry + 1, waitMillis);
-        if (!sleepUnlessCancelled(waitMillis, budget)) {
-          throw e;
-        }
-      }
-    }
+    return withRetry("Fetching " + key, params.getRetryPolicy(), params.getBudget(), fetch);
   }
 
   /**
@@ -315,11 +362,12 @@ public class S3StorageClient extends BaseStorageClient {
         .maxKeys(maxNumOfPages)
         .build();
 
-    // the path is in the same bucket as the traversal being split, so its prefixes resolve against the same URI
-    return s3.listObjectsV2Paginator(request).commonPrefixes().stream()
+    // the path is in the same bucket as the traversal being split, so its prefixes resolve against the same URI. A
+    // failure part way through starts the listing again: nothing has been published, so nothing is repeated.
+    return withRetry("Listing " + path, params.getRetryPolicy(), null, () -> s3.listObjectsV2Paginator(request).commonPrefixes().stream()
         .map(cp -> uriForDirectory(cp.prefix(), params))
         .filter(prefixUri -> !isSkippedDirectory(prefixUri, params))
-        .toList();
+        .toList());
   }
 
   private URI uriForDirectory(String prefix, TraversalParams params) {
@@ -337,7 +385,7 @@ public class S3StorageClient extends BaseStorageClient {
     String objectKey = uri.getPath().substring(1);
 
     GetObjectRequest request = GetObjectRequest.builder().bucket(bucketName).key(objectKey).build();
-    return s3.getObject(request);
+    return withRetry("Fetching " + uri, retryPolicy, null, () -> s3.getObject(request));
   }
 
   @Override
@@ -357,8 +405,9 @@ public class S3StorageClient extends BaseStorageClient {
         .bucket(sourceBucket).key(sourceKey)
         .build();
 
-    s3.copyObject(copyRequest);
-    s3.deleteObject(deleteRequest);
+    // each half is safe to repeat: copying again writes the same object, and deleting one already gone succeeds
+    withRetry("Copying " + filePath, retryPolicy, null, () -> s3.copyObject(copyRequest));
+    withRetry("Deleting " + filePath, retryPolicy, null, () -> s3.deleteObject(deleteRequest));
   }
 
   private String getStartingDirectory(TraversalParams params) {

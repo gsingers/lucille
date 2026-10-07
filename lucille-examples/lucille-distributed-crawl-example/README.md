@@ -71,7 +71,7 @@ for (Path directory : notListed) {
 }
 ```
 
-The Crawler names them in its report; the Coordinator makes a unit of each and dispatches it to whichever Crawler is free. Those units are bounded the same way, so a subtree of any size is shared out. Two rules make this safe:
+The Crawler sends them to the Coordinator with its next progress report, every heartbeat, while the unit is still running; the Coordinator makes a unit of each and dispatches it to whichever Crawler is free. Those units are bounded the same way, so a subtree of any size is shared out. Two rules make this safe:
 
 - **Hand back, don't do, what you hand back.** A handed-back part is executed by whoever receives it.
 - **Use the keys the planner would use.** Then a directory that is both planned and handed back is one unit, not two; the Coordinator ignores a key it already has.
@@ -82,7 +82,7 @@ The Crawler names them in its report; the Coordinator makes a unit of each and d
 
 `context.addSourceCalls(1)` per listing gives the Coordinator a measure of each unit's cost, which `-costsFrom` uses on the next run to start the largest units first. `context.isCancelled()` turns true when the unit has timed out, lost its partition or lost its run; the walk then stops and hands nothing back, since the unit will be executed again from the start.
 
-A Connector reading a source that can refuse requests (HTTP 429) would also count refusals with `context.addRefusedCalls()`, so the Coordinator can slow the run down, and could cap its own concurrency at `context.maxSourceConcurrency()`. This one reads a local disk and has no need to.
+A Connector reading a source that can refuse requests would also count refusals with `context.addRefusedCalls(n, FailureClass.THROTTLED)` for a 429, or `SOURCE_UNAVAILABLE` for a 5xx, so the Coordinator can slow the run down, and could cap its own concurrency at `context.maxSourceConcurrency()`. This one reads a local disk and has no need to.
 
 ## Testing a Connector like this
 

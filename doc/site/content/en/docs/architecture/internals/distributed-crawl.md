@@ -54,9 +54,9 @@ All on the run's event topic for the pipeline, `<pipeline>_event_<runId>` (`Kafk
 | Type | Sent by | Message |
 |---|---|---|
 | `UNIT_CREATED` | Coordinator, before dispatch | the `WorkUnit` |
-| `UNIT_CHILDREN` | Crawler, before `UNIT_DONE` | `attempt`, `epoch`, `crawler`, `execution`, `children: [{key, payload}]`; a batch is closed at 200 entries or once it reaches 100,000 characters, so it can exceed that by one entry |
-| `UNIT_PROGRESS` | Crawler, every heartbeat while a unit runs, when something changed | `attempt`, `epoch`, `crawler`, `execution`, `sourceCalls`, `refusedCalls`, `numPublished` (running totals) |
-| `UNIT_DONE` | Crawler | `attempt`, `epoch`, `execution`, `crawler`, `numPublished`, `sourceCalls`, `refusedCalls`, `durationMs`, `numChildren`; `errorClass`, `errorCause` if the unit ended early because of its source |
+| `UNIT_CHILDREN` | Crawler: every heartbeat while a unit runs (`early: true`), and before `UNIT_DONE` for the rest | `attempt`, `epoch`, `crawler`, `execution`, `children: [{key, payload}]`, `early` if sent while the unit runs; a batch is closed at 200 entries or once it reaches 100,000 characters, so it can exceed that by one entry |
+| `UNIT_PROGRESS` | Crawler, every heartbeat while a unit runs, when something changed | `attempt`, `epoch`, `crawler`, `execution`, `sourceCalls`, `requests`, `refusedCalls`, `throttledCalls`, `numPublished` (running totals) |
+| `UNIT_DONE` | Crawler | `attempt`, `epoch`, `execution`, `crawler`, `numPublished`, `sourceCalls`, `requests`, `refusedCalls`, `throttledCalls`, `durationMs`, `numChildren` (early ones included); `errorClass`, `errorCause` if the unit ended early because of its source |
 | `UNIT_FAILED` | Crawler, its watchdog, or the Coordinator's messenger | Four forms. A unit that threw: as `UNIT_DONE` without children, plus `error`, `errorClass`, `errorCause`. The watchdog's timeout: `attempt`, `epoch`, `crawler`, `error`, `errorClass: TIMEOUT`. A unit abandoned because its run was orphaned: `attempt`, `epoch`, `crawler`, `error`, no `errorClass`. A failed dispatch: `attempt`, `epoch`, `crawler: "coordinator"`, `error`. The timeout and orphan forms count against `maxAttempts`. |
 | `PLANNING_DONE` | Coordinator | none; the document ID is the Connector's name |
 | `HOOK_DONE` | Coordinator | `preExecute`, `prepareRun`, `finalizeRun` or `postExecute` |
@@ -158,11 +158,13 @@ A report counts only if it names the current dispatch of an outstanding unit: sa
 2. If one of the children is the unit itself, the unit could not list its own directory. Treat it as a failure of the class it reported (a source class if it gave one, else `SOURCE_ERROR`), not as done.
 3. Otherwise mark it done, free its partition, and create a unit for each child that is not already known (outstanding, queued, delayed or done). If the unit ended early because of its source (`errorClass` THROTTLED or SOURCE_UNAVAILABLE), the children inherit its refusal count plus one and are delayed by the backoff for that count; at `maxThrottledAttempts` the run fails instead.
 
+**`UNIT_CHILDREN`:** kept by unit, execution and child key for the `UNIT_DONE`, so a batch sent twice counts once (a Crawler also ignores a key handed back twice). If marked `early`, a unit is also created at once for each child not already known, with no delay; these stand if the parent then fails. The parent's own key among them is not created (it is outstanding), and the `UNIT_DONE` still treats it as a self-hand-back.
+
 **`UNIT_FAILED`:** free the partition; count it as throttled if `errorClass` is THROTTLED or SOURCE_UNAVAILABLE, plain otherwise; fail the Connector at the relevant limit; otherwise queue the next attempt, delayed by `backoffMillis(count)` if throttled.
 
 Backoff for the *n*th throttled failure: a ceiling of `min(throttleBackoffCapSecs, throttleBackoffSecs × 2^(n-1))`, and a wait chosen uniformly between half the ceiling and the ceiling.
 
-**`UNIT_PROGRESS`:** the running total of refused calls for that unit and execution is compared with the last total seen, and only the increase is counted, so a refusal reported in progress and again in the final report is counted once.
+**`UNIT_PROGRESS`:** the running totals of source calls, refused calls and throttled calls for that unit and execution are compared with the last totals seen, and only the increase is counted, so a refusal reported in progress and again in the final report is counted once. A report without `throttledCalls` counts all its refusals as throttles.
 
 ### Replay
 
@@ -171,7 +173,7 @@ Backoff for the *n*th throttled failure: a ceiling of `min(throttleBackoffCapSec
 | Event | While replaying |
 |---|---|
 | `UNIT_CREATED` | The unit becomes outstanding (the newest dispatch by epoch, then attempt, wins). |
-| `UNIT_CHILDREN`, `UNIT_DONE` | As live: the unit is done, and its children become outstanding, with epoch 0 so that a later logged dispatch of them replaces them and reports on that dispatch are accepted. |
+| `UNIT_CHILDREN`, `UNIT_DONE` | As live: early children become outstanding when read, the rest when the unit is done, each with epoch 0 so that a later logged dispatch of them replaces them and reports on that dispatch are accepted. |
 | `UNIT_FAILED` | Ignored: the earlier Coordinator responded to it, and any re-dispatch is in the log. The unit stays outstanding. |
 | `PLANNING_DONE`, `HOOK_DONE` | Recorded. (Live, these are the Coordinator's own Events coming back, and are ignored.) |
 | `UNIT_PROGRESS` | Ignored; refusals are not counted, so a resumed run does not cut its source concurrency for what an earlier Coordinator saw. |
@@ -224,8 +226,10 @@ If a rebalance takes away the partition of the held unit, the unit is marked los
 2. Ask `RunControlTracker` for a decision on the unit's run and epoch, waiting up to `min(orphanTimeoutSecs, 3 × heartbeatSecs)` for a first heartbeat. `STALE` (older epoch), `CANCELLED`, `ORPHANED` (heartbeat too old) or `UNKNOWN` (never heard of): abandon. Only an orphaned run gets a `UNIT_FAILED` (see [Replay](#replay)).
 3. Find the Connector in its own config (cached across units) and check its config hash against the unit's. A mismatch fails the unit as a `CONNECTOR_ERROR`, so it fails the run after `maxAttempts`.
 4. Execute: `connector.executeUnit(unit, publisher, execution)`, then flush the publisher. Any `Throwable` is caught and reported; a `VirtualMachineError` is reported and then rethrown.
-5. Report: `UNIT_CHILDREN` batches and `UNIT_DONE`, or `UNIT_FAILED` with `FailureClass.of(t)` and the root cause. Each report is sent, flushed and acknowledged by Kafka before the next step.
+5. Report: `UNIT_CHILDREN` batches for the parts not already sent early, and `UNIT_DONE`, or `UNIT_FAILED` with `FailureClass.of(t)` and the root cause. Each report is sent, flushed and acknowledged by Kafka before the next step. The final batches and `UNIT_DONE` are sent under the execution's lock, which the progress timer also takes to send early batches, so an early batch never follows the `UNIT_DONE`.
 6. Acknowledge: commit the offset.
+
+`KafkaCrawlerMessenger` sends on `CrawlerProducers`: `crawl.documentProducers` producers for Documents (one chosen by the Document's ID, so that sends of one Document stay in order; each has its own sending thread and buffer), one for `CREATE` Events, and one for unit reports, so that a report, which is sent and waited for, never waits behind a backlog of `CREATE`s. A `UNIT_DONE` still follows its unit's `CREATE`s in the event topic, because it is sent only after the publisher's flush has seen them all accepted.
 
 `CrawlerPublisher` sends each Document to the source topic and, once Kafka accepts it, its `CREATE` Event, so the Coordinator never tracks a Document that was not written. Before each publish it checks the run is still worth working for (`RunControlTracker`) and that the unit is not lost; otherwise it throws and records why, and the Crawler checks that record after the Connector returns, in case the Connector caught the exception.
 
@@ -235,7 +239,7 @@ If a rebalance takes away the partition of the held unit, the unit is marked los
 
 `CrawlerPool` runs two scheduled threads:
 
-- **Progress**, every `heartbeatSecs`: for each Crawler with a unit executing, send `UNIT_PROGRESS` if its totals changed since the last report.
+- **Progress**, every `heartbeatSecs`: for each Crawler with a unit executing, send `UNIT_PROGRESS` if its totals changed since the last report, then, with `dispatchHandBacksEarly`, the parts handed back since the last early batch, unless the unit has recorded a source error or been cancelled. The count of parts is read before the source error, so a part handed back after the error was recorded is never sent early.
 - **Watchdog**, every 500 ms, only with `maxUnitSecs` set: a unit executing longer is reported `UNIT_FAILED` with class `TIMEOUT`, acknowledged, and the Crawler's messenger closed, which leaves the group and frees its partitions. The Crawler's thread is left to finish or not; a new Crawler is started in its place. With `exitOnTimeout`, the pool stops its other Crawlers, gives them ten seconds to finish and leave, and exits instead.
 
 ## The Connector SPI
@@ -257,7 +261,8 @@ public interface WorkUnitSink {
 public interface UnitContext {
   void handBack(String unitKey, ObjectNode payload);
   void addSourceCalls(long calls);
-  default void addRefusedCalls(long calls) {}
+  default void addRefusedCalls(long calls) {}                              // taken as throttles
+  default void addRefusedCalls(long calls, FailureClass failureClass) {}
   default void recordSourceError(FailureClass failureClass, String cause) {}
   default Integer maxSourceConcurrency() { return null; }
   default boolean isCancelled() { return false; }
@@ -269,16 +274,18 @@ Rules for an implementation:
 - **Keys are stable.** The same part of the source must get the same key every time it is planned or handed back. That is how a resumed planner skips what exists, and how a part handed back twice is created once.
 - **Executing a unit twice publishes the same Document IDs.**
 - **Validate the payload.** Units arrive over the network; accept only parts of what this Connector was configured to read.
-- **Hand back, don't do, what you hand back.** A handed-back part is executed by whoever receives it.
-- **Count calls and refusals as they happen**, through the context, so progress reports carry them.
+- **Hand back, don't do, what you hand back.** A handed-back part is executed by whoever receives it, possibly while this unit is still running.
+- **Hand back as soon as you know.** Parts go out with the next progress report; a part handed back at the end of a long unit waits for it.
+- **Record a source error before handing back what it left**, so those parts wait for the unit's completion and its backoff.
+- **Count calls and refusals as they happen**, through the context, with the refusal's class, so progress reports carry them.
 - A Connector that is not partitionable runs through `SingleUnitAdapter` as one unit calling `execute()`.
 
 ### FileConnector
 
 - **Planning:** `depth` levels below each path, one recursive unit per directory at that level (key: its URI) and one non-recursive unit per directory above it (key: URI + `#files`). `depth: 0` plans each path as one unit. Local and S3 are split; other providers are one unit per path.
 - **Payload:** `path` or `paths` (a group), and `recursive`. Every path is checked to lie within a configured path (for local paths, by real path, so a symbolic link cannot lead out) and not under `pathsToSkip`.
-- **Execution:** one `TraversalBudget` per unit, from `maxDirectoriesPerUnit` and `maxUnitSecs`, with the context's `isCancelled` and `maxSourceConcurrency`, and a listener that adds each listing and refusal to the context. The unit's paths are grouped by storage client and each group passed to `traverseAll`.
-- **Hand-back:** the budget's handed-back directories, in groups of `handBackGroupSize`. A single directory gets the key the planner would give it; a group gets `firstPath + "+" + (n-1) + suffix + "~" + hash`, where the suffix is `#files` for a non-recursive group and empty otherwise. A unit's own directory handed back because it could not be listed keeps the unit's kind: a non-recursive unit hands back `path#files`, non-recursive.
+- **Execution:** one `TraversalBudget` per unit, from `maxDirectoriesPerUnit` and `maxUnitSecs`, with the context's `isCancelled` and `maxSourceConcurrency`, and a listener that passes each listing, refusal (with its class), source error and handed-back directory to the context as it happens. The unit's paths are grouped by storage client and each group passed to `traverseAll`.
+- **Hand-back:** the budget's handed-back directories, in groups of `handBackGroupSize` (`FileConnector.HandBacks`). Each group goes to the context as soon as it is full, the partial last one when the unit ends; the groups are the same as if all were grouped at the end. A single directory gets the key the planner would give it; a group gets `firstPath + "+" + (n-1) + suffix + "~" + hash`, where the suffix is `#files` for a non-recursive group and empty otherwise. A unit's own directory handed back because it could not be listed keeps the unit's kind: a non-recursive unit hands back `path#files`, non-recursive.
 
 ## The storage-client contract
 
@@ -292,7 +299,7 @@ SourceRetryPolicy retry = params.getRetryPolicy();    // from sourceRetrySecs, s
 | Call | When |
 |---|---|
 | `budget.mayList()` | Before listing a directory. False: do not list it; `budget.handBack(uri)`. It is true for the first directory whatever the limits, and false for everything once cancelled or once a source error is recorded. |
-| `budget.callRefused()` | Each request refused for load (`THROTTLED`) or unanswered (`SOURCE_UNAVAILABLE`), retried or not. Not for access denied or not found, which are not a sign to slow down. |
+| `budget.callRefused(class)` | Each request refused for load (`THROTTLED`) or unanswered (`SOURCE_UNAVAILABLE`), retried or not. Not for access denied or not found, which are not a sign to slow down. `callRefused()` without a class counts as a throttle. |
 | `retry.nextWaitMillis(n, firstFailureMillis)` | Before the *n*th retry; -1 means give up. Wait in slices that check `budget.isCancelled()`. |
 | `budget.sourceError(class, e)`, `budget.listingFailed()`, `budget.handBack(uri)` | When a directory's listing is given up on. The traversal then returns instead of throwing; everything not yet listed is handed back as the traversal reaches it. |
 | `budget.getMaxConcurrency()` | A client listing with a pool: the most listings this unit may have in flight, re-read between listings. |
@@ -302,17 +309,17 @@ None of Lucille's built-in storage clients walks with a pool: the default `trave
 
 Classify with care: only overload (`THROTTLED`, `SOURCE_UNAVAILABLE`) is retried. A client-side SDK failure is `SOURCE_UNAVAILABLE` only when an `IOException` lies beneath it; a credentials or signing failure would not pass if retried. Turn the SDK's own retries off when the policy is on, so every refusal is counted.
 
-`S3StorageClient` is the reference: a stack-based walk under a budget, a retrying `listPrefix` and `getWithRetry`, and `classify(SdkException)`. `LocalStorageClient` honours the budget in `preVisitDirectory` and hands back a directory it cannot open.
+`S3StorageClient` is the reference: a stack-based walk under a budget, a `listPrefix` that retries a failed page from its continuation token, `withRetry` around every other call (fetch, move, `listSubdirectories`), and `classify(SdkException)`. `LocalStorageClient` honours the budget in `preVisitDirectory` and hands back a directory it cannot open.
 
 ## Source concurrency
 
-`SourceConcurrencyController.adjust(refused)` runs once per heartbeat while units are in flight, with the refusals counted since the last heartbeat:
+`SourceConcurrencyController.adjust(Interval)` runs once per heartbeat while units are in flight, with the calls, throttled calls and unanswered calls counted since the last heartbeat. The calls are the requests Crawlers reported (`UnitContext.addRequests`, which `FileConnector` feeds from `TraversalBudget.requestMade()` on every S3 page, fetch and failed attempt), or the source calls when the connector reports no requests. The interval is overloaded if any call was throttled, or if more than `sourceUnavailableRate` of the calls went unanswered (any unanswered call, if there were no calls).
 
-- some refused, and not at the floor (one call), and no cut within `sourceConcurrencyHoldSecs`: halve;
-- some refused within the hold: keep;
-- none refused: add `sourceConcurrencyStep`, up to `maxSourceConcurrency`.
+- overloaded, not at the floor (one call), and no cut within `sourceConcurrencyHoldSecs`: halve;
+- overloaded within the hold: keep;
+- otherwise: add `sourceConcurrencyStep`, up to `maxSourceConcurrency`.
 
-The Coordinator then bounds units in flight at `min(partitions, figure)`, and the heartbeat carries `figure / min(partitions, figure)` (at least 1) as `unitConcurrency`, so the per-unit share is 1 whenever the figure is at most the number of partitions. An interval with no unit running is not counted as clean. The run's total of refusals is summed across Connectors under a lock, so the switch from one Connector's publisher to the next does not count one Connector's refusals twice.
+The Coordinator then bounds units in flight at `min(partitions, figure)`, and the heartbeat carries `figure / min(partitions, figure)` (at least 1) as `unitConcurrency`, so the per-unit share is 1 whenever the figure is at most the number of partitions. An interval with no unit running is not counted as clean. The run's totals of calls, refusals and throttles are summed across Connectors under a lock, so the switch from one Connector's publisher to the next does not count one Connector's twice.
 
 ## Tests
 
@@ -322,6 +329,7 @@ The Coordinator then bounds units in flight at `min(partitions, figure)`, and th
 | `DistributedCrawlTest` | End to end in memory (`LocalCrawlMessenger`): failures, hangs and the watchdog, stuck Coordinator, resume, throttled units, source concurrency against a fake limited source. |
 | `KafkaDistributedCrawlTest` | End to end on an embedded broker: dispatch after the work topic has been idle, resume after the Coordinator dies, unit costs, allowances in heartbeats, FileConnector hand-back on a temporary tree. |
 | `KafkaCoordinatorMessengerTest` | Event-before-unit order, dispatch failures reported as unit failures, flush, with a `MockProducer`. |
+| `CrawlerProducersTest` | Documents spread over producers by ID, one Document always on one producer, unit reports not waiting for a `CREATE` backlog. |
 | `S3StorageClientTest`, `LocalStorageClientTest`, `TraversalBudgetTest`, `SourceRetryPolicyTest`, `FailureClassTest`, `SourceConcurrencyControllerTest` | Budgets, retries (including a failure part way through a paged listing), classification, the controller. |
 | `PartitionedFileConnectorTest` | Planning, every file published exactly once under any cut, grouped hand-back, unreadable directories, path validation. |
 

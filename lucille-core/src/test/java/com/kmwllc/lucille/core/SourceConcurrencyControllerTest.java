@@ -46,6 +46,31 @@ public class SourceConcurrencyControllerTest {
   }
 
   @Test
+  public void testUnavailableAnswersCutOnlyAboveTheirRate() {
+    long[] now = {0};
+    // one in a thousand calls
+    SourceConcurrencyController controller = new SourceConcurrencyController(2400, 1200, 240, 24, 10_000, 0.001, () -> now[0]);
+
+    // a lone failure among 40,000 calls is noise: it costs its own retry and the figure goes on climbing
+    assertEquals(1440, controller.adjust(new SourceConcurrencyController.Interval(40_000, 0, 1)));
+    assertEquals(1680, controller.adjust(new SourceConcurrencyController.Interval(40_000, 0, 40)));
+    // above the rate, the source is failing under the load, and the figure is halved
+    assertEquals(840, controller.adjust(new SourceConcurrencyController.Interval(40_000, 0, 41)));
+    // failures with no calls to set them against are taken as above any rate
+    now[0] = 100_000;
+    assertEquals(420, controller.adjust(new SourceConcurrencyController.Interval(0, 0, 1)));
+    // a throttle is the source asking for less, and is heeded however few
+    now[0] = 200_000;
+    assertEquals(210, controller.adjust(new SourceConcurrencyController.Interval(1_000_000, 1, 0)));
+  }
+
+  @Test
+  public void testARateOfZeroCutsOnAnyUnavailableAnswer() {
+    SourceConcurrencyController controller = new SourceConcurrencyController(2400, 1200, 240, 24, 10_000, 0, () -> 0L);
+    assertEquals(600, controller.adjust(new SourceConcurrencyController.Interval(1_000_000, 0, 1)));
+  }
+
+  @Test
   public void testPerUnit() {
     SourceConcurrencyController controller = new SourceConcurrencyController(2400, 2400, 240, 24, 10_000);
     assertEquals(100, controller.perUnit(24));

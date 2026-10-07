@@ -167,6 +167,92 @@ public class CoordinatorPublisherTest {
     assertEquals(4, publisher.numUnitsDone());
   }
 
+  // What a Crawler sends while the unit is still executing: parts it may hand back at once.
+  private static Event earlyChildrenEvent(String unitKey, int attempt, int epoch, String execution, String... partKeys)
+      throws Exception {
+    Event event = childrenEvent(unitKey, attempt, epoch, execution, partKeys);
+    ObjectNode message = CrawlConfig.parseMessage(event.getMessage());
+    return new Event(event.getDocumentId(), RUN_ID, message.put("early", true).toString(), Event.Type.UNIT_CHILDREN);
+  }
+
+  @Test
+  public void testPartsHandedBackEarlyAreDispatchedBeforeTheUnitCompletes() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // two partitions and crawl.maxOutstandingUnits of 2: u0 and one part fit
+    publisher.handleEvent(earlyChildrenEvent("u0", 1, 1, "x", "p1", "p2"));
+    assertEquals(List.of("u0", "p1"), dispatchedKeys());
+    assertEquals(3, publisher.numUnitsOutstanding());
+
+    // the rest arrives with the completion, which counts the early parts as well
+    publisher.handleEvent(childrenEvent("u0", 1, 1, "x", "p3"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 3));
+    assertEquals(1, publisher.numUnitsDone());
+    assertEquals(List.of("u0", "p1", "p2"), dispatchedKeys());
+    assertEquals(List.of("connector1/p1", "connector1/p2", "connector1/p3"), publisher.outstandingUnitIds().stream().sorted().toList());
+
+    publisher.handleEvent(doneEvent("p1", 1, 1, "y", 0));
+    assertEquals(List.of("u0", "p1", "p2", "p3"), dispatchedKeys());
+  }
+
+  @Test
+  public void testPartsHandedBackEarlyOutliveAUnitThatFails() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+    publisher.handleEvent(earlyChildrenEvent("u0", 1, 1, "x", "p1"));
+    assertEquals(List.of("u0", "p1"), dispatchedKeys());
+
+    // u0 is executed again whole; the part already dispatched is not, even when handed back again
+    publisher.handleEvent(unitEvent("u0", 1, 1, Event.Type.UNIT_FAILED));
+    publisher.handleEvent(doneEvent("p1", 1, 1, "y", 0));
+    assertEquals(List.of("u0", "p1", "u0"), dispatchedKeys());
+    publisher.handleEvent(earlyChildrenEvent("u0", 2, 1, "z", "p1"));
+    publisher.handleEvent(doneEvent("u0", 2, 1, "z", 1));
+    assertEquals(List.of("u0", "p1", "u0"), dispatchedKeys());
+    assertFalse(publisher.hasOutstandingWork());
+  }
+
+  @Test
+  public void testABatchOfPartsSentTwiceIsCountedOnce() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    // a send that timed out after the broker had the batch: the Crawler sends it again at the next heartbeat
+    publisher.handleEvent(earlyChildrenEvent("u0", 1, 1, "x", "p1", "p2"));
+    publisher.handleEvent(earlyChildrenEvent("u0", 1, 1, "x", "p1", "p2"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 2));
+    assertEquals(1, publisher.numUnitsDone());
+    // each part is dispatched once: p1 while u0 ran, p2 into the partition u0 freed
+    assertEquals(List.of("u0", "p1", "p2"), dispatchedKeys());
+  }
+
+  @Test
+  public void testAUnitHandingItselfBackEarlyStillFails() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    publisher.handleEvent(earlyChildrenEvent("u0", 1, 1, "x", "u0"));
+    publisher.handleEvent(doneEvent("u0", 1, 1, "x", 1));
+    assertEquals(0, publisher.numUnitsDone());
+    assertEquals(List.of("u0", "u0"), dispatchedKeys());
+    assertEquals(2, messenger.dispatched.get(1).attempt());
+  }
+
+  @Test
+  public void testPartsHandedBackEarlyAreRecoveredFromTheLog() throws Exception {
+    // the earlier Coordinator logged the early parts and died before dispatching them
+    messenger.log.add(created(unit("u0", 1, 1)));
+    messenger.log.add(earlyChildrenEvent("u0", 1, 1, "x", "p1"));
+    CoordinatorPublisher publisher = publisher(2);
+    publisher.recover();
+    assertEquals(List.of("connector1/p1", "connector1/u0"), publisher.outstandingUnitIds().stream().sorted().toList());
+    assertTrue(messenger.dispatched.isEmpty());
+
+    publisher.redispatchOutstandingUnits();
+    assertEquals(List.of("p1", "u0"), dispatchedKeys().stream().sorted().toList());
+  }
+
   @Test
   public void testHandedBackPartsWaitForRoom() throws Exception {
     CoordinatorPublisher publisher = publisher(1);
@@ -808,6 +894,44 @@ public class CoordinatorPublisherTest {
     // a report on a unit that is done is ignored
     publisher.handleEvent(progressEvent("u0", 1, 1, "x", 50));
     assertEquals(14, publisher.numCallsRefused());
+  }
+
+  @Test
+  public void testCallsAndThrottlesAreCountedApartFromRefusals() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+    publisher.getSink().emit("u1", WorkUnit.newPayload());
+
+    ObjectNode progress = CrawlConfig.newMessage().put("attempt", 1).put("epoch", 1).put("execution", "x")
+        .put("sourceCalls", 1000).put("refusedCalls", 5).put("throttledCalls", 2);
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, progress.toString(), Event.Type.UNIT_PROGRESS));
+    ObjectNode done = CrawlConfig.newMessage().put("attempt", 1).put("epoch", 1).put("execution", "x")
+        .put("sourceCalls", 1500).put("refusedCalls", 6).put("throttledCalls", 2);
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, done.toString(), Event.Type.UNIT_DONE));
+    assertEquals(1500, publisher.numSourceCalls());
+    assertEquals(6, publisher.numCallsRefused());
+    assertEquals(2, publisher.numCallsThrottled());
+    assertEquals(0, publisher.numRequests());
+
+    // a Crawler that does not say how many were throttled is taken to mean all of them
+    publisher.handleEvent(progressEvent("u1", 1, 1, "y", 3));
+    assertEquals(9, publisher.numCallsRefused());
+    assertEquals(5, publisher.numCallsThrottled());
+    assertEquals(1600, publisher.numSourceCalls());
+  }
+
+  @Test
+  public void testRequestsAreCountedByTheirIncrease() throws Exception {
+    CoordinatorPublisher publisher = publisher(1);
+    publisher.getSink().emit("u0", WorkUnit.newPayload());
+
+    ObjectNode progress = CrawlConfig.newMessage().put("attempt", 1).put("epoch", 1).put("execution", "x")
+        .put("sourceCalls", 10).put("requests", 4000);
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, progress.toString(), Event.Type.UNIT_PROGRESS));
+    assertEquals(4000, publisher.numRequests());
+    publisher.handleEvent(new Event("connector1/u0", RUN_ID, progress.put("requests", 4500).toString(), Event.Type.UNIT_PROGRESS));
+    assertEquals(4500, publisher.numRequests());
+    assertEquals(10, publisher.numSourceCalls());
   }
 
   private static Event progressEvent(String unitKey, int attempt, int epoch, String execution, long refused) {

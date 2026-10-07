@@ -12,12 +12,9 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -27,9 +24,6 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.CooperativeStickyAssignor;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
-import org.apache.kafka.clients.producer.KafkaProducer;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.RebalanceInProgressException;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -49,6 +43,7 @@ import org.slf4j.LoggerFactory;
  *
  * Documents are sent without waiting for each to be accepted. The CREATE Event for a Document is sent only after the
  * Document has been accepted, so the Coordinator is never told of a Document that did not reach the source topic.
+ * See {@link CrawlerProducers} for which producer sends what.
  */
 public class KafkaCrawlerMessenger implements CrawlerMessenger {
 
@@ -59,8 +54,7 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
 
   private final Config config;
   private final RunControlTracker tracker;
-  private final KafkaProducer<String, Document> documentProducer;
-  private final KafkaProducer<String, String> eventProducer;
+  private final CrawlerProducers producers;
   private final ScheduledExecutorService keepAlive;
 
   // A KafkaConsumer must not be used by two threads at once. Guards the consumer and the fields describing the held unit.
@@ -69,19 +63,10 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
   private ConsumerRecord<String, String> heldRecord;
   private volatile boolean unitLost;
 
-  // Documents the source topic has accepted, each awaiting its CREATE Event. Filled by the producer's callback thread.
-  private final ConcurrentLinkedQueue<Event> pendingCreates = new ConcurrentLinkedQueue<>();
-  private final AtomicReference<Exception> sendException = new AtomicReference<>();
-
   public KafkaCrawlerMessenger(Config config, CrawlConfig crawlConfig, RunControlTracker tracker) {
     this.config = config;
     this.tracker = tracker;
-
-    this.documentProducer = KafkaUtils.createDocumentProducer(config);
-    this.eventProducer = KafkaUtils.createEventProducer(config);
-    if (eventProducer == null) {
-      throw new IllegalArgumentException("A distributed crawl requires Events; kafka.events cannot be false.");
-    }
+    this.producers = CrawlerProducers.create(config, crawlConfig.documentProducers);
 
     try {
       // a Crawler can be started before any Coordinator has created the topic
@@ -145,11 +130,9 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
 
       // A unit that failed or was abandoned can leave sends in flight. They are allowed to finish first, so that
       // their outcome is not taken for this unit's.
-      documentProducer.flush();
+      producers.startUnit();
       heldRecord = record;
       unitLost = false;
-      sendException.set(null);
-      pendingCreates.clear();
       workConsumer.pause(workConsumer.assignment());
       return unit;
     }
@@ -248,59 +231,17 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
 
   @Override
   public void sendForProcessing(Document document, String pipelineName) throws Exception {
-    checkException();
-    sendPendingCreates(pipelineName);
-
-    Event create = new Event(document, null, Event.Type.CREATE);
-    documentProducer.send(
-        new ProducerRecord<>(KafkaUtils.getSourceTopicName(pipelineName, config), document.getId(), document),
-        (metadata, exception) -> {
-          if (exception != null) {
-            log.error("Kafka send failed for document: {}", create.getDocumentId(), exception);
-            sendException.compareAndSet(null, exception);
-          } else {
-            pendingCreates.add(create);
-          }
-        });
-  }
-
-  private void sendPendingCreates(String pipelineName) {
-    Event create;
-    while ((create = pendingCreates.poll()) != null) {
-      String eventTopic = KafkaUtils.getEventTopicName(config, pipelineName, create.getRunId());
-      String docId = create.getDocumentId();
-      eventProducer.send(new ProducerRecord<>(eventTopic, docId, create.toString()), (metadata, exception) -> {
-        if (exception != null) {
-          log.error("Kafka send failed for CREATE event of document: {}", docId, exception);
-          sendException.compareAndSet(null, exception);
-        }
-      });
-    }
+    producers.sendForProcessing(document, pipelineName);
   }
 
   @Override
   public void flush(String pipelineName) throws Exception {
-    documentProducer.flush();
-    sendPendingCreates(pipelineName);
-    eventProducer.flush();
-    checkException();
-  }
-
-  private void checkException() throws Exception {
-    Exception e = sendException.get();
-    if (e != null) {
-      throw new Exception("Kafka send failed", e);
-    }
+    producers.flush(pipelineName);
   }
 
   @Override
   public void sendEvent(Event event, String pipelineName) throws Exception {
-    String eventTopic = KafkaUtils.getEventTopicName(config, pipelineName, event.getRunId());
-    Future<RecordMetadata> sent = eventProducer.send(new ProducerRecord<>(eventTopic, event.getDocumentId(), event.toString()));
-    // sent at once: left to itself the producer holds a record back for linger.ms in case more follow, and this
-    // is paid once per unit
-    eventProducer.flush();
-    sent.get();
+    producers.sendEvent(event, pipelineName);
   }
 
   @Override
@@ -314,8 +255,7 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
     synchronized (consumerLock) {
       KafkaCoordinatorMessenger.closeQuietly(workConsumer, "work consumer");
     }
-    KafkaCoordinatorMessenger.closeQuietly(documentProducer, "document producer");
-    KafkaCoordinatorMessenger.closeQuietly(eventProducer, "event producer");
+    producers.close();
   }
 
   /**

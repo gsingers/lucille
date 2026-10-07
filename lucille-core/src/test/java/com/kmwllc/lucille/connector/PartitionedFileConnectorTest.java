@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Comparator;
+import java.net.URI;
 import java.util.List;
 import java.util.stream.Stream;
 import java.util.Map;
@@ -319,6 +320,35 @@ public class PartitionedFileConnectorTest {
   }
 
   @Test
+  public void testGroupsAreHandedBackAsSoonAsTheyFill() {
+    RecordingUnitContext context = new RecordingUnitContext();
+    List<URI> unitPaths = List.of(root.toUri());
+    FileConnector.HandBacks handBacks = new FileConnector.HandBacks(unitPaths, true, 2, context);
+    List<URI> directories = List.of(root.resolve("a").toUri(), root.resolve("b").toUri(), root.resolve("c").toUri(),
+        root.resolve("d").toUri(), root.resolve("e").toUri());
+
+    // nothing until a group is full; then that group, while the unit is still going
+    handBacks.add(directories.get(0));
+    assertTrue(context.handedBack.isEmpty());
+    handBacks.add(directories.get(1));
+    assertEquals(1, context.handedBack.size());
+    handBacks.add(directories.get(2));
+    handBacks.add(directories.get(3));
+    assertEquals(2, context.handedBack.size());
+
+    // the rest when the unit ends; the groups are those that handing everything back at the end would have made
+    handBacks.add(directories.get(4));
+    handBacks.finish();
+    RecordingUnitContext atTheEnd = new RecordingUnitContext();
+    FileConnector.HandBacks allAtOnce = new FileConnector.HandBacks(unitPaths, true, 2, atTheEnd);
+    directories.forEach(allAtOnce::add);
+    allAtOnce.finish();
+    assertEquals(3, context.handedBack.size());
+    assertEquals(atTheEnd.handedBack, context.handedBack);
+    assertEquals(root.resolve("e").toUri().toString(), new ArrayList<>(context.handedBack.keySet()).get(2));
+  }
+
+  @Test
   public void testUnitForSeveralDirectoriesIsHeldToTheConfiguredPaths() throws Exception {
     Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 2 }");
     FileConnector connector = new FileConnector(config);
@@ -370,6 +400,8 @@ public class PartitionedFileConnectorTest {
       assertEquals(List.of(b.toUri().toString()), new ArrayList<>(context.handedBack.keySet()));
       assertEquals(FailureClass.SOURCE_ERROR, context.errorClass);
       assertTrue(context.errorCause, context.errorCause.contains("AccessDenied"));
+      // the failure was recorded before b/ was handed back, so a Crawler holds b/ back for the unit's completion
+      assertEquals(Set.of(b.toUri().toString()), context.handedBackAfterError);
 
       // that unit meets the same failure, and hands back only itself
       FileConnector again = new FileConnector(config);

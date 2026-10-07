@@ -36,6 +36,7 @@ import com.kmwllc.lucille.core.FailureClass;
 import com.kmwllc.lucille.core.SourceException;
 import java.util.concurrent.atomic.AtomicInteger;
 import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.S3Exception;
@@ -169,28 +170,59 @@ public class S3StorageClientTest {
     assertEquals(6, calls.get());
     assertEquals(3, budget.getDirectoriesListed());
     assertEquals(3, budget.getRefusedCalls());
+    assertEquals(3, budget.getThrottledCalls());
     assertNull(budget.getSourceError());
     assertEquals(List.of(), budget.getHandedBack());
   }
 
   @Test
-  public void testListingRefusedPartWayThroughIsRetriedWhole() throws Exception {
-    // the store serves the first page of the root's listing, then refuses the next, once
+  public void testUnavailableAnswersAreCountedApartFromThrottles() throws Exception {
+    AtomicInteger calls = new AtomicInteger();
+    TraversalBudget budget = TraversalBudget.unlimited();
+
+    clientWith(refusingClient(503, 2, calls)).traverse(new PublisherImpl(ConfigFactory.empty(), new TestMessenger(), "run1", "pipeline1"),
+        new TraversalParams(QUICK_RETRIES, URI.create("s3://bucket/"), "", true, budget));
+
+    assertEquals(2, budget.getRefusedCalls());
+    assertEquals(0, budget.getThrottledCalls());
+    // every request is counted, so that refusals can be set against them: three pages, three fetches, two failures
+    assertEquals(8, budget.getRequests());
+  }
+
+  // A page of a listing, with the token for the page after it (null on the last page).
+  private static ListObjectsV2Response page(String objectKey, String commonPrefix, String nextToken) {
+    ListObjectsV2Response page = mock(ListObjectsV2Response.class);
+    when(page.contents()).thenReturn(List.of(S3Object.builder().key(objectKey).lastModified(Instant.ofEpochMilli(1)).size(1L).build()));
+    when(page.commonPrefixes()).thenReturn(List.of(CommonPrefix.builder().prefix(commonPrefix).build()));
+    when(page.nextContinuationToken()).thenReturn(nextToken);
+    return page;
+  }
+
+  private static ListObjectsV2Iterable pages(Stream<ListObjectsV2Response> pages) {
+    ListObjectsV2Iterable iterable = mock(ListObjectsV2Iterable.class);
+    when(iterable.stream()).thenReturn(pages);
+    return iterable;
+  }
+
+  @Test
+  public void testListingRefusedPartWayThroughResumesFromThePageItReached() throws Exception {
+    // the root's listing has two pages; the store serves the first, then refuses the second, once
     S3Client serving = mockClientWithPrefixes();
-    AtomicInteger rootListings = new AtomicInteger();
+    List<String> rootTokens = new ArrayList<>();
     S3Client mockClient = mock(S3Client.class, RETURNS_DEEP_STUBS);
     when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenAnswer(invocation -> {
       ListObjectsV2Request request = invocation.getArgument(0);
-      ListObjectsV2Iterable whole = serving.listObjectsV2Paginator(request);
-      if (!request.prefix().isEmpty() || rootListings.incrementAndGet() > 1) {
-        return whole;
+      if (!request.prefix().isEmpty()) {
+        return serving.listObjectsV2Paginator(request);
       }
-      // the real paginator is lazy: the failure comes while the pages are being read, after the first was consumed
-      ListObjectsV2Iterable failing = mock(ListObjectsV2Iterable.class);
-      when(failing.stream()).thenAnswer(i -> Stream.concat(whole.stream(), Stream.generate(() -> {
-        throw S3Exception.builder().statusCode(503).message("unavailable").build();
-      })));
-      return failing;
+      rootTokens.add(request.continuationToken());
+      if (request.continuationToken() == null) {
+        // the real paginator is lazy: the failure comes while the pages are being read, after the first was consumed
+        return pages(Stream.concat(Stream.of(page("root.txt", "a/", "page2")), Stream.generate(() -> {
+          throw S3Exception.builder().statusCode(503).message("unavailable").build();
+        })));
+      }
+      return pages(Stream.of(page("root2.txt", "b/", null)));
     });
     TestMessenger messenger = new TestMessenger();
     TraversalBudget budget = TraversalBudget.unlimited();
@@ -198,14 +230,76 @@ public class S3StorageClientTest {
     clientWith(mockClient).traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
         new TraversalParams(QUICK_RETRIES, URI.create("s3://bucket/"), "", true, budget));
 
-    // the root's object was published by the attempt that failed and again by the one that passed; nothing is lost,
-    // and the prefixes found by the failed attempt were not carried over to be listed twice
+    // the retry asked for the page that failed, not the first again, so nothing was published twice; the prefixes
+    // found on both pages were listed
     List<String> published = messenger.getDocsSentForProcessing().stream().map(doc -> doc.getString(FILE_PATH)).toList();
-    assertEquals(List.of("s3://bucket/root.txt", "s3://bucket/root.txt", "s3://bucket/a/file.txt", "s3://bucket/b/file.txt"), published);
-    assertEquals(2, rootListings.get());
+    assertEquals(List.of("s3://bucket/root.txt", "s3://bucket/root2.txt", "s3://bucket/a/file.txt", "s3://bucket/b/file.txt"), published);
+    assertEquals(java.util.Arrays.asList(null, "page2"), rootTokens);
     assertEquals(3, budget.getDirectoriesListed());
     assertEquals(1, budget.getRefusedCalls());
     assertNull(budget.getSourceError());
+  }
+
+  private static AwsServiceException unavailable() {
+    return S3Exception.builder().statusCode(503).message("unavailable").build();
+  }
+
+  private S3StorageClient quickClientWith(S3Client s3) {
+    S3StorageClient client = new S3StorageClient(ConfigFactory.parseMap(Map.of(S3_REGION, "us-east-1")), new SourceRetryPolicy(10_000, 1_000));
+    client.setS3ClientForTesting(s3);
+    client.initializeForTesting();
+    return client;
+  }
+
+  @Test
+  public void testCallsOutsideATraversalAreRetried() throws Exception {
+    // the SDK's own retries are off, so each of these would fail on its first refusal unless Lucille retries it
+    S3Client mockClient = mockClientWithPrefixes();
+    when(mockClient.copyObject(any(CopyObjectRequest.class))).thenThrow(unavailable()).thenReturn(null);
+    when(mockClient.deleteObject(any(DeleteObjectRequest.class))).thenThrow(unavailable()).thenReturn(null);
+    ResponseInputStream<GetObjectResponse> content = new ResponseInputStream<>(GetObjectResponse.builder().build(),
+        new ByteArrayInputStream("hello".getBytes()));
+    when(mockClient.getObject(any(GetObjectRequest.class))).thenThrow(unavailable()).thenReturn(content);
+    ListObjectsV2Iterable listing = mockClient.listObjectsV2Paginator(ListObjectsV2Request.builder().prefix("").build());
+    when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenThrow(unavailable()).thenReturn(listing);
+    S3StorageClient client = quickClientWith(mockClient);
+
+    client.moveFile(URI.create("s3://bucket/a/file.txt"), URI.create("s3://bucket/done/"));
+    verify(mockClient, times(2)).copyObject(any(CopyObjectRequest.class));
+    verify(mockClient, times(2)).deleteObject(any(DeleteObjectRequest.class));
+
+    assertEquals("hello", new String(client.getFileContentStream(URI.create("s3://bucket/a/file.txt")).readAllBytes()));
+
+    URI root = URI.create("s3://bucket/");
+    assertEquals(List.of(URI.create("s3://bucket/a/"), URI.create("s3://bucket/b/")),
+        client.listSubdirectories(root, new TraversalParams(QUICK_RETRIES, root, "")));
+  }
+
+  @Test
+  public void testAnErrorOutsideATraversalIsNotRetried() throws Exception {
+    S3Client mockClient = mock(S3Client.class);
+    when(mockClient.copyObject(any(CopyObjectRequest.class))).thenThrow(S3Exception.builder().statusCode(403).build());
+
+    assertThrows(S3Exception.class, () -> quickClientWith(mockClient).moveFile(URI.create("s3://bucket/a"), URI.create("s3://bucket/done/")));
+    verify(mockClient, times(1)).copyObject(any(CopyObjectRequest.class));
+  }
+
+  @Test
+  public void testTheConnectorsRetrySettingsReachTheClient() {
+    Config connector = ConfigFactory.parseString("s3 { region: us-east-1 }, sourceRetrySecs: 0");
+    S3StorageClient client = (S3StorageClient) StorageClient.create(URI.create("s3://bucket/"), connector);
+    assertEquals(0, client.retryPolicy().maxMillis());
+
+    // a stage or another connector that reads S3 keeps the SDK's own retries unless it asks for Lucille's
+    client = (S3StorageClient) StorageClient.create(URI.create("s3://bucket/"), ConfigFactory.parseString("s3 { region: us-east-1 }"));
+    assertEquals(SourceRetryPolicy.NONE, client.retryPolicy());
+    client = (S3StorageClient) StorageClient.createClients(ConfigFactory.parseString("s3 { region: us-east-1 }")).get("s3");
+    assertEquals(SourceRetryPolicy.NONE, client.retryPolicy());
+
+    // asked for, it is Lucille's
+    client = (S3StorageClient) StorageClient.createClients(
+        ConfigFactory.parseString("s3 { region: us-east-1 }, sourceRetrySecs: 180")).get("s3");
+    assertEquals(SourceRetryPolicy.fromConfig(ConfigFactory.empty()), client.retryPolicy());
   }
 
   @Test
@@ -306,6 +400,9 @@ public class S3StorageClientTest {
     assertEquals(FailureClass.THROTTLED, S3StorageClient.classify(S3Exception.builder().statusCode(400)
         .awsErrorDetails(AwsErrorDetails.builder().errorCode("Throttling").build()).build()));
     assertEquals(FailureClass.SOURCE_UNAVAILABLE, S3StorageClient.classify(S3Exception.builder().statusCode(503).build()));
+    // S3 asks for a lower request rate with a 503 SlowDown, which is a throttle, not the store being down
+    assertEquals(FailureClass.THROTTLED, S3StorageClient.classify(S3Exception.builder().statusCode(503)
+        .awsErrorDetails(AwsErrorDetails.builder().errorCode("SlowDown").build()).build()));
     assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(S3Exception.builder().statusCode(403).build()));
     assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(NoSuchKeyException.builder().statusCode(404).build()));
     assertEquals(FailureClass.SOURCE_ERROR, S3StorageClient.classify(S3Exception.builder().statusCode(501).build()));

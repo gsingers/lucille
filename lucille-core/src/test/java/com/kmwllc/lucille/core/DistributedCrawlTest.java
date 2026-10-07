@@ -16,6 +16,7 @@ import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -144,6 +145,52 @@ public class DistributedCrawlTest {
       assertEquals(unitKey, 1, ScriptedPartitionedConnector.executionsOf(unitKey));
     }
     assertEquals(1, ScriptedPartitionedConnector.finalizes.get());
+  }
+
+  @Test
+  public void testPartsHandedBackWhileAUnitExecutesRunBeforeItCompletes() throws Exception {
+    Config config = start(SCRIPTED);
+    // u0 hands back two parts and then keeps executing until they are done
+    ScriptedPartitionedConnector.earlyHandBacks.put("u0", List.of("p1", "p2"));
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(40, numSucceeded(result));
+    assertEquals(Set.of("u0"), ScriptedPartitionedConnector.outlivedEarlyParts);
+    for (String unitKey : List.of("u0", "p1", "p2")) {
+      assertEquals(unitKey, 1, ScriptedPartitionedConnector.executionsOf(unitKey));
+    }
+  }
+
+  @Test
+  public void testPartsHandedBackEarlyWaitForTheUnitWhenTurnedOff() throws Exception {
+    Config config = start(SCRIPTED, "crawl.dispatchHandBacksEarly: false");
+    ScriptedPartitionedConnector.earlyHandBacks.put("u0", List.of("p1"));
+    ScriptedPartitionedConnector.earlyWaitMillis = 2500;
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(35, numSucceeded(result));
+    assertTrue(ScriptedPartitionedConnector.outlivedEarlyParts.isEmpty());
+    assertEquals(1, ScriptedPartitionedConnector.executionsOf("p1"));
+  }
+
+  @Test
+  public void testPartsHandedBackBecauseTheSourceRefusedWaitForTheUnit() throws Exception {
+    // what a unit hands back after its source refused it is delayed, so it cannot be dispatched before the unit ends
+    Config config = start(SCRIPTED, "crawl { throttleBackoffSecs: 1, throttleBackoffCapSecs: 1 }");
+    ScriptedPartitionedConnector.earlyHandBacks.put("u0", List.of("p1"));
+    ScriptedPartitionedConnector.earlyAfterSourceError.add("u0");
+    ScriptedPartitionedConnector.earlyWaitMillis = 2500;
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(35, numSucceeded(result));
+    assertTrue(ScriptedPartitionedConnector.outlivedEarlyParts.isEmpty());
+    assertEquals(1, ScriptedPartitionedConnector.executionsOf("p1"));
   }
 
   @Test

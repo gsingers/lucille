@@ -60,6 +60,11 @@ import org.apache.kafka.clients.admin.NewTopic;
  *   <li>sourceConcurrencyHoldSecs (Int, Optional) : After refused calls halve the figure, how long before it may be
  *   halved again, so that reports still arriving from the same burst do not halve it twice. Defaults to
  *   throttleBackoffCapSecs.</li>
+ *   <li>sourceUnavailableRate (Double, Optional) : Any call the source throttles halves the figure. A call it could
+ *   not answer (a 5xx, a connection failure) halves it only when more than this share of a heartbeat interval's
+ *   requests went unanswered (every request, pages, fetches and failed attempts included, where the connector counts
+ *   them, as FileConnector on S3 does; its source calls where it does not); below that they are a background error rate, each already retried. Defaults to 0.001, one call
+ *   in a thousand; 0 halves the figure on any.</li>
  *   <li>costsFromRun (String, Optional) : The ID of an earlier run of this config whose unit reports say what each unit
  *   cost. The Coordinator dispatches the units it expects to cost most first, which keeps a few large units from
  *   setting the length of the run. Not set by default; units are then dispatched in the order they are planned.
@@ -67,6 +72,16 @@ import org.apache.kafka.clients.admin.NewTopic;
  *   <li>exitOnTimeout (Boolean, Optional) : Whether a Crawler process exits after reporting a unit that passed
  *   maxUnitSecs, instead of replacing the thread. Exiting is the only way to free what a stuck thread holds, and
  *   suits a deployment that restarts Crawlers. Defaults to false.</li>
+ *   <li>dispatchHandBacksEarly (Boolean, Optional) : Whether a Crawler sends the parts a unit hands back with its
+ *   progress reports, every heartbeat, so that the Coordinator dispatches them while the unit is still executing.
+ *   Otherwise they wait for the unit to complete, and a unit that runs long past its bound holds back everything it
+ *   gave up. A unit that fails after handing parts back early is executed again whole, so those parts may be crawled
+ *   twice; Document IDs are the same either time. Parts handed back after the source refused the unit always wait.
+ *   Defaults to true.</li>
+ *   <li>documentProducers (Int, Optional) : How many Kafka producers each Crawler thread sends Documents on, each
+ *   with its own sending thread and buffer (kafka.producer settings apply to each). A Crawler whose traversal threads
+ *   wait on the producer's buffer, because one sending thread cannot keep up, sends faster with more. A Document
+ *   always goes on the same one, chosen by its ID. Defaults to 1.</li>
  * </ul>
  */
 public final class CrawlConfig {
@@ -76,8 +91,8 @@ public final class CrawlConfig {
       .optionalNumber("workTopicPartitions", "topicReplicationFactor", "threads", "maxOutstandingUnits", "maxAttempts",
           "heartbeatSecs", "orphanTimeoutSecs", "maxUnitSecs", "maxThrottledAttempts", "throttleBackoffSecs",
           "throttleBackoffCapSecs", "maxSourceConcurrency", "initialSourceConcurrency", "sourceConcurrencyStep",
-          "sourceConcurrencyHoldSecs")
-      .optionalBoolean("exitOnTimeout")
+          "sourceConcurrencyHoldSecs", "sourceUnavailableRate", "documentProducers")
+      .optionalBoolean("exitOnTimeout", "dispatchHandBacksEarly")
       .optionalString("costsFromRun").build();
 
   // Config keys whose values are left out of the config hash, so that a hash published to Kafka cannot be used to
@@ -114,11 +129,14 @@ public final class CrawlConfig {
   public final int initialSourceConcurrency;
   public final int sourceConcurrencyStep;
   public final int sourceConcurrencyHoldSecs;
+  public final double sourceUnavailableRate;
   public final int heartbeatSecs;
   public final int orphanTimeoutSecs;
   // null when not configured, in which case a unit is never timed out
   public final Integer maxUnitSecs;
   public final boolean exitOnTimeout;
+  public final boolean dispatchHandBacksEarly;
+  public final int documentProducers;
   // null when not configured
   public final String costsFromRun;
 
@@ -143,6 +161,11 @@ public final class CrawlConfig {
     this.initialSourceConcurrency = atLeastOne(config, "crawl.initialSourceConcurrency", Math.max(1, max / 4));
     this.sourceConcurrencyStep = atLeastOne(config, "crawl.sourceConcurrencyStep", Math.max(1, max / 10));
     this.sourceConcurrencyHoldSecs = atLeastOne(config, "crawl.sourceConcurrencyHoldSecs", throttleBackoffCapSecs);
+    this.sourceUnavailableRate = config.hasPath("crawl.sourceUnavailableRate")
+        ? config.getDouble("crawl.sourceUnavailableRate") : SourceConcurrencyController.DEFAULT_UNAVAILABLE_RATE;
+    if (sourceUnavailableRate < 0 || sourceUnavailableRate >= 1) {
+      throw new IllegalArgumentException("crawl.sourceUnavailableRate must be at least 0 and less than 1.");
+    }
     if (maxSourceConcurrency != null && initialSourceConcurrency > maxSourceConcurrency) {
       throw new IllegalArgumentException("crawl.initialSourceConcurrency cannot exceed crawl.maxSourceConcurrency.");
     }
@@ -150,6 +173,8 @@ public final class CrawlConfig {
     this.orphanTimeoutSecs = atLeastOne(config, "crawl.orphanTimeoutSecs", 120);
     this.maxUnitSecs = config.hasPath("crawl.maxUnitSecs") ? atLeastOne(config, "crawl.maxUnitSecs", 1) : null;
     this.exitOnTimeout = config.hasPath("crawl.exitOnTimeout") && config.getBoolean("crawl.exitOnTimeout");
+    this.dispatchHandBacksEarly = !config.hasPath("crawl.dispatchHandBacksEarly") || config.getBoolean("crawl.dispatchHandBacksEarly");
+    this.documentProducers = atLeastOne(config, "crawl.documentProducers", 1);
     this.costsFromRun = config.hasPath("crawl.costsFromRun") ? config.getString("crawl.costsFromRun") : null;
     if (costsFromRun != null && !isValidRunId(costsFromRun)) {
       throw new IllegalArgumentException("crawl.costsFromRun is not a valid run ID.");

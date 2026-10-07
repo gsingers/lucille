@@ -17,10 +17,15 @@ public class RecordingUnitContext implements UnitContext {
   public long refusedCalls = 0;
   public FailureClass errorClass;
   public String errorCause;
+  /** The keys of the parts handed back after a source error had been recorded. */
+  public final java.util.Set<String> handedBackAfterError = new java.util.LinkedHashSet<>();
 
   @Override
   public void handBack(String unitKey, ObjectNode payload) {
     handedBack.put(unitKey, payload);
+    if (errorClass != null) {
+      handedBackAfterError.add(unitKey);
+    }
   }
 
   @Override

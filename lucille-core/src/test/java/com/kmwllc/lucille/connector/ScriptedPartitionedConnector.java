@@ -65,6 +65,15 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
    * and may itself have parts to hand back.
    */
   public static final Map<String, List<String>> handBacks = new ConcurrentHashMap<>();
+  /**
+   * For a unit, the keys of parts it hands back first thing, after which it waits, for up to {@link #earlyWaitMillis},
+   * until they have all completed. Records in {@link #outlivedEarlyParts} whether they did.
+   */
+  public static final Map<String, List<String>> earlyHandBacks = new ConcurrentHashMap<>();
+  public static final Set<String> outlivedEarlyParts = ConcurrentHashMap.newKeySet();
+  public static volatile long earlyWaitMillis = 10_000;
+  /** Of those units, the ones that meet a throttled source first, so that what they hand back is the source's refusal. */
+  public static final Set<String> earlyAfterSourceError = ConcurrentHashMap.newKeySet();
   /** Units that, the first time they are executed, wait for {@link #hang} to open before doing anything. */
   public static final Set<String> hangOnce = ConcurrentHashMap.newKeySet();
   /** Units that found their execution cancelled once {@link #hang} had opened. */
@@ -120,6 +129,10 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     started.set(0);
     completed.clear();
     handBacks.clear();
+    earlyHandBacks.clear();
+    outlivedEarlyParts.clear();
+    earlyWaitMillis = 10_000;
+    earlyAfterSourceError.clear();
     hangOnce.clear();
     throttledOnce.clear();
     throttleFailOnce.clear();
@@ -191,6 +204,9 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       if (sourceLimit > 0) {
         callTheSource(context);
       }
+      if (execution == 1 && earlyHandBacks.containsKey(unitKey)) {
+        awaitEarlyParts(earlyHandBacks.get(unitKey), context, unitKey);
+      }
       if (hangAlways.contains(unitKey) || (execution == 1 && hangOnce.contains(unitKey))) {
         hang.await();
         if (context.isCancelled()) {
@@ -205,9 +221,9 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       for (int i = 0; i < docsPerUnit; i++) {
         if (execution == 1 && throttledOnce.contains(unitKey) && i == docsPerUnit / 2) {
           // the source refused the rest: handed back under a key of its own, to be executed as a unit
+          context.recordSourceError(FailureClass.THROTTLED, "RuntimeException: 429 Too Many Requests");
           context.handBack(unitKey + "-rest", WorkUnit.newPayload().put("key", unitKey + "-rest"));
           context.addRefusedCalls(3);
-          context.recordSourceError(FailureClass.THROTTLED, "RuntimeException: 429 Too Many Requests");
           break;
         }
         publisher.publish(Document.create(createDocId(unitKey + "-" + i)));
@@ -226,6 +242,22 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
       throw new ConnectorException("Error publishing document", e);
     } finally {
       executing.decrementAndGet();
+    }
+  }
+
+  private static void awaitEarlyParts(List<String> parts, UnitContext context, String unitKey) throws InterruptedException {
+    if (earlyAfterSourceError.contains(unitKey)) {
+      context.recordSourceError(FailureClass.THROTTLED, "RuntimeException: 429 Too Many Requests");
+    }
+    for (String part : parts) {
+      context.handBack(part, WorkUnit.newPayload().put("key", part));
+    }
+    long deadline = System.currentTimeMillis() + earlyWaitMillis;
+    while (System.currentTimeMillis() < deadline && !completed.containsAll(parts)) {
+      Thread.sleep(50);
+    }
+    if (completed.containsAll(parts)) {
+      outlivedEarlyParts.add(unitKey);
     }
   }
 

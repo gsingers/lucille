@@ -126,7 +126,7 @@ public interface StorageClient {
           throw new IllegalArgumentException("Path is to S3 but no options provided.");
         }
         Config s3Options = connectorConfig.getConfig("s3");
-        return new S3StorageClient(s3Options);
+        return new S3StorageClient(s3Options, retryPolicyAskedFor(connectorConfig));
       }
       case "https" -> {
         String authority = pathToStorage.getAuthority();
@@ -177,6 +177,9 @@ public interface StorageClient {
    * includes the LocalStorageClient, keyed by "file".
    */
   static Map<String, StorageClient> createClients(Config config) {
+    // Lucille retries calls the source refuses only if the config sets sourceRetrySecs, which FileConnector always
+    // does; everything else keeps the cloud SDK's own retries
+    SourceRetryPolicy retryPolicy = retryPolicyAskedFor(config);
     Map<String, StorageClient> results = new HashMap<>();
 
     results.put("file", new LocalStorageClient());
@@ -193,10 +196,16 @@ public interface StorageClient {
 
     if (config.hasPath("s3")) {
       Config s3Options = config.getConfig("s3");
-      results.put("s3", new S3StorageClient(s3Options));
+      results.put("s3", new S3StorageClient(s3Options, retryPolicy));
     }
 
     return results;
+  }
+
+  // Lucille's retry policy if the config sets one, and otherwise none, which leaves the SDK's own retries on: a stage
+  // fetching a file is not held for minutes by an unreachable store unless it asks to be.
+  private static SourceRetryPolicy retryPolicyAskedFor(Config config) {
+    return config.hasPath(SourceRetryPolicy.RETRY_SECS) ? SourceRetryPolicy.fromConfig(config) : SourceRetryPolicy.NONE;
   }
 
   /**

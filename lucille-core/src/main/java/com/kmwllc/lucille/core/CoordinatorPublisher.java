@@ -11,6 +11,7 @@ import com.typesafe.config.Config;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
@@ -62,6 +63,8 @@ public class CoordinatorPublisher extends PublisherImpl {
   static final String CHILD_KEY = "key";
   static final String CHILD_PAYLOAD = "payload";
   static final String NUM_CHILDREN = "numChildren";
+  // on a UNIT_CHILDREN, that the parts were handed back while the unit was executing and may be dispatched at once
+  static final String EARLY = "early";
   static final String NUM_PUBLISHED = "numPublished";
   static final String SOURCE_CALLS = "sourceCalls";
   static final String DURATION_MS = "durationMs";
@@ -70,6 +73,10 @@ public class CoordinatorPublisher extends PublisherImpl {
   public static final String ERROR_CLASS = "errorClass";
   public static final String ERROR_CAUSE = "errorCause";
   public static final String REFUSED_CALLS = "refusedCalls";
+  // of the refused calls, those the source throttled; the rest it could not answer
+  public static final String THROTTLED_CALLS = "throttledCalls";
+  // every request made to the source, failed attempts and fetches included; what refusals are set against
+  public static final String REQUESTS = "requests";
 
   private static final int UNDISPATCHED_EPOCH = 0;
 
@@ -133,14 +140,15 @@ public class CoordinatorPublisher extends PublisherImpl {
   // not. The two are limited separately: a source that is overloaded is waited out, a unit that is broken is not.
   private final Map<String, Integer> plainFailures = new HashMap<>();
   private final Map<String, Integer> throttledFailures = new HashMap<>();
-  // the refusals each execution of an outstanding unit has reported so far, by unit ID and execution
-  private final Map<String, Long> refusedSoFar = new HashMap<>();
+  // the calls, refusals and throttles each execution of an outstanding unit has reported so far, by unit ID and
+  // execution
+  private final Map<String, long[]> refusedSoFar = new HashMap<>();
 
   private record Dispatch(WorkUnit unit, int partition) { }
 
   // What executions of outstanding units have handed back so far, by unit ID and then by execution. A unit that is
   // executed twice reports twice, and only the execution whose completion is accepted counts.
-  private final Map<String, Map<String, List<JsonNode>>> handedBack = new HashMap<>();
+  private final Map<String, Map<String, Map<String, JsonNode>>> handedBack = new HashMap<>();
 
   // True while handling Events that an earlier Coordinator already acted on. Nothing is dispatched then.
   private boolean replaying = false;
@@ -160,6 +168,9 @@ public class CoordinatorPublisher extends PublisherImpl {
   // the same, for this connector alone; the registry's counters are shared across runs of a JVM
   private final AtomicLong numUnitsThrottled = new AtomicLong();
   private final AtomicLong numCallsRefused = new AtomicLong();
+  private final AtomicLong numCallsThrottled = new AtomicLong();
+  private final AtomicLong numSourceCalls = new AtomicLong();
+  private final AtomicLong numRequests = new AtomicLong();
 
   /**
    * @param unitCosts what the units cost in an earlier run, by unit ID, or empty. See crawl.costsFromRun.
@@ -625,8 +636,11 @@ public class CoordinatorPublisher extends PublisherImpl {
     return unit;
   }
 
-  // A Crawler sends what a unit handed back ahead of the unit's completion, in as many Events as it takes. Nothing is
-  // done with it until the completion arrives: an execution that does not complete has handed nothing back.
+  // A Crawler sends what a unit handed back ahead of the unit's completion, in as many Events as it takes. Most of
+  // it waits for the completion: an execution that does not complete has handed nothing back. Parts marked early
+  // were handed back while the unit was still executing, and are made units at once, so that the rest of the run
+  // need not wait for a long unit to finish; if the unit then fails, they stand, and the unit is executed again whole.
+  // They are counted with the rest when the completion arrives.
   private void handleUnitChildren(Event event) {
     ObjectNode message = parse(event);
     WorkUnit unit = message == null ? null : outstandingUnitFor(event, message);
@@ -634,22 +648,45 @@ public class CoordinatorPublisher extends PublisherImpl {
       return;
     }
 
-    List<JsonNode> children = handedBack.computeIfAbsent(unit.unitId(), id -> new HashMap<>())
-        .computeIfAbsent(message.path(EXECUTION).asText(), execution -> new ArrayList<>());
-    message.path(CHILDREN).forEach(children::add);
+    // by key: a batch sent again, after a send that failed only as far as the Crawler could tell, is not counted twice
+    Map<String, JsonNode> children = handedBack.computeIfAbsent(unit.unitId(), id -> new HashMap<>())
+        .computeIfAbsent(message.path(EXECUTION).asText(), execution -> new LinkedHashMap<>());
+    message.path(CHILDREN).forEach(child -> children.putIfAbsent(
+        child.path(CHILD_KEY).isTextual() ? child.path(CHILD_KEY).asText() : child.toString(), child));
+
+    if (message.path(EARLY).asBoolean(false)) {
+      int numCreated = 0;
+      synchronized (dispatchLock) {
+        for (JsonNode child : message.path(CHILDREN)) {
+          numCreated += createHandedBackUnit(child, 0, 0) ? 1 : 0;
+        }
+      }
+      log.info("Unit {} handed back {} parts while executing.", unit.unitId(), numCreated);
+      dispatchQueuedUnits();
+    }
   }
 
-  // A unit's refusals arrive as running totals, in progress reports and then in its completion; only what is new
-  // since the last report is counted, so that a refusal is counted once. What an earlier Coordinator saw is its own
-  // business: nothing is counted while replaying.
+  // A unit's calls and refusals arrive as running totals, in progress reports and then in its completion; only what
+  // is new since the last report is counted, so that each is counted once. What an earlier Coordinator saw is its own
+  // business: nothing is counted while replaying. A report that does not say how many refusals were throttles, from
+  // a Crawler that does not tell them apart, is taken to mean all of them.
   private void countRefusedSoFar(WorkUnit unit, ObjectNode message) {
     if (replaying) {
       return;
     }
     String key = unit.unitId() + "#" + message.path(EXECUTION).asText();
-    long total = message.path(REFUSED_CALLS).asLong(0);
-    Long before = refusedSoFar.put(key, total);
-    countRefused(Math.max(0, total - (before == null ? 0 : before)));
+    long refused = message.path(REFUSED_CALLS).asLong(0);
+    long[] total = {message.path(SOURCE_CALLS).asLong(0), refused, message.path(THROTTLED_CALLS).asLong(refused),
+        message.path(REQUESTS).asLong(0)};
+    long[] before = refusedSoFar.put(key, total);
+    long[] delta = new long[total.length];
+    for (int i = 0; i < total.length; i++) {
+      delta[i] = Math.max(0, total[i] - (before == null ? 0 : before[i]));
+    }
+    numSourceCalls.addAndGet(delta[0]);
+    countRefused(delta[1]);
+    numCallsThrottled.addAndGet(delta[2]);
+    numRequests.addAndGet(delta[3]);
   }
 
   private void handleUnitProgress(Event event) {
@@ -670,8 +707,9 @@ public class CoordinatorPublisher extends PublisherImpl {
       return;
     }
 
-    Map<String, List<JsonNode>> byExecution = handedBack.remove(unit.unitId());
-    List<JsonNode> children = byExecution == null ? null : byExecution.get(message.path(EXECUTION).asText());
+    Map<String, Map<String, JsonNode>> byExecution = handedBack.remove(unit.unitId());
+    Map<String, JsonNode> received = byExecution == null ? null : byExecution.get(message.path(EXECUTION).asText());
+    List<JsonNode> children = received == null ? null : new ArrayList<>(received.values());
     int numChildren = children == null ? 0 : children.size();
 
     // The unit said how much it handed back. If that much has not arrived, creating units for what did arrive
@@ -847,6 +885,21 @@ public class CoordinatorPublisher extends PublisherImpl {
   /** Returns how many calls to the source the Crawlers have reported as refused, over the whole connector. */
   public long numCallsRefused() {
     return numCallsRefused.get();
+  }
+
+  /** Returns how many of the refused calls the source throttled; the rest it could not answer. */
+  public long numCallsThrottled() {
+    return numCallsThrottled.get();
+  }
+
+  /** Returns how many calls to the source the Crawlers have reported making, over the whole connector. */
+  public long numSourceCalls() {
+    return numSourceCalls.get();
+  }
+
+  /** Returns how many requests to the source the Crawlers have reported, or 0 if their connector does not count them. */
+  public long numRequests() {
+    return numRequests.get();
   }
 
   /** Returns how many times a unit was dispatched again after its source refused it. */
