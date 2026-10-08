@@ -242,6 +242,30 @@ public class S3StorageClientTest {
     assertNull(budget.getSourceError());
   }
 
+  @Test
+  public void testAListingGivenUpOnStillCountsItsPages() throws Exception {
+    // the root's listing serves two pages, then fails for good: often the slowest listing of all
+    S3Client mockClient = mock(S3Client.class, RETURNS_DEEP_STUBS);
+    when(mockClient.listObjectsV2Paginator(any(ListObjectsV2Request.class))).thenAnswer(invocation -> {
+      ListObjectsV2Request request = invocation.getArgument(0);
+      if (request.continuationToken() == null) {
+        // two pages, then the third fails while being read, and every retry of it fails too
+        return pages(Stream.concat(Stream.of(page("root.txt", "a/", "page2"), page("root2.txt", "b/", "page3")),
+            Stream.generate(() -> {
+              throw S3Exception.builder().statusCode(503).message("unavailable").build();
+            })));
+      }
+      throw S3Exception.builder().statusCode(503).message("unavailable").build();
+    });
+    TraversalBudget budget = TraversalBudget.unlimited();
+
+    clientWith(mockClient).traverse(new PublisherImpl(ConfigFactory.empty(), new TestMessenger(), "run1", "pipeline1"),
+        new TraversalParams(ConfigFactory.parseString("sourceRetrySecs: 1, sourceRetryCapSecs: 1"), URI.create("s3://bucket/"), "", true, budget));
+
+    assertEquals(FailureClass.SOURCE_UNAVAILABLE, budget.getSourceError().failureClass());
+    assertEquals(2, budget.getMaxDirectoryPages());
+  }
+
   private static AwsServiceException unavailable() {
     return S3Exception.builder().statusCode(503).message("unavailable").build();
   }

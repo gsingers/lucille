@@ -39,6 +39,15 @@ public class CrawlConfigTest {
   }
 
   @Test
+  public void testKafkaPollMustBeShorterThanTheOrphanTimeout() {
+    // a Coordinator waits a poll at a time, and one that has not gone round its loop in orphanTimeoutSecs is stuck
+    new CrawlConfig(ConfigFactory.parseString("kafka.pollIntervalMs: 5000, crawl.orphanTimeoutSecs: 15"));
+    assertThrows(IllegalArgumentException.class,
+        () -> new CrawlConfig(ConfigFactory.parseString("kafka.pollIntervalMs: 15001, crawl.orphanTimeoutSecs: 15")));
+    assertThrows(IllegalArgumentException.class, () -> new CrawlConfig(ConfigFactory.parseString("kafka.pollIntervalMs: 0")));
+  }
+
+  @Test
   public void testThrottleSettings() {
     CrawlConfig defaults = new CrawlConfig(ConfigFactory.empty());
     assertEquals(20, defaults.maxThrottledAttempts);

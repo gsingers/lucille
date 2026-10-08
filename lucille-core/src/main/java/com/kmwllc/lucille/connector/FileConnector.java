@@ -388,8 +388,9 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
 
     // listings, refusals, a failure of the source and the full groups went to the context as they happened
     handBacks.finish();
+    // only a unit the limit cut short went on past it; one whose last directory just used up the limit did not
     long limitReached = budget.limitReachedMillis();
-    if (limitReached > 0) {
+    if (limitReached > 0 && handBacks.handedBackAny()) {
       context.recordTimePastBound(Math.max(0, System.currentTimeMillis() - limitReached));
     }
   }
@@ -425,9 +426,11 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
    * Each group goes to the context as soon as it is full, so that the Crawler can have it dispatched while the unit
    * is still executing. A partial group goes when the unit ends, or, once the unit has reached its limit, at the next
    * progress report: a unit past its limit only finishes listings already under way, which can take minutes, and a
-   * part that hands back fewer directories than a group would otherwise hold all of them back that long. Until the
-   * limit is reached, and without a limit, the groups are the ones handing every directory back at the end would
-   * make, so the same directories handed back in the same order get the same keys.
+   * part that hands back fewer directories than a group would otherwise hold all of them back that long. The groups
+   * then depend on when the reports fall, so a unit executed again may hand the same directories back under other
+   * keys, and parts can be crawled twice, under the same Document IDs. Hand-backs that come from a source error or
+   * a cancelled unit, and every hand-back while early dispatch is off, are grouped as handing every directory back
+   * at the end would group them.
    */
   static final class HandBacks {
 
@@ -448,6 +451,10 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       this.groupSize = groupSize;
       this.context = context;
       this.usedUp = usedUp;
+    }
+
+    synchronized boolean handedBackAny() {
+      return !directories.isEmpty();
     }
 
     /** Hands back the partial group waiting to fill, if the unit has reached its limit. Run at each progress report. */

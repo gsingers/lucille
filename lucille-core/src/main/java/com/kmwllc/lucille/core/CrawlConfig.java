@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kmwllc.lucille.core.spec.Spec;
 import com.kmwllc.lucille.core.spec.SpecBuilder;
+import com.kmwllc.lucille.message.KafkaUtils;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigRenderOptions;
 import com.typesafe.config.ConfigValue;
@@ -16,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import org.apache.kafka.clients.admin.NewTopic;
 
@@ -171,6 +173,13 @@ public final class CrawlConfig {
     }
     this.heartbeatSecs = atLeastOne(config, "crawl.heartbeatSecs", 10);
     this.orphanTimeoutSecs = atLeastOne(config, "crawl.orphanTimeoutSecs", 120);
+    // The Coordinator and Crawlers wait a Kafka poll at a time (kafka.pollIntervalMs), and a Coordinator that has
+    // not gone round its loop in orphanTimeoutSecs takes itself to be stuck and exits.
+    long pollMillis = KafkaUtils.getPollInterval(config).toMillis();
+    if (pollMillis > TimeUnit.SECONDS.toMillis(orphanTimeoutSecs)) {
+      throw new IllegalArgumentException("kafka.pollIntervalMs (" + pollMillis + ") cannot be more than crawl.orphanTimeoutSecs ("
+          + orphanTimeoutSecs + " s): an idle Coordinator would otherwise take itself to be stuck.");
+    }
     this.maxUnitSecs = config.hasPath("crawl.maxUnitSecs") ? atLeastOne(config, "crawl.maxUnitSecs", 1) : null;
     this.exitOnTimeout = config.hasPath("crawl.exitOnTimeout") && config.getBoolean("crawl.exitOnTimeout");
     this.dispatchHandBacksEarly = !config.hasPath("crawl.dispatchHandBacksEarly") || config.getBoolean("crawl.dispatchHandBacksEarly");

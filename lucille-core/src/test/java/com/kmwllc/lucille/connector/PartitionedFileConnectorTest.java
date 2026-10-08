@@ -492,6 +492,15 @@ public class PartitionedFileConnectorTest {
     assertNotNull(context.timePastBound);
     assertTrue(context.timePastBound >= 0);
 
+    // nor does a unit whose limit was reached by its very last directory: nothing was cut off
+    Config exactly = config("partitioning { depth: 0, maxDirectoriesPerUnit: 4 }");
+    RecordingUnitContext justFits = new RecordingUnitContext();
+    FileConnector fits = new FileConnector(exactly);
+    fits.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()), new PublisherImpl(exactly, new TestMessenger(), "run1", "pipeline1"), justFits);
+    fits.close();
+    assertTrue(justFits.handedBack.isEmpty());
+    assertNull(justFits.timePastBound);
+
     // a unit that never reaches a limit has no time past it to report
     Config unlimited = config("partitioning { depth: 0 }");
     RecordingUnitContext whole = new RecordingUnitContext();

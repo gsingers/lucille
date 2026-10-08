@@ -243,6 +243,10 @@ public class S3StorageClient extends BaseStorageClient {
         try {
           awaitRetry("Listing " + prefix, params.getRetryPolicy(), params.getBudget(), e, retry, firstFailureMillis);
         } catch (SdkException giveUp) {
+          // a listing that paged a long way before the source failed it for good was a long listing all the same
+          if (params.getBudget() != null && pagesRead > 0) {
+            params.getBudget().directoryPaged(pagesRead);
+          }
           throw new SourceException(classify(e), "Could not list " + uriForDirectory(prefix, params) + " after "
               + (retry - 1) + " retries.", e);
         }

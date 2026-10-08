@@ -1,6 +1,7 @@
 package com.kmwllc.lucille.message;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import com.kmwllc.lucille.core.Document;
@@ -56,6 +57,22 @@ public class CrawlerProducersTest {
     Set<String> created = creates.history().stream().map(ProducerRecord::key).collect(Collectors.toSet());
     assertEquals(300, created.size());
     assertTrue(reports.history().isEmpty());
+  }
+
+  @Test
+  public void testACreateFailingAfterItsUnitIsNotChargedToTheNext() throws Exception {
+    MockProducer<String, String> creates = new MockProducer<>(false, null, new StringSerializer(), new StringSerializer());
+    MockProducer<String, String> reports = new MockProducer<>(true, null, new StringSerializer(), new StringSerializer());
+    CrawlerProducers crawlerProducers = new CrawlerProducers(CONFIG, new ArrayList<>(List.of(documentProducer())), creates, reports);
+    // a unit that fails with a CREATE still on its way
+    crawlerProducers.sendForProcessing(doc("doc1"), "pipeline1");
+    crawlerProducers.sendForProcessing(doc("doc2"), "pipeline1");
+    assertEquals(1, creates.history().size());
+
+    // the next unit starts: the last unit's sends are seen through first, so none is still open to fail on it
+    crawlerProducers.startUnit();
+    assertFalse(creates.errorNext(new RuntimeException("delivery timed out")));
+    crawlerProducers.sendForProcessing(doc("doc3"), "pipeline1");
   }
 
   @Test

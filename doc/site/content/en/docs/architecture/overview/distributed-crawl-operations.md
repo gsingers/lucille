@@ -87,7 +87,7 @@ crawl {
 | `sourceUnavailableRate` | 0.001 | Calls the source could not answer (5xx, connection failures) halve the figure only above this share of a heartbeat's requests (every page, fetch and failed attempt, where the connector counts them; its source calls otherwise). 0: any does. |
 | `initialSourceConcurrency`, `sourceConcurrencyStep` | a quarter, a tenth of the maximum | Where the figure starts and how much a clean heartbeat adds. To skip the climb, set the start at or above what the Crawlers can issue. |
 | `sourceConcurrencyHoldSecs` | `throttleBackoffCapSecs` | After a cut, how long before another. |
-| `documentProducers` | 1 | Kafka producers each Crawler thread sends Documents on. Each has one sending thread and its own `buffer.memory`; raise it when traversal threads wait on the producer (a profile shows them in `BufferPool.allocate`). Tune `kafka.producer` (`compression.type`, `linger.ms`, `batch.size`) first. |
+| `documentProducers` | 1 | Kafka producers each Crawler thread sends Documents on. Each has one sending thread and its own `buffer.memory`, and every Crawler thread has two more (CREATEs and unit reports), so a process holds `threads` × (`documentProducers` + 2) buffers; raise it when traversal threads wait on the producer (a profile shows them in `BufferPool.allocate`). Tune `kafka.producer` (`compression.type`, `linger.ms`, `batch.size`) first. |
 | `dispatchHandBacksEarly` | true | Crawlers send handed-back parts every heartbeat, and they are dispatched while the unit still runs. A unit that then fails is executed again whole. |
 | `costsFromRun` | unset | As `-costsFrom`. |
 | `heartbeatSecs` | 10 | The Coordinator's heartbeat period. |

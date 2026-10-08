@@ -56,9 +56,11 @@ public interface UnitContext {
 
   /**
    * Registers something to run each time the Crawler reports on this unit's progress, every heartbeat while it
-   * executes, on the Crawler's timer thread, just before the parts handed back since the last report are sent. For a
-   * connector that holds parts back to hand them back together, and should let go of them once it knows no more are
-   * coming soon. It must be quick and safe to run alongside the unit's own threads.
+   * executes, on the Crawler's timer thread, just before the parts handed back since the last report are sent; only
+   * with crawl.dispatchHandBacksEarly, since that is what it is for. For a connector that holds parts back to hand
+   * them back together, and should let go of them once it knows no more are coming soon. It must be quick and safe to
+   * run alongside the unit's own threads, and it must hand nothing back once executeUnit has returned: such a part is
+   * neither sent nor counted.
    */
   default void onProgress(Runnable action) {
   }

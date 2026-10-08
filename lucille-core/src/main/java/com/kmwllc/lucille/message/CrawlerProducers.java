@@ -65,11 +65,13 @@ class CrawlerProducers implements AutoCloseable {
   }
 
   /**
-   * Waits for Documents still being sent, then forgets their outcome and any CREATEs not yet sent. Called before a
+   * Waits for Documents and CREATEs still being sent, then forgets their outcome and any CREATEs not yet sent. Called before a
    * new unit is taken, so that the last unit's sends are not taken for the new one's.
    */
   void startUnit() {
     documentProducers.forEach(Producer::flush);
+    // a failed or abandoned unit's report does not wait for its CREATEs, so they may still be on their way
+    createProducer.flush();
     sendException.set(null);
     pendingCreates.clear();
   }
