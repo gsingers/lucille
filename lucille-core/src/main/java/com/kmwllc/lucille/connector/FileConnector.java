@@ -94,7 +94,7 @@ import com.typesafe.config.ConfigFactory;
  *   <li>state.performDeletions (Boolean, Optional) : Delete rows for files removed from storage. Defaults to true.</li>
  *   <li>state.runsBeforeExpiration (Int, Optional) : After a file is not encountered for this number of runs, it will be marked
  *   as expired. Must be at least 1. Defaults to 1.</li>
- *   <li>state.pathLength (Int, Optional) : Max length for stored file paths when Lucille creates the table. Defaults to 200.</li>
+ *   <li>state.pathLength (Int, Optional) : Max length for stored file paths when Lucille creates the table. Defaults to 768. A longer path fails the run.</li>
  *   <li>partitioning.depth (Int, Optional) : In a distributed crawl, split each path into one work unit per directory this
  *   many levels below it, plus one for the files directly in each directory above that level. With 0, each path is one
  *   unit. Local paths and S3 are split; paths in other providers become one unit each. Defaults to 1. Without a

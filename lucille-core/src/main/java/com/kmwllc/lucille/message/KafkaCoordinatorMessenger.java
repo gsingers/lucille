@@ -256,7 +256,7 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
     }
 
     if (polledEvents.isEmpty()) {
-      eventConsumer.poll(KafkaUtils.POLL_INTERVAL).forEach(polledEvents::add);
+      eventConsumer.poll(KafkaUtils.getPollInterval(config)).forEach(polledEvents::add);
     }
 
     // A record that cannot be read is skipped. If it were allowed to fail the run, the run could never be resumed
@@ -324,7 +324,7 @@ public class KafkaCoordinatorMessenger implements CoordinatorMessenger {
       consumer.seekToBeginning(partitions);
 
       while (partitions.stream().anyMatch(p -> consumer.position(p) < end.get(p))) {
-        for (ConsumerRecord<String, String> record : consumer.poll(KafkaUtils.POLL_INTERVAL)) {
+        for (ConsumerRecord<String, String> record : consumer.poll(KafkaUtils.getPollInterval(config))) {
           try {
             Event event = Event.fromJsonString(record.value());
             if (event.getType() == Event.Type.UNIT_DONE && event.getDocumentId() != null) {

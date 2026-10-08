@@ -111,7 +111,7 @@ public class KafkaCrawlerMessenger implements CrawlerMessenger {
         throw new IllegalStateException("A work unit is already held; it must be acknowledged first.");
       }
 
-      ConsumerRecords<String, String> records = workConsumer.poll(KafkaUtils.POLL_INTERVAL);
+      ConsumerRecords<String, String> records = workConsumer.poll(KafkaUtils.getPollInterval(config));
       KafkaUtils.validateAtMostOneRecord(records);
       if (records.isEmpty()) {
         return null;
