@@ -74,6 +74,8 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
   public static volatile long earlyWaitMillis = 10_000;
   /** Of those units, the ones that meet a throttled source first, so that what they hand back is the source's refusal. */
   public static final Set<String> earlyAfterSourceError = ConcurrentHashMap.newKeySet();
+  /** Of those units, the ones that hand their parts back from a progress action, as FileConnector does a partial group. */
+  public static final Set<String> handBackOnProgress = ConcurrentHashMap.newKeySet();
   /** Units that, the first time they are executed, wait for {@link #hang} to open before doing anything. */
   public static final Set<String> hangOnce = ConcurrentHashMap.newKeySet();
   /** Units that found their execution cancelled once {@link #hang} had opened. */
@@ -132,6 +134,7 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     earlyHandBacks.clear();
     outlivedEarlyParts.clear();
     earlyWaitMillis = 10_000;
+    handBackOnProgress.clear();
     earlyAfterSourceError.clear();
     hangOnce.clear();
     throttledOnce.clear();
@@ -249,8 +252,15 @@ public class ScriptedPartitionedConnector extends AbstractConnector implements P
     if (earlyAfterSourceError.contains(unitKey)) {
       context.recordSourceError(FailureClass.THROTTLED, "RuntimeException: 429 Too Many Requests");
     }
-    for (String part : parts) {
-      context.handBack(part, WorkUnit.newPayload().put("key", part));
+    Runnable handBack = () -> {
+      for (String part : parts) {
+        context.handBack(part, WorkUnit.newPayload().put("key", part));
+      }
+    };
+    if (handBackOnProgress.contains(unitKey)) {
+      context.onProgress(handBack);
+    } else {
+      handBack.run();
     }
     long deadline = System.currentTimeMillis() + earlyWaitMillis;
     while (System.currentTimeMillis() < deadline && !completed.containsAll(parts)) {

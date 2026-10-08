@@ -56,7 +56,7 @@ All on the run's event topic for the pipeline, `<pipeline>_event_<runId>` (`Kafk
 | `UNIT_CREATED` | Coordinator, before dispatch | the `WorkUnit` |
 | `UNIT_CHILDREN` | Crawler: every heartbeat while a unit runs (`early: true`), and before `UNIT_DONE` for the rest | `attempt`, `epoch`, `crawler`, `execution`, `children: [{key, payload}]`, `early` if sent while the unit runs; a batch is closed at 200 entries or once it reaches 100,000 characters, so it can exceed that by one entry |
 | `UNIT_PROGRESS` | Crawler, every heartbeat while a unit runs, when something changed | `attempt`, `epoch`, `crawler`, `execution`, `sourceCalls`, `requests`, `refusedCalls`, `throttledCalls`, `numPublished` (running totals) |
-| `UNIT_DONE` | Crawler | `attempt`, `epoch`, `execution`, `crawler`, `numPublished`, `sourceCalls`, `requests`, `refusedCalls`, `throttledCalls`, `durationMs`, `numChildren` (early ones included); `errorClass`, `errorCause` if the unit ended early because of its source |
+| `UNIT_DONE` | Crawler | `attempt`, `epoch`, `execution`, `crawler`, `numPublished`, `sourceCalls`, `requests`, `refusedCalls`, `throttledCalls`, `durationMs`, `numChildren` (early ones included); `errorClass`, `errorCause` if the unit ended early because of its source; `maxDirectoryPages` (the longest single listing) and `millisPastBound` (how long the unit ran after reaching its limit) where the connector reports them |
 | `UNIT_FAILED` | Crawler, its watchdog, or the Coordinator's messenger | Four forms. A unit that threw: as `UNIT_DONE` without children, plus `error`, `errorClass`, `errorCause`. The watchdog's timeout: `attempt`, `epoch`, `crawler`, `error`, `errorClass: TIMEOUT`. A unit abandoned because its run was orphaned: `attempt`, `epoch`, `crawler`, `error`, no `errorClass`. A failed dispatch: `attempt`, `epoch`, `crawler: "coordinator"`, `error`. The timeout and orphan forms count against `maxAttempts`. |
 | `PLANNING_DONE` | Coordinator | none; the document ID is the Connector's name |
 | `HOOK_DONE` | Coordinator | `preExecute`, `prepareRun`, `finalizeRun` or `postExecute` |
@@ -263,6 +263,10 @@ public interface UnitContext {
   void addSourceCalls(long calls);
   default void addRefusedCalls(long calls) {}                              // taken as throttles
   default void addRefusedCalls(long calls, FailureClass failureClass) {}
+  default void addRequests(long requests) {}
+  default void onProgress(Runnable action) {}                             // run at each progress report
+  default void recordTimePastBound(long millis) {}
+  default void recordDirectoryPages(long pages) {}                        // the largest is reported
   default void recordSourceError(FailureClass failureClass, String cause) {}
   default Integer maxSourceConcurrency() { return null; }
   default boolean isCancelled() { return false; }
@@ -285,7 +289,7 @@ Rules for an implementation:
 - **Planning:** `depth` levels below each path, one recursive unit per directory at that level (key: its URI) and one non-recursive unit per directory above it (key: URI + `#files`). `depth: 0` plans each path as one unit. Local and S3 are split; other providers are one unit per path.
 - **Payload:** `path` or `paths` (a group), and `recursive`. Every path is checked to lie within a configured path (for local paths, by real path, so a symbolic link cannot lead out) and not under `pathsToSkip`.
 - **Execution:** one `TraversalBudget` per unit, from `maxDirectoriesPerUnit` and `maxUnitSecs`, with the context's `isCancelled` and `maxSourceConcurrency`, and a listener that passes each listing, refusal (with its class), source error and handed-back directory to the context as it happens. The unit's paths are grouped by storage client and each group passed to `traverseAll`.
-- **Hand-back:** the budget's handed-back directories, in groups of `handBackGroupSize` (`FileConnector.HandBacks`). Each group goes to the context as soon as it is full, the partial last one when the unit ends; the groups are the same as if all were grouped at the end. A single directory gets the key the planner would give it; a group gets `firstPath + "+" + (n-1) + suffix + "~" + hash`, where the suffix is `#files` for a non-recursive group and empty otherwise. A unit's own directory handed back because it could not be listed keeps the unit's kind: a non-recursive unit hands back `path#files`, non-recursive.
+- **Hand-back:** the budget's handed-back directories, in groups of `handBackGroupSize` (`FileConnector.HandBacks`). Each group goes to the context as soon as it is full. A partial group goes when the unit ends, or, once the budget is used up, at the next progress report (`UnitContext.onProgress`), so a part that hands back fewer directories than a group does not hold them back while its listings in flight finish. Until the budget is used up the groups are the same as if all were grouped at the end. The unit also reports the most pages any one directory took (`TraversalBudget.directoryPaged`, fed by the S3 client) and the time from reaching its limit to its end (`TraversalBudget.limitReachedMillis`). A single directory gets the key the planner would give it; a group gets `firstPath + "+" + (n-1) + suffix + "~" + hash`, where the suffix is `#files` for a non-recursive group and empty otherwise. A unit's own directory handed back because it could not be listed keeps the unit's kind: a non-recursive unit hands back `path#files`, non-recursive.
 
 ## The storage-client contract
 

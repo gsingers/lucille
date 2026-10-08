@@ -138,7 +138,7 @@ A run can be resumed for a week after its last heartbeat; after that its record 
 
 ## Reading the Coordinator's log
 
-- One line per unit done: the Crawler, Documents published, source calls, refused calls, duration, parts handed back, and the units outstanding and queued.
+- One line per unit done: the Crawler, Documents published, source calls, refused calls, duration, parts handed back, the longest single listing in pages and the time the unit ran past its limit (where reported), and the units outstanding and queued. A unit far past its limit with a long listing is a directory paged one page at a time: a floor no number of Crawlers lowers.
 - One line per failed unit: its failure class, the count against the relevant limit, and the backoff chosen.
 - With `maxSourceConcurrency` set, a line each time the figure changes, and each time the units in flight are re-bounded.
 - At the end of each Connector, totals of units, calls refused, and units dispatched again after refusals.

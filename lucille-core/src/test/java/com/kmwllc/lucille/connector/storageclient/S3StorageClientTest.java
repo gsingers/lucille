@@ -235,6 +235,8 @@ public class S3StorageClientTest {
     List<String> published = messenger.getDocsSentForProcessing().stream().map(doc -> doc.getString(FILE_PATH)).toList();
     assertEquals(List.of("s3://bucket/root.txt", "s3://bucket/root2.txt", "s3://bucket/a/file.txt", "s3://bucket/b/file.txt"), published);
     assertEquals(java.util.Arrays.asList(null, "page2"), rootTokens);
+    // the root took two pages, whatever happened between them: the longest listing in the unit
+    assertEquals(2, budget.getMaxDirectoryPages());
     assertEquals(3, budget.getDirectoriesListed());
     assertEquals(1, budget.getRefusedCalls());
     assertNull(budget.getSourceError());

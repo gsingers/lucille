@@ -41,6 +41,8 @@ public class TraversalBudget {
 
     default void requested() { }
 
+    default void directoryPaged(long pages) { }
+
     default void sourceError(SourceError error) { }
 
     default void handedBack(URI directory) { }
@@ -52,6 +54,9 @@ public class TraversalBudget {
   private final List<URI> handedBack = Collections.synchronizedList(new ArrayList<>());
   // set once the source has failed for good on some directory; nothing more is listed after that
   private volatile SourceError sourceError;
+  // when the listing that used the last of the directory limit was allowed, or 0
+  private volatile long directoryLimitReachedMillis = 0;
+  private final AtomicLong maxDirectoryPages = new AtomicLong();
 
   /** A failure of the source that ended the traversal early. */
   public record SourceError(FailureClass failureClass, String cause) { }
@@ -93,10 +98,43 @@ public class TraversalBudget {
         return false;
       }
       if (directoriesListed.compareAndSet(listed, listed + 1)) {
+        if (listed + 1 == maxDirectories) {
+          directoryLimitReachedMillis = System.currentTimeMillis();
+        }
         listener.listed();
         return true;
       }
     }
+  }
+
+  /**
+   * Returns when the traversal reached its limit: the time the last directory it may list was allowed, or the
+   * deadline once past, whichever was first; 0 if it has not. Not when the traversal next asked, which a listing in
+   * flight can put off for a long time.
+   */
+  public long limitReachedMillis() {
+    long byCount = directoryLimitReachedMillis;
+    boolean pastDeadline = deadlineMillis != Long.MAX_VALUE && System.currentTimeMillis() >= deadlineMillis;
+    if (byCount > 0) {
+      return pastDeadline ? Math.min(byCount, deadlineMillis) : byCount;
+    }
+    return pastDeadline ? deadlineMillis : 0;
+  }
+
+  /** Whether the traversal has reached its limit, so that whatever it finds from now on is handed back. */
+  public boolean isUsedUp() {
+    return limitReachedMillis() > 0;
+  }
+
+  /** Records the number of pages one directory's listing took. */
+  public void directoryPaged(long pages) {
+    maxDirectoryPages.accumulateAndGet(pages, Math::max);
+    listener.directoryPaged(pages);
+  }
+
+  /** Returns the most pages any one directory's listing took. */
+  public long getMaxDirectoryPages() {
+    return maxDirectoryPages.get();
   }
 
   /**

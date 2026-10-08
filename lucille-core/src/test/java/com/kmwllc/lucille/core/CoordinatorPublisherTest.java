@@ -921,6 +921,13 @@ public class CoordinatorPublisherTest {
   }
 
   @Test
+  public void testSerialFloorIsDescribed() throws Exception {
+    assertEquals("", CoordinatorPublisher.serialFloor(CrawlConfig.newMessage()));
+    assertEquals(", longest listing 140 pages, 68000 ms past its limit", CoordinatorPublisher.serialFloor(
+        CrawlConfig.newMessage().put("maxDirectoryPages", 140).put("millisPastBound", 68_000)));
+  }
+
+  @Test
   public void testRequestsAreCountedByTheirIncrease() throws Exception {
     CoordinatorPublisher publisher = publisher(1);
     publisher.getSink().emit("u0", WorkUnit.newPayload());

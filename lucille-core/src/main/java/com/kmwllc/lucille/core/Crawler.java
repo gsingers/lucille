@@ -236,12 +236,19 @@ class Crawler implements Runnable {
           message.put(CoordinatorPublisher.ERROR_CLASS, execution.errorClass.name())
               .put(CoordinatorPublisher.ERROR_CAUSE, truncate(execution.errorCause));
         }
-        // under the execution's lock, so that a progress report sending parts early cannot send them after this
+        if (execution.timePastBound != null) {
+          message.put(CoordinatorPublisher.MILLIS_PAST_BOUND, execution.timePastBound);
+        }
+        if (execution.maxDirectoryPages.get() > 0) {
+          message.put(CoordinatorPublisher.MAX_DIRECTORY_PAGES, execution.maxDirectoryPages.get());
+        }
+        // under the execution's lock, so that a progress report sending parts early cannot send them after this; and
+        // from one snapshot, so that a part handed back by a progress action meanwhile is neither sent nor counted
         synchronized (execution) {
           execution.completing = true;
-          sendHandedBack(unit, execution,
-              List.copyOf(execution.handedBack.subList(execution.sentHandedBack, execution.handedBack.size())), false);
-          sendUnitEvent(unit, message.put(CoordinatorPublisher.NUM_CHILDREN, execution.handedBack.size()), Event.Type.UNIT_DONE);
+          List<ObjectNode> handedBack = List.copyOf(execution.handedBack);
+          sendHandedBack(unit, execution, handedBack.subList(execution.sentHandedBack, handedBack.size()), false);
+          sendUnitEvent(unit, message.put(CoordinatorPublisher.NUM_CHILDREN, handedBack.size()), Event.Type.UNIT_DONE);
         }
         log.info("Unit {} done: {} docs in {} ms, {} parts handed back, {} calls refused{}.", unit.unitId(), numPublished,
             durationMillis, execution.handedBack.size(), execution.refusedCalls.get(),
@@ -291,6 +298,9 @@ class Crawler implements Runnable {
     final AtomicLong refusedCalls = new AtomicLong();
     final AtomicLong throttledCalls = new AtomicLong();
     final AtomicLong requests = new AtomicLong();
+    final List<Runnable> progressActions = new CopyOnWriteArrayList<>();
+    volatile Long timePastBound;
+    final AtomicLong maxDirectoryPages = new AtomicLong();
     volatile FailureClass errorClass;
     volatile String errorCause;
     // set once the unit has a publisher, which is what learns that the unit was lost or its run stopped
@@ -330,6 +340,21 @@ class Crawler implements Runnable {
     @Override
     public void addRequests(long count) {
       requests.addAndGet(count);
+    }
+
+    @Override
+    public void onProgress(Runnable action) {
+      progressActions.add(action);
+    }
+
+    @Override
+    public void recordTimePastBound(long millis) {
+      timePastBound = millis;
+    }
+
+    @Override
+    public void recordDirectoryPages(long pages) {
+      maxDirectoryPages.accumulateAndGet(pages, Math::max);
     }
 
     @Override
@@ -390,6 +415,21 @@ class Crawler implements Runnable {
     }
     message.putArray(CoordinatorPublisher.CHILDREN).addAll(parts);
     sendUnitEvent(unit, message, Event.Type.UNIT_CHILDREN);
+  }
+
+  // What the connector asked to have run at each report, such as letting go of parts it was holding to group them.
+  // One that fails is logged and the rest still run: the unit itself is not affected.
+  private void runProgressActions(WorkUnit unit, Execution execution) {
+    if (execution.isCancelled()) {
+      return;
+    }
+    for (Runnable action : execution.progressActions) {
+      try {
+        action.run();
+      } catch (RuntimeException e) {
+        log.warn("A progress action of unit {} failed.", unit.unitId(), e);
+      }
+    }
   }
 
   /**
@@ -455,6 +495,7 @@ class Crawler implements Runnable {
         sendUnitEvent(unit, message, Event.Type.UNIT_PROGRESS);
       }
       if (dispatchHandBacksEarly) {
+        runProgressActions(unit, execution);
         sendHandedBackEarly(unit, execution);
       }
     } catch (Exception e) {

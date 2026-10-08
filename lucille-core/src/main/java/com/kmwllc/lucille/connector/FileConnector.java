@@ -20,6 +20,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import org.apache.commons.lang3.concurrent.BasicThreadFactory;
 import org.slf4j.Logger;
@@ -363,9 +365,13 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
 
     initializeStorageClients();
     // one budget for the whole unit: once it is used up, the directories not yet reached are handed back unlisted,
-    // a group at a time as the groups fill
-    HandBacks handBacks = new HandBacks(unitPaths, recursive, handBackGroupSize(), context);
+    // a group at a time as the groups fill, and what is left of a group at each progress report from then on
+    AtomicReference<TraversalBudget> budgetRef = new AtomicReference<>();
+    HandBacks handBacks = new HandBacks(unitPaths, recursive, handBackGroupSize(), context,
+        () -> budgetRef.get() != null && budgetRef.get().isUsedUp());
     TraversalBudget budget = newUnitBudget(context, handBacks);
+    budgetRef.set(budget);
+    context.onProgress(handBacks::flushPartial);
 
     try {
       if (stateManager != null) {
@@ -382,6 +388,10 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
 
     // listings, refusals, a failure of the source and the full groups went to the context as they happened
     handBacks.finish();
+    long limitReached = budget.limitReachedMillis();
+    if (limitReached > 0) {
+      context.recordTimePastBound(Math.max(0, System.currentTimeMillis() - limitReached));
+    }
   }
 
   // The paths of a unit are given to each storage client together, so that a client able to walk several at once
@@ -413,8 +423,11 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
    * each cost more to dispatch than to execute.
    *
    * Each group goes to the context as soon as it is full, so that the Crawler can have it dispatched while the unit
-   * is still executing; the last, partial group when the unit ends. The groups are the ones handing every directory
-   * back at the end would make, so the same directories handed back in the same order get the same keys.
+   * is still executing. A partial group goes when the unit ends, or, once the unit has reached its limit, at the next
+   * progress report: a unit past its limit only finishes listings already under way, which can take minutes, and a
+   * part that hands back fewer directories than a group would otherwise hold all of them back that long. Until the
+   * limit is reached, and without a limit, the groups are the ones handing every directory back at the end would
+   * make, so the same directories handed back in the same order get the same keys.
    */
   static final class HandBacks {
 
@@ -422,14 +435,27 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
     private final boolean recursive;
     private final int groupSize;
     private final UnitContext context;
+    private final BooleanSupplier usedUp;
     private final List<URI> directories = new ArrayList<>();
     private int handedBackUpTo = 0;
 
-    HandBacks(List<URI> unitPaths, boolean recursive, int groupSize, UnitContext context) {
+    /**
+     * @param usedUp whether the unit has reached its limit, after which a partial group need not wait to fill.
+     */
+    HandBacks(List<URI> unitPaths, boolean recursive, int groupSize, UnitContext context, BooleanSupplier usedUp) {
       this.unitPaths = unitPaths;
       this.recursive = recursive;
       this.groupSize = groupSize;
       this.context = context;
+      this.usedUp = usedUp;
+    }
+
+    /** Hands back the partial group waiting to fill, if the unit has reached its limit. Run at each progress report. */
+    synchronized void flushPartial() {
+      if (handedBackUpTo < directories.size() && usedUp.getAsBoolean()) {
+        handBackGroup(directories.subList(handedBackUpTo, directories.size()));
+        handedBackUpTo = directories.size();
+      }
     }
 
     synchronized void add(URI directory) {
@@ -505,6 +531,11 @@ public class FileConnector extends AbstractConnector implements PartitionableCon
       @Override
       public void requested() {
         context.addRequests(1);
+      }
+
+      @Override
+      public void directoryPaged(long pages) {
+        context.recordDirectoryPages(pages);
       }
 
       // before the directory the source failed on is handed back, so that the Crawler holds that back

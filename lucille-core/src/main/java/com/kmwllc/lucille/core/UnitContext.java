@@ -55,6 +55,30 @@ public interface UnitContext {
   }
 
   /**
+   * Registers something to run each time the Crawler reports on this unit's progress, every heartbeat while it
+   * executes, on the Crawler's timer thread, just before the parts handed back since the last report are sent. For a
+   * connector that holds parts back to hand them back together, and should let go of them once it knows no more are
+   * coming soon. It must be quick and safe to run alongside the unit's own threads.
+   */
+  default void onProgress(Runnable action) {
+  }
+
+  /**
+   * Records how long the unit went on after reaching its limit (partitioning.maxDirectoriesPerUnit or
+   * partitioning.maxUnitSecs): the listings in flight when it was reached, which no limit can stop. Reported with the
+   * unit's result.
+   */
+  default void recordTimePastBound(long millis) {
+  }
+
+  /**
+   * Records the number of pages one directory's listing took. The largest is reported with the unit's result: a
+   * directory's pages are listed one after another, so the largest listing is the least time the unit can take.
+   */
+  default void recordDirectoryPages(long pages) {
+  }
+
+  /**
    * Records that the source failed for good on part of this unit, which the connector has handed back rather than
    * executed, so that the unit can complete. The Coordinator delays the handed-back parts if the failure says the
    * source is overloaded.

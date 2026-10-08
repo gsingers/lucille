@@ -77,6 +77,9 @@ public class CoordinatorPublisher extends PublisherImpl {
   public static final String THROTTLED_CALLS = "throttledCalls";
   // every request made to the source, failed attempts and fetches included; what refusals are set against
   public static final String REQUESTS = "requests";
+  // on a UNIT_DONE: the most pages one directory's listing took, and how long the unit ran after reaching its limit
+  public static final String MAX_DIRECTORY_PAGES = "maxDirectoryPages";
+  public static final String MILLIS_PAST_BOUND = "millisPastBound";
 
   private static final int UNDISPATCHED_EPOCH = 0;
 
@@ -765,16 +768,29 @@ public class CoordinatorPublisher extends PublisherImpl {
       }
     }
 
-    log.info("Unit {} done by {}: {} docs, {} source calls, {} refused, {} ms, {} handed back{}. {} units outstanding, {} queued.",
+    log.info("Unit {} done by {}: {} docs, {} source calls, {} refused, {} ms, {} handed back{}{}. {} units outstanding, {} queued.",
         unit.unitId(), message.path(CRAWLER).asText(), message.path(NUM_PUBLISHED).asLong(),
         message.path(SOURCE_CALLS).asLong(), message.path(REFUSED_CALLS).asLong(0), message.path(DURATION_MS).asLong(),
         numCreated, endedBy == null ? "" : " after " + endedBy + " (" + message.path(ERROR_CAUSE).asText() + ")",
-        outstandingUnits.size(), queuedUnitIds.size());
+        serialFloor(message), outstandingUnits.size(), queuedUnitIds.size());
 
     dispatchQueuedUnits();
     synchronized (dispatchWindow) {
       dispatchWindow.notifyAll();
     }
+  }
+
+  // What bounds the unit from below, where the Crawler said: the longest single listing, which no number of Crawlers
+  // shortens, and how long the unit went on after reaching its limit.
+  static String serialFloor(JsonNode message) {
+    StringBuilder floor = new StringBuilder();
+    if (message.has(MAX_DIRECTORY_PAGES)) {
+      floor.append(", longest listing ").append(message.path(MAX_DIRECTORY_PAGES).asLong()).append(" pages");
+    }
+    if (message.has(MILLIS_PAST_BOUND)) {
+      floor.append(", ").append(message.path(MILLIS_PAST_BOUND).asLong()).append(" ms past its limit");
+    }
+    return floor.toString();
   }
 
   /**

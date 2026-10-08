@@ -164,6 +164,22 @@ public class DistributedCrawlTest {
   }
 
   @Test
+  public void testPartsHandedBackByAProgressActionRunBeforeTheUnitCompletes() throws Exception {
+    Config config = start(SCRIPTED);
+    // u0 hands its parts back only when the Crawler's progress timer runs its action, then waits for them
+    ScriptedPartitionedConnector.earlyHandBacks.put("u0", List.of("p1", "p2"));
+    ScriptedPartitionedConnector.handBackOnProgress.add("u0");
+
+    RunResult result = run(config, "run1");
+
+    assertTrue(result.getStatus());
+    assertEquals(40, numSucceeded(result));
+    assertEquals(Set.of("u0"), ScriptedPartitionedConnector.outlivedEarlyParts);
+    // the action ran more than once, but the parts were handed back once each
+    assertEquals(1, ScriptedPartitionedConnector.executionsOf("p1"));
+  }
+
+  @Test
   public void testPartsHandedBackEarlyWaitForTheUnitWhenTurnedOff() throws Exception {
     Config config = start(SCRIPTED, "crawl.dispatchHandBacksEarly: false");
     ScriptedPartitionedConnector.earlyHandBacks.put("u0", List.of("p1"));

@@ -19,6 +19,25 @@ public class RecordingUnitContext implements UnitContext {
   public String errorCause;
   /** The keys of the parts handed back after a source error had been recorded. */
   public final java.util.Set<String> handedBackAfterError = new java.util.LinkedHashSet<>();
+  /** What the unit asked to have run at each progress report. */
+  public final java.util.List<Runnable> progressActions = new java.util.ArrayList<>();
+  public Long timePastBound;
+  public long maxDirectoryPages = 0;
+
+  @Override
+  public void onProgress(Runnable action) {
+    progressActions.add(action);
+  }
+
+  @Override
+  public void recordTimePastBound(long millis) {
+    timePastBound = millis;
+  }
+
+  @Override
+  public void recordDirectoryPages(long pages) {
+    maxDirectoryPages = Math.max(maxDirectoryPages, pages);
+  }
 
   @Override
   public void handBack(String unitKey, ObjectNode payload) {

@@ -2,8 +2,14 @@ package com.kmwllc.lucille.connector;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.kmwllc.lucille.core.ConnectorException;
@@ -26,6 +32,16 @@ import java.util.stream.Stream;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import com.kmwllc.lucille.connector.storageclient.StorageClient;
+import com.kmwllc.lucille.connector.storageclient.TraversalBudget;
+import com.kmwllc.lucille.connector.storageclient.TraversalParams;
+import org.mockito.MockedStatic;
 import java.util.stream.Collectors;
 import org.junit.Assume;
 import org.junit.Before;
@@ -323,7 +339,7 @@ public class PartitionedFileConnectorTest {
   public void testGroupsAreHandedBackAsSoonAsTheyFill() {
     RecordingUnitContext context = new RecordingUnitContext();
     List<URI> unitPaths = List.of(root.toUri());
-    FileConnector.HandBacks handBacks = new FileConnector.HandBacks(unitPaths, true, 2, context);
+    FileConnector.HandBacks handBacks = new FileConnector.HandBacks(unitPaths, true, 2, context, () -> false);
     List<URI> directories = List.of(root.resolve("a").toUri(), root.resolve("b").toUri(), root.resolve("c").toUri(),
         root.resolve("d").toUri(), root.resolve("e").toUri());
 
@@ -340,12 +356,149 @@ public class PartitionedFileConnectorTest {
     handBacks.add(directories.get(4));
     handBacks.finish();
     RecordingUnitContext atTheEnd = new RecordingUnitContext();
-    FileConnector.HandBacks allAtOnce = new FileConnector.HandBacks(unitPaths, true, 2, atTheEnd);
+    FileConnector.HandBacks allAtOnce = new FileConnector.HandBacks(unitPaths, true, 2, atTheEnd, () -> false);
     directories.forEach(allAtOnce::add);
     allAtOnce.finish();
     assertEquals(3, context.handedBack.size());
     assertEquals(atTheEnd.handedBack, context.handedBack);
     assertEquals(root.resolve("e").toUri().toString(), new ArrayList<>(context.handedBack.keySet()).get(2));
+  }
+
+  @Test
+  public void testAPartialGroupIsHandedBackOnceTheBudgetIsUsedUp() {
+    RecordingUnitContext context = new RecordingUnitContext();
+    List<URI> unitPaths = List.of(root.toUri());
+    boolean[] usedUp = {false};
+    FileConnector.HandBacks handBacks = new FileConnector.HandBacks(unitPaths, true, 512, context, () -> usedUp[0]);
+
+    // while the unit may still list, a partial group waits: more may join it
+    handBacks.add(root.resolve("a").toUri());
+    handBacks.add(root.resolve("b").toUri());
+    handBacks.flushPartial();
+    assertTrue(context.handedBack.isEmpty());
+
+    // once it may not, what is waiting goes at the next progress report, rather than when the unit ends
+    usedUp[0] = true;
+    handBacks.flushPartial();
+    assertEquals(1, context.handedBack.size());
+    handBacks.flushPartial();
+    assertEquals(1, context.handedBack.size());
+
+    // what is handed back after that makes a group of its own
+    handBacks.add(root.resolve("c").toUri());
+    handBacks.finish();
+    assertEquals(List.of(root.resolve("a").toUri() + "+1~", root.resolve("c").toUri().toString()),
+        context.handedBack.keySet().stream().map(key -> key.contains("~") ? key.substring(0, key.indexOf('~') + 1) : key).toList());
+  }
+
+  /**
+   * A storage client that lists with a pool, as a client for a large store would: the unit's first listing uses
+   * its whole budget, one thread is then held paging a large directory until the test releases it, and the other
+   * threads, finding the budget used up, hand back the directories they reach.
+   */
+  private StorageClient poolClient(CountDownLatch largeListingHeld, CountDownLatch releaseLargeListing,
+      List<URI> reached) throws Exception {
+    StorageClient client = mock(StorageClient.class);
+    // the test's paths are all within the connector's
+    org.mockito.Mockito.when(client.containsPath(any(), any())).thenReturn(true);
+    doAnswer(invocation -> {
+      @SuppressWarnings("unchecked")
+      List<TraversalParams> params = invocation.getArgument(1);
+      TraversalBudget budget = params.get(0).getBudget();
+      assertTrue(budget.mayList());
+      ExecutorService pool = Executors.newFixedThreadPool(4);
+      try {
+        Future<?> large = pool.submit(() -> {
+          largeListingHeld.countDown();
+          releaseLargeListing.await();
+          budget.directoryPaged(140);
+          return null;
+        });
+        for (URI directory : reached) {
+          pool.submit(() -> {
+            if (!budget.mayList()) {
+              budget.handBack(directory);
+            }
+          }).get();
+        }
+        large.get();
+      } finally {
+        pool.shutdownNow();
+      }
+      return null;
+    }).when(client).traverseAll(any(), any(), any());
+    return client;
+  }
+
+  @Test
+  public void testAPartialGroupGoesOutWhileAListingIsStillUnderWay() throws Exception {
+    Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 1, handBackGroupSize: 64 }");
+    CountDownLatch largeListingHeld = new CountDownLatch(1);
+    CountDownLatch releaseLargeListing = new CountDownLatch(1);
+    List<URI> reached = List.of(root.resolve("a").toUri(), root.resolve("b").toUri(), root.resolve("c").toUri());
+    StorageClient client = poolClient(largeListingHeld, releaseLargeListing, reached);
+    RecordingUnitContext context = new RecordingUnitContext();
+    Map.Entry<String, ObjectNode> rootUnit = plan(config).entrySet().iterator().next();
+
+    FileConnector connector;
+    try (MockedStatic<StorageClient> storageClients = mockStatic(StorageClient.class, org.mockito.Mockito.CALLS_REAL_METHODS)) {
+      storageClients.when(() -> StorageClient.createClients(any())).thenReturn(Map.of("file", client));
+      connector = new FileConnector(config);
+    }
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    Thread unitThread = new Thread(() -> {
+      try {
+        connector.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()), new PublisherImpl(config, new TestMessenger(), "run1", "pipeline1"), context);
+      } catch (Throwable e) {
+        failure.set(e);
+      }
+    });
+    unitThread.start();
+
+    // three directories wait in a group of 64 that will never fill, while a large directory is still being paged
+    boolean held = largeListingHeld.await(10, TimeUnit.SECONDS);
+    assertTrue("the unit failed: " + failure.get() + " at " + java.util.Arrays.toString(unitThread.getStackTrace()), held);
+    Thread.sleep(200);
+    assertTrue(context.handedBack.isEmpty());
+
+    // the Crawler's heartbeat: the group goes now, not when the large listing ends
+    context.progressActions.forEach(Runnable::run);
+    assertEquals(1, context.handedBack.size());
+    ObjectNode group = context.handedBack.values().iterator().next();
+    assertEquals(3, group.get("paths").size());
+    assertTrue(unitThread.isAlive());
+
+    releaseLargeListing.countDown();
+    unitThread.join(10_000);
+    assertNull(failure.get());
+    // nothing is handed back twice, and the unit says what held it up
+    assertEquals(1, context.handedBack.size());
+    assertEquals(140, context.maxDirectoryPages);
+    assertTrue(context.timePastBound >= 200);
+    connector.close();
+  }
+
+  @Test
+  public void testAUnitReportsItsSerialFloor() throws Exception {
+    // one directory a unit: the unit for root lists root, so its limit is reached, and it registers for progress
+    Config config = config("partitioning { depth: 0, maxDirectoriesPerUnit: 1 }");
+    RecordingUnitContext context = new RecordingUnitContext();
+    Map.Entry<String, ObjectNode> rootUnit = plan(config).entrySet().iterator().next();
+    FileConnector connector = new FileConnector(config);
+    connector.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()), new PublisherImpl(config, new TestMessenger(), "run1", "pipeline1"), context);
+    connector.close();
+
+    assertEquals(1, context.progressActions.size());
+    assertNotNull(context.timePastBound);
+    assertTrue(context.timePastBound >= 0);
+
+    // a unit that never reaches a limit has no time past it to report
+    Config unlimited = config("partitioning { depth: 0 }");
+    RecordingUnitContext whole = new RecordingUnitContext();
+    FileConnector again = new FileConnector(unlimited);
+    again.executeUnit(unit(rootUnit.getKey(), rootUnit.getValue()), new PublisherImpl(unlimited, new TestMessenger(), "run1", "pipeline1"), whole);
+    again.close();
+    assertNull(whole.timePastBound);
   }
 
   @Test

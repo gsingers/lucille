@@ -212,6 +212,7 @@ public class S3StorageClient extends BaseStorageClient {
     String nextPage = null;
     long firstFailureMillis = 0;
     int retry = 0;
+    long pagesRead = 0;
 
     while (true) {
       String failedPage = nextPage;
@@ -220,11 +221,16 @@ public class S3StorageClient extends BaseStorageClient {
         Iterator<ListObjectsV2Response> pages = s3.listObjectsV2Paginator(request).stream().iterator();
         while (pages.hasNext()) {
           ListObjectsV2Response page = pages.next();
+          pagesRead++;
           if (params.getBudget() != null) {
             params.getBudget().requestMade();
           }
           publishPage(publisher, params, stateMgr, page, prefixesBeneath);
           nextPage = page.nextContinuationToken();
+        }
+        // one directory's pages are read one after another: the longest listing is a floor under the unit's time
+        if (params.getBudget() != null) {
+          params.getBudget().directoryPaged(pagesRead);
         }
         return prefixesBeneath;
       } catch (SdkException e) {

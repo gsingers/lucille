@@ -27,6 +27,59 @@ public class TraversalBudgetTest {
   }
 
   @Test
+  public void testWhenTheDirectoryLimitWasReached() {
+    TraversalBudget budget = new TraversalBudget(2, null);
+    assertEquals(0, budget.limitReachedMillis());
+    assertFalse(budget.isUsedUp());
+
+    long before = System.currentTimeMillis();
+    budget.mayList();
+    assertFalse(budget.isUsedUp());
+    // the listing that uses the last of the limit is when the limit was reached, whenever the traversal next asks
+    budget.mayList();
+    assertTrue(budget.isUsedUp());
+    long reached = budget.limitReachedMillis();
+    assertTrue(reached >= before && reached <= System.currentTimeMillis());
+    assertFalse(budget.mayList());
+    assertEquals(reached, budget.limitReachedMillis());
+
+    // with no limits, never
+    TraversalBudget unlimited = TraversalBudget.unlimited();
+    unlimited.mayList();
+    assertFalse(unlimited.isUsedUp());
+  }
+
+  @Test
+  public void testWhenTheTimeLimitWasReached() throws Exception {
+    TraversalBudget budget = new TraversalBudget(null, 50L);
+    budget.mayList();
+    assertFalse(budget.isUsedUp());
+    Thread.sleep(80);
+    // the deadline itself, not when the traversal noticed it
+    assertTrue(budget.isUsedUp());
+    assertTrue(budget.limitReachedMillis() <= System.currentTimeMillis() - 25);
+  }
+
+  @Test
+  public void testLargestListingIsKept() {
+    TraversalBudget budget = TraversalBudget.unlimited();
+    long[] heard = {0};
+    budget.setListener(new TraversalBudget.Listener() {
+      @Override
+      public void directoryPaged(long pages) {
+        heard[0] += pages;
+      }
+    });
+
+    assertEquals(0, budget.getMaxDirectoryPages());
+    budget.directoryPaged(3);
+    budget.directoryPaged(12);
+    budget.directoryPaged(5);
+    assertEquals(12, budget.getMaxDirectoryPages());
+    assertEquals(20, heard[0]);
+  }
+
+  @Test
   public void testFirstDirectoryIsAlwaysListed() throws Exception {
     // a time limit that has passed before the traversal lists anything
     TraversalBudget budget = new TraversalBudget(null, 0L);
