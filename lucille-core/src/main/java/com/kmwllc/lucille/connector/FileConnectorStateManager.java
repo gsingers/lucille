@@ -133,6 +133,41 @@ public class FileConnectorStateManager {
   }
 
   /**
+   * Connects to the database for a process that handles only part of a traversal which another process began with
+   * {@link #init()}, and binds a state to the calling thread. Unlike init(), leaves every row's encountered flag as it
+   * is, since other processes are setting those flags for the same traversal. Does nothing if already connected.
+   * Pair with {@link #closeForPartialTraversal()}.
+   */
+  public void openForPartialTraversal() throws ClassNotFoundException, SQLException {
+    connect();
+
+    if (threadState.get() == null) {
+      threadState.set(new TraversalState(jdbcConnection, tableName, traversalInstant));
+    }
+  }
+
+  /**
+   * Connects to the database, without changing any rows or binding a state to the calling thread, for the
+   * whole-table operations. Does nothing if already connected.
+   */
+  public void connect() throws ClassNotFoundException, SQLException {
+    if (jdbcConnection == null) {
+      traversalInstant = Instant.now();
+      jdbcConnection = openConnection();
+    }
+  }
+
+  /**
+   * Disconnects from the database without deleting the rows of expired files, which only the process that sees
+   * the whole traversal can identify.
+   */
+  public void closeForPartialTraversal() {
+    closeStateForThread();
+    closeConnection(jdbcConnection);
+    jdbcConnection = null;
+  }
+
+  /**
    * Binds a {@link TraversalState}, with its own connection to the state database, to the calling thread. The per-file
    * methods on this class then operate through it. {@link #init()} does this for the thread that calls it, so only
    * additional traversal threads need to call this. Every call must be paired with {@link #closeStateForThread()}.
@@ -236,6 +271,10 @@ public class FileConnectorStateManager {
    * Throws an exception if an error occurs.
    */
   public void shutdown() throws SQLException {
+    if (jdbcConnection == null) {
+      return;
+    }
+
     closeStateForThread();
 
     if (performDeletions) {

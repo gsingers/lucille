@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -44,6 +45,36 @@ public interface StorageClient {
    * @throws Exception If an error occurs during traversal.
    */
   void traverse(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr) throws Exception;
+
+  /**
+   * Traverses several paths, as {@link #traverse(Publisher, TraversalParams, FileConnectorStateManager)} would each
+   * in turn. A distributed crawl calls this for a work unit that covers several directories, which is what a unit
+   * is once directories have been handed back and regrouped. The default takes them one after another. A client
+   * that lists with a pool of threads should override it to walk the paths together: run one at a time, a unit of
+   * many small directories keeps one thread busy and the rest idle. The paths share whatever budget their params
+   * carry.
+   *
+   * @param params one TraversalParams per path, in the order to be traversed if they are taken in turn.
+   */
+  default void traverseAll(Publisher publisher, List<TraversalParams> params, FileConnectorStateManager stateMgr) throws Exception {
+    for (TraversalParams p : params) {
+      traverse(publisher, p, stateMgr);
+    }
+  }
+
+  /**
+   * Lists the directories directly under the given path, leaving out any that <code>params</code> says to skip.
+   * A traversal of the path that is not recursive, followed by a recursive traversal of each directory returned,
+   * visits the same files as a recursive traversal of the path. Used to split a traversal into parts.
+   *
+   * @param path A URI to a path in storage.
+   * @param params Parameters for the traversal that is being split.
+   * @return URIs of the directories directly under the path. Empty if there are none, or the path is a file.
+   * @throws UnsupportedOperationException If this client cannot list directories or cannot traverse without recursion.
+   */
+  default List<URI> listSubdirectories(URI path, TraversalParams params) throws IOException {
+    throw new UnsupportedOperationException(getClass().getSimpleName() + " cannot list subdirectories.");
+  }
 
   /**
    * Returns whether a traversal of the given parent would also visit the files under the given child, based on this
@@ -95,7 +126,7 @@ public interface StorageClient {
           throw new IllegalArgumentException("Path is to S3 but no options provided.");
         }
         Config s3Options = connectorConfig.getConfig("s3");
-        return new S3StorageClient(s3Options);
+        return new S3StorageClient(s3Options, retryPolicyAskedFor(connectorConfig));
       }
       case "https" -> {
         String authority = pathToStorage.getAuthority();
@@ -146,6 +177,9 @@ public interface StorageClient {
    * includes the LocalStorageClient, keyed by "file".
    */
   static Map<String, StorageClient> createClients(Config config) {
+    // Lucille retries calls the source refuses only if the config sets sourceRetrySecs, which FileConnector always
+    // does; everything else keeps the cloud SDK's own retries
+    SourceRetryPolicy retryPolicy = retryPolicyAskedFor(config);
     Map<String, StorageClient> results = new HashMap<>();
 
     results.put("file", new LocalStorageClient());
@@ -162,10 +196,16 @@ public interface StorageClient {
 
     if (config.hasPath("s3")) {
       Config s3Options = config.getConfig("s3");
-      results.put("s3", new S3StorageClient(s3Options));
+      results.put("s3", new S3StorageClient(s3Options, retryPolicy));
     }
 
     return results;
+  }
+
+  // Lucille's retry policy if the config sets one, and otherwise none, which leaves the SDK's own retries on: a stage
+  // fetching a file is not held for minutes by an unreachable store unless it asks to be.
+  private static SourceRetryPolicy retryPolicyAskedFor(Config config) {
+    return config.hasPath(SourceRetryPolicy.RETRY_SECS) ? SourceRetryPolicy.fromConfig(config) : SourceRetryPolicy.NONE;
   }
 
   /**

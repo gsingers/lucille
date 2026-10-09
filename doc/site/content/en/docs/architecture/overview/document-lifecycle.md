@@ -1,6 +1,6 @@
 ---
 title: "Document Lifecycle"
-weight: 6
+weight: 7
 date: 2025-06-09
 description: >
   The complete journey of a single Document through Lucille, from raw data in a source system to a searchable record in the search backend.

@@ -7,16 +7,22 @@ import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.io.File;
 import java.io.FileInputStream;
+import com.kmwllc.lucille.core.FailureClass;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.nio.file.FileVisitOption;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,7 +45,26 @@ public class LocalStorageClient extends BaseStorageClient {
 
   @Override
   protected void traverseStorageClient(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr) throws Exception {
-    Files.walkFileTree(toPath(params.getURI()), new LocalFileVisitor(publisher, params, stateMgr));
+    int maxDepth = params.isRecursive() ? Integer.MAX_VALUE : 1;
+    Files.walkFileTree(toPath(params.getURI()), EnumSet.noneOf(FileVisitOption.class), maxDepth,
+        new LocalFileVisitor(publisher, params, stateMgr));
+  }
+
+  @Override
+  public List<URI> listSubdirectories(URI path, TraversalParams params) throws IOException {
+    Path directory = toPath(path);
+    if (!Files.isDirectory(directory)) {
+      return List.of();
+    }
+
+    try (Stream<Path> children = Files.list(directory)) {
+      return children
+          .filter(child -> Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS))
+          .map(child -> child.toAbsolutePath().normalize().toUri())
+          .filter(childURI -> !isSkippedDirectory(childURI, params))
+          .sorted()
+          .toList();
+    }
   }
 
   @Override
@@ -100,9 +125,16 @@ public class LocalStorageClient extends BaseStorageClient {
 
       if (isSkippedDirectory(dirURI, params)) {
         return FileVisitResult.SKIP_SUBTREE;
-      } else {
-        return FileVisitResult.CONTINUE;
       }
+
+      // a traversal with a budget lists only as many directories as it allows, and hands the rest back unwalked
+      TraversalBudget budget = params.getBudget();
+      if (budget != null && !budget.mayList()) {
+        budget.handBack(dirURI);
+        return FileVisitResult.SKIP_SUBTREE;
+      }
+
+      return FileVisitResult.CONTINUE;
     }
 
     private static String ensureTrailingSlash(String s) {
@@ -111,6 +143,11 @@ public class LocalStorageClient extends BaseStorageClient {
 
     @Override
     public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+      // a traversal that is not recursive is handed the directories at its depth limit as though they were files
+      if (attrs.isDirectory()) {
+        return FileVisitResult.CONTINUE;
+      }
+
       // Visit the file and actually process it!
       FileReference fileRef = new LocalFileReference(file, attrs);
       processAndPublishFileIfValid(publisher, fileRef, params, stateMgr);
@@ -119,6 +156,16 @@ public class LocalStorageClient extends BaseStorageClient {
 
     @Override
     public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+      // A directory that could not be listed, in a traversal that can hand work back: it is handed back, to be tried
+      // again as a unit of its own, and so is the rest of this traversal.
+      TraversalBudget budget = params.getBudget();
+      if (budget != null && Files.isDirectory(file)) {
+        log.warn("Could not list {}; handing it and the rest of the unit back.", file, exc);
+        budget.sourceError(FailureClass.SOURCE_ERROR, exc);
+        budget.handBack(file.toAbsolutePath().normalize().toUri());
+        return FileVisitResult.CONTINUE;
+      }
+
       // At some point we can add a feature to create a tombstone document, for now just log the failure.
       log.warn("Visit File Failed for : {}", file.toString(), exc);
       return FileVisitResult.CONTINUE;

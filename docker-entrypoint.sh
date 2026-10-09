@@ -17,6 +17,7 @@ fi
 #   runner  (default)  - com.kmwllc.lucille.core.Runner. Optionally driven by LUCILLE_OPTS (e.g. -distributed)
 #   worker             - com.kmwllc.lucille.core.Worker <pipeline>, requires LUCILLE_PIPELINE
 #   indexer            - com.kmwllc.lucille.core.Indexer <pipeline>, requires LUCILLE_PIPELINE
+#   crawler            - com.kmwllc.lucille.core.Crawler. Executes the work units of runs started with -distributedCrawl
 LUCILLE_ROLE_NORMALIZED=$(echo "${LUCILLE_ROLE:-runner}" | tr '[:upper:]' '[:lower:]')
 case "$LUCILLE_ROLE_NORMALIZED" in
   runner)
@@ -41,14 +42,24 @@ case "$LUCILLE_ROLE_NORMALIZED" in
     fi
     MAIN_ARGS=("$LUCILLE_PIPELINE")
     ;;
+  crawler)
+    if [ -n "$LUCILLE_PIPELINE" ]; then
+      echo "WARN: LUCILLE_PIPELINE is set, but LUCILLE_ROLE=crawler. It will not be used."
+    fi
+    if [ -n "$LUCILLE_OPTS" ]; then
+      echo "WARN: LUCILLE_OPTS is set, but LUCILLE_ROLE=crawler. It will not be used."
+    fi
+    MAIN_CLASS="com.kmwllc.lucille.core.Crawler"
+    MAIN_ARGS=()
+    ;;
   *)
-    echo "ERROR: unrecognized LUCILLE_ROLE '${LUCILLE_ROLE}'. Must be one of: runner, worker, indexer."
+    echo "ERROR: unrecognized LUCILLE_ROLE '${LUCILLE_ROLE}'. Must be one of: runner, worker, indexer, crawler."
     exit 1
     ;;
 esac
 
 # JAVA_OPTS: JVM-level flags (heap, GC, etc.)
-# LUCILLE_OPTS: Lucille Runner CLI flags (e.g. -distributed, -external)
+# LUCILLE_OPTS: Lucille Runner CLI flags (e.g. -distributed, -external, -distributedCrawl)
 # exec replaces the shell so Java is PID 1 and receives signals (SIGTERM, SIGINT) directly
 exec java \
   ${JAVA_OPTS} \

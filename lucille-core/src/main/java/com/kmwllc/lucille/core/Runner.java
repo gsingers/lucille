@@ -13,6 +13,7 @@ import com.kmwllc.lucille.util.LogUtils;
 import com.kmwllc.lucille.util.ThreadNameUtils;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import com.typesafe.config.ConfigValueFactory;
 import com.typesafe.config.ConfigRenderOptions;
 import com.typesafe.config.ConfigValue;
 import java.util.Map.Entry;
@@ -26,6 +27,7 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.*;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.MDC;
 import sun.misc.Signal;
@@ -77,7 +79,8 @@ public class Runner {
       Pair.of("runner", Runner.SPEC),
       Pair.of("kafka", KafkaUtils.SPEC),
       Pair.of("zookeeper", ZKRetryCounter.SPEC),
-      Pair.of("worker", Worker.SPEC)
+      Pair.of("worker", Worker.SPEC),
+      Pair.of("crawl", CrawlConfig.SPEC)
   );
 
   public static final int DEFAULT_CONNECTOR_TIMEOUT = 1000 * 60 * 60 * 24;
@@ -90,7 +93,8 @@ public class Runner {
     LOCAL, // launch Worker(s) and Indexer as threads; have all components communicate via in-memory queues
     TEST, // same as LOCAL, but bypass Solr, and store message traffic so it can be inspected after the run
     EXTERNAL, // launch Worker(s) and Indexer as threads; have all components communicate via Kafka
-    DISTRIBUTED// assume Workers/Indexers were started separately (don't launch threads); have all components communicate via Kafka
+    DISTRIBUTED, // assume Workers/Indexers were started separately (don't launch threads); have all components communicate via Kafka
+    DISTRIBUTED_CRAWL // same as DISTRIBUTED, but also assume Crawlers were started separately and have them execute the Connectors' work
   }
 
   // no need to instantiate Runner; all methods currently static
@@ -110,6 +114,7 @@ public class Runner {
     private WorkerPool workerPool;
     private Indexer indexer;
     private Thread indexerThread;
+    private Runnable interruptAction;
 
     public RunnerState() {
     }
@@ -131,6 +136,13 @@ public class Runner {
     }
 
     public void close() {
+      if (interruptAction != null) {
+        try {
+          interruptAction.run();
+        } catch (Exception e) {
+          log.error("Error announcing the end of the run", e);
+        }
+      }
       if (connector != null) {
         try {
           log.info("Closing current Connector...");
@@ -182,6 +194,19 @@ public class Runner {
    * -external: modified local mode where workers and indexers are started as separate threads within the same JVM and kafka is
    * used for communication between them.
    * <p>
+   * -distributedCrawl: like -distributed, but the connectors are not executed here either. Each connector's work is split
+   * into units that are executed by Crawlers, which are assumed to have been deployed as separate processes.
+   * <p>
+   * -runId &lt;id&gt;: uses the given run ID instead of generating one.
+   * <p>
+   * -resume &lt;id&gt;: continues the distributed crawl with the given run ID, which an earlier Runner started but did not
+   * finish. Add -force to resume a run whose Runner appears to still be alive.
+   * <p>
+   * -resumeIfExists: with -distributedCrawl and -runId, starts the run if there is no record of it and continues it if
+   * there is. For a Runner that is restarted automatically with the same arguments.
+   * <p>
+   * -listRuns: lists the distributed crawls on record, with the state of each, and exits.
+   * <p>
    * -render: prints out the effective/actual config in the exact form it will be seen by Lucille during the run
    */
   public static void main(String[] args) throws Exception {
@@ -199,10 +224,27 @@ public class Runner {
             + "through kafka")
         .build();
 
-    OptionGroup distributedType = new OptionGroup().addOption(distributedOpt).addOption(external);
+    Option distributedCrawl = Option.builder("distributedcrawl").hasArg(false)
+        .desc("Uses Kafka for inter-component communication and doesn't execute connectors or pipelines locally. "
+            + "Connectors are executed by separately deployed Crawlers.")
+        .build();
+
+    OptionGroup distributedType = new OptionGroup().addOption(distributedOpt).addOption(external).addOption(distributedCrawl);
 
     Options cliOptions = new Options()
         .addOptionGroup(distributedType)
+        .addOption(Option.builder("runid").hasArg(true).argName("id")
+            .desc("Use the given run ID instead of generating one").build())
+        .addOption(Option.builder("resume").hasArg(true).argName("id")
+            .desc("Continue the unfinished distributed crawl with the given run ID").build())
+        .addOption(Option.builder("force").hasArg(false)
+            .desc("With -resume, continue the run even if its original Runner may still be alive").build())
+        .addOption(Option.builder("resumeifexists").hasArg(false)
+            .desc("With -distributedCrawl and -runId, continue the run if it was started before, else start it").build())
+        .addOption(Option.builder("costsfrom").hasArg(true).argName("id")
+            .desc("With -distributedCrawl: dispatch the largest units first, as measured by this earlier run. Sets crawl.costsFromRun.").build())
+        .addOption(Option.builder("listruns").hasArg(false)
+            .desc("List the distributed crawls on record and exit").build())
         .addOption(Option.builder("validate").hasArg(false)
             .desc("Validate the configuration and exit").build())
         .addOption(Option.builder("render").hasArg(false)
@@ -210,7 +252,8 @@ public class Runner {
 
     CommandLine cli = null;
     try {
-      args = Arrays.stream(args).map(String::toLowerCase).toArray(String[]::new);
+      // flags are case insensitive; their values, such as a run ID, are left as given
+      args = Arrays.stream(args).map(arg -> arg.startsWith("-") ? arg.toLowerCase() : arg).toArray(String[]::new);
       cli = new DefaultParser().parse(cliOptions, args);
 
       if (!cli.getArgList().isEmpty()) {
@@ -237,6 +280,27 @@ public class Runner {
       return;
     }
 
+    if (cli.hasOption("listruns")) {
+      listRuns(config);
+      return;
+    }
+
+    if (cli.hasOption("costsfrom")) {
+      if (!cli.hasOption("distributedcrawl") && !cli.hasOption("resume")) {
+        printHelp(cliOptions, "-costsFrom requires -distributedCrawl or -resume");
+        SystemHelper.exit(1);
+        return;
+      }
+      config = config.withValue("crawl.costsFromRun", ConfigValueFactory.fromAnyRef(cli.getOptionValue("costsfrom")));
+    }
+
+    // A Runner that may be restarted has to be told its run ID: one it generated would be lost with it.
+    if (cli.hasOption("resumeifexists") && !(cli.hasOption("distributedcrawl") && cli.hasOption("runid"))) {
+      printHelp(cliOptions, "-resumeIfExists requires -distributedCrawl and -runId");
+      SystemHelper.exit(1);
+      return;
+    }
+
     // register a signal handler to attempt a clean shutdown of
     // Connector, Publisher, WorkerPool, and Indexer if an INT signal is received
     Signal.handle(new Signal("INT"), signal -> {
@@ -247,10 +311,20 @@ public class Runner {
       SystemHelper.exit(0);
     });
 
-    RunType runType = getRunType(cli.hasOption("distributed"), cli.hasOption("external"));
+    RunType runType = cli.hasOption("distributedcrawl") || cli.hasOption("resume") ? RunType.DISTRIBUTED_CRAWL
+        : getRunType(cli.hasOption("distributed"), cli.hasOption("external"));
 
     // Kick off the run with a log of the result
-    RunResult result = runAndLogResult(config, runType, true);
+    RunResult result;
+    if (cli.hasOption("resume")) {
+      result = resumeAndLogResult(config, cli.getOptionValue("resume"), cli.hasOption("force"), true);
+    } else if (cli.hasOption("resumeifexists")) {
+      result = startOrResumeAndLogResult(config, cli.getOptionValue("runid"), true);
+    } else if (cli.hasOption("runid")) {
+      result = runAndLogResult(config, runType, cli.getOptionValue("runid"), true);
+    } else {
+      result = runAndLogResult(config, runType, true);
+    }
 
     if (result.getStatus()) {
       SystemHelper.exit(0);
@@ -492,12 +566,75 @@ public class Runner {
       throw new IllegalArgumentException("Cannot specify null runId.");
     }
 
+    return logResult(config, runId, logMetrics, () -> run(config, runType, runId));
+  }
+
+  /**
+   * Continues the distributed crawl with the given <code>runId</code>, which an earlier Runner started but did not
+   * finish, and logs the RunResult as {@link #runAndLogResult(Config, RunType, String, boolean)} does. Connectors
+   * and work units that the run already completed are not executed again.
+   *
+   * @param force whether to resume even though the run's original Runner may still be alive.
+   */
+  public static RunResult resumeAndLogResult(Config config, String runId, boolean force, boolean logMetrics)
+      throws Exception {
+    return logResult(config, runId, logMetrics, () -> {
+      RunResult invalid = prepareRun(config, RunType.DISTRIBUTED_CRAWL, runId);
+      return invalid != null ? invalid : CrawlCoordinator.forKafka(config, runId).run(true, force);
+    });
+  }
+
+  /**
+   * Starts the distributed crawl with the given <code>runId</code>, or continues it if an earlier Runner started it,
+   * and logs the RunResult as {@link #runAndLogResult(Config, RunType, String, boolean)} does. For a Runner that is
+   * restarted automatically with the same arguments. If the run's earlier Runner may still be alive, waits for it
+   * to have been silent for <code>crawl.orphanTimeoutSecs</code> before taking over.
+   */
+  public static RunResult startOrResumeAndLogResult(Config config, String runId, boolean logMetrics) throws Exception {
+    return logResult(config, runId, logMetrics, () -> {
+      RunResult invalid = prepareRun(config, RunType.DISTRIBUTED_CRAWL, runId);
+      return invalid != null ? invalid : CrawlCoordinator.forKafka(config, runId).startOrResume();
+    });
+  }
+
+  /**
+   * Logs every distributed crawl there is a record of: its run ID, its state, the epoch of its latest Coordinator,
+   * and how long ago that Coordinator was last heard from. A run can be resumed by its ID for as long as it is listed.
+   */
+  public static void listRuns(Config config) throws Exception {
+    RunControl runControl = new KafkaRunControl(config);
+    try {
+      log.info(formatRuns(runControl.list(), new CrawlConfig(config).orphanTimeoutSecs));
+    } finally {
+      runControl.close();
+    }
+  }
+
+  // package access for unit test
+  static String formatRuns(Map<String, RunControl.Status> runs, int orphanTimeoutSecs) {
+    if (runs.isEmpty()) {
+      return "No distributed crawls are on record.";
+    }
+
+    StringBuilder table = new StringBuilder(String.format("%n%-40s %-22s %5s %s", "RUN ID", "STATE", "EPOCH", "LAST HEARD FROM"));
+    for (Map.Entry<String, RunControl.Status> run : runs.entrySet()) {
+      RunControl.Status status = run.getValue();
+      long ageSecs = TimeUnit.MILLISECONDS.toSeconds(status.ageMillis());
+      String state = status.cancelled() ? "ended (" + status.reason() + ")"
+          : ageSecs < orphanTimeoutSecs ? "running" : "silent, resumable";
+      table.append(String.format("%n%-40s %-22s %5d %d secs ago", run.getKey(), state, status.epoch(), ageSecs));
+    }
+    return table.toString();
+  }
+
+  private static RunResult logResult(Config config, String runId, boolean logMetrics, Callable<RunResult> run)
+      throws Exception {
     StopWatch stopWatch = new StopWatch();
     stopWatch.start();
     RunResult result;
 
     try {
-      result = run(config, runType, runId);
+      result = run.call();
 
       if (logMetrics) {
         Slf4jReporter.forRegistry(SharedMetricRegistries.getOrCreate(LogUtils.METRICS_REG))
@@ -532,20 +669,14 @@ public class Runner {
       runId = Runner.generateRunId();
     }
 
-    MDC.put(RUNID_FIELD, runId);
-
-    Map<String, List<Exception>> validationErrors = runInValidationMode(config);
-    if (!validationErrors.isEmpty()) {
-      log.error("Pre-run validation failed.");
-
-      Map<String, TestMessenger> history =
-          type.equals(RunType.TEST) ? new HashMap<>() : null;
-
-      return new RunResult(false,
-          Collections.emptyList(), Collections.emptyList(), history, runId);
+    RunResult invalid = prepareRun(config, type, runId);
+    if (invalid != null) {
+      return invalid;
     }
 
-    log.info("Starting run with id " + runId);
+    if (type.equals(RunType.DISTRIBUTED_CRAWL)) {
+      return CrawlCoordinator.forKafka(config, runId).run(false, false);
+    }
 
     List<Connector> connectors = Connector.fromConfig(config);
     List<ConnectorResult> connectorResults = new ArrayList<>();
@@ -591,6 +722,37 @@ public class Runner {
     }
 
     return new RunResult(true, connectors, connectorResults, history, runId);
+  }
+
+  /**
+   * Validates the config ahead of a run. Returns the failing RunResult to return if the config is invalid, and
+   * otherwise null.
+   */
+  private static RunResult prepareRun(Config config, RunType type, String runId) throws Exception {
+    MDC.put(RUNID_FIELD, runId);
+
+    Map<String, List<Exception>> validationErrors = runInValidationMode(config);
+    if (!validationErrors.isEmpty()) {
+      log.error("Pre-run validation failed.");
+
+      Map<String, TestMessenger> history =
+          type.equals(RunType.TEST) ? new HashMap<>() : null;
+
+      return new RunResult(false,
+          Collections.emptyList(), Collections.emptyList(), history, runId);
+    }
+
+    log.info("Starting run with id " + runId);
+    return null;
+  }
+
+  /**
+   * Registers an action to perform if the run is aborted by an INT signal. Has no effect unless running via main().
+   */
+  static void onInterrupt(Runnable action) {
+    if (state != null) {
+      state.interruptAction = action;
+    }
   }
 
   /**

@@ -592,4 +592,101 @@ public class LocalStorageClientTest {
 
     localStorageClient.shutdown();
   }
+
+  // A traversal that is not recursive publishes the files directly under the path and nothing below them.
+  @Test
+  public void testTraverseWithoutRecursion() throws Exception {
+    TestMessenger messenger = new TestMessenger();
+    Publisher publisher = new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1");
+    Config connectorConfig = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("excludes", List.of(".*\\.DS_Store$"))));
+
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    TraversalParams params = new TraversalParams(connectorConfig,
+        URI.create("src/test/resources/StorageClientTest/testPublishFilesDefault"), "", false);
+    localStorageClient.init();
+    localStorageClient.traverse(publisher, params);
+
+    List<Document> docs = messenger.getDocsSentForProcessing();
+    assertEquals(4, docs.size());
+    assertTrue(docs.stream().noneMatch(d -> d.getString(FileConnector.FILE_PATH).contains("subdir1")));
+
+    localStorageClient.shutdown();
+  }
+
+  // A traversal with a budget lists as many directories as it allows and hands back the rest, unwalked.
+  @Test
+  public void testTraverseWithinBudget() throws Exception {
+    Config connectorConfig = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("excludes", List.of(".*\\.DS_Store$"))));
+    URI root = URI.create("src/test/resources/StorageClientTest/testPublishFilesDefault");
+    URI subdir1 = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault/subdir1").toAbsolutePath().toUri();
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    localStorageClient.init();
+
+    // one directory: the four files in the root are published and subdir1 is handed back
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = new TraversalBudget(1, null);
+    localStorageClient.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(connectorConfig, root, "", true, budget));
+    assertEquals(4, messenger.getDocsSentForProcessing().size());
+    assertEquals(List.of(subdir1), budget.getHandedBack());
+    assertEquals(1, budget.getDirectoriesListed());
+
+    // two directories: everything is walked and nothing is handed back
+    messenger = new TestMessenger();
+    budget = new TraversalBudget(2, null);
+    localStorageClient.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(connectorConfig, root, "", true, budget));
+    assertEquals(8, messenger.getDocsSentForProcessing().size());
+    assertEquals(List.of(), budget.getHandedBack());
+    assertEquals(2, budget.getDirectoriesListed());
+
+    // a budget with no limits walks everything too, and counts
+    messenger = new TestMessenger();
+    budget = TraversalBudget.unlimited();
+    localStorageClient.traverse(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"),
+        new TraversalParams(connectorConfig, root, "", true, budget));
+    assertEquals(8, messenger.getDocsSentForProcessing().size());
+    assertEquals(2, budget.getDirectoriesListed());
+
+    localStorageClient.shutdown();
+  }
+
+  // A client that does not override the traversal of several paths gets them one after another, sharing a budget.
+  @Test
+  public void testTraverseSeveralPaths() throws Exception {
+    Config connectorConfig = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("excludes", List.of(".*\\.DS_Store$"))));
+    URI root = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault").toAbsolutePath().toUri();
+    URI subdir1 = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault/subdir1").toAbsolutePath().toUri();
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    localStorageClient.init();
+    TestMessenger messenger = new TestMessenger();
+    TraversalBudget budget = new TraversalBudget(1, null);
+
+    localStorageClient.traverseAll(new PublisherImpl(ConfigFactory.empty(), messenger, "run1", "pipeline1"), List.of(
+        new TraversalParams(connectorConfig, subdir1, "", false, budget),
+        new TraversalParams(connectorConfig, root, "", false, budget)), null);
+
+    // subdir1 used up the budget, so root was handed back unlisted
+    assertEquals(4, messenger.getDocsSentForProcessing().size());
+    assertEquals(List.of(root), budget.getHandedBack());
+    localStorageClient.shutdown();
+  }
+
+  @Test
+  public void testListSubdirectories() throws Exception {
+    LocalStorageClient localStorageClient = new LocalStorageClient();
+    URI root = URI.create("src/test/resources/StorageClientTest/testPublishFilesDefault");
+    URI subdir1 = Paths.get("src/test/resources/StorageClientTest/testPublishFilesDefault/subdir1").toAbsolutePath().toUri();
+
+    TraversalParams params = new TraversalParams(ConfigFactory.empty(), root, "");
+    assertEquals(List.of(subdir1), localStorageClient.listSubdirectories(root, params));
+
+    // a directory with no directories in it, and a file, have no subdirectories
+    assertEquals(List.of(), localStorageClient.listSubdirectories(subdir1, params));
+    assertEquals(List.of(), localStorageClient.listSubdirectories(URI.create(root + "/a.json"), params));
+
+    // directories that the traversal would skip are left out
+    Config skipSubdir1 = ConfigFactory.parseMap(Map.of("filterOptions", Map.of("pathsToSkip", List.of(subdir1.toString()))));
+    assertEquals(List.of(), localStorageClient.listSubdirectories(root, new TraversalParams(skipSubdir1, root, "")));
+  }
 }

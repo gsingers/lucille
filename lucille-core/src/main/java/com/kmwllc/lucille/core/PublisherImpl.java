@@ -390,6 +390,7 @@ public class PublisherImpl implements Publisher {
     // each event. We would then join on the connector thread, then the Event handling thread, and
     // finally stop the logging thread.
     while (true) {
+      onWaitIteration();
 
       // we assume that messenger.pollEvent() is a blocking operation with a timeout in the range
       // of several milliseconds to several seconds.
@@ -412,13 +413,19 @@ public class PublisherImpl implements Publisher {
         return new PublisherResult(false, "Connector exception.");
       }
 
+      String failure = failureReason();
+      if (failure != null) {
+        log.error("Exiting run with " + numPending() + " pending documents; " + failure);
+        return new PublisherResult(false, failure);
+      }
+
       // We are done if 1) the Connector thread has terminated and therefore no more Documents will be generated,
       // 2) all published Documents and their children are accounted for (none are pending),
       // 3) there are no more Events relating to the current run to consume
       // Regarding 3), we assume there are no more events if the previous call to messenger.pollEvent() returned null
       // In a Kafka deployment, the publisher should be the only consumer of the event topic, and the topic should
       // have a single partition
-      if (!thread.isAlive() && !hasPending() && event == null) {
+      if (!thread.isAlive() && !hasPending() && !hasOutstandingWork() && event == null) {
         // note: the present waitForCompletion() method usually executes in a separate thread from publish()
         // so this ThreadLocal timerContext is usually different from the one set by publish() and may not be set at all;
         // we stop it here just in case it is set
@@ -459,6 +466,29 @@ public class PublisherImpl implements Publisher {
   @Override
   public boolean hasPending() {
     return !docIdsToTrack.isEmpty();
+  }
+
+  /**
+   * Returns whether Documents may still be published by something other than the thread given to waitForCompletion().
+   * Checked by waitForCompletion() alongside its other conditions. Always false here, where that thread is the only
+   * source of Documents; a subclass whose Documents are published elsewhere overrides it.
+   */
+  protected boolean hasOutstandingWork() {
+    return false;
+  }
+
+  /**
+   * Called by waitForCompletion() each time round its loop, which is at least every few seconds. Does nothing here.
+   */
+  protected void onWaitIteration() {
+  }
+
+  /**
+   * Returns a message describing why the work being waited on has failed and will never complete, or null if it has
+   * not. Checked by waitForCompletion(), which stops waiting when a message is returned. Always null here.
+   */
+  protected String failureReason() {
+    return null;
   }
 
   @Override
