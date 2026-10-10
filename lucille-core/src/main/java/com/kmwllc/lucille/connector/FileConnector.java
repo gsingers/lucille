@@ -85,6 +85,9 @@ import com.typesafe.config.Config;
  *   credentials. Cannot be combined with accessKeyId/secretAccessKey. When set and no region is given,
  *   region defaults to us-east-1, S3's global endpoint. Defaults to false.</li>
  *   <li>s3.maxNumOfPages (Int, Optional) : Maximum number of file references to hold in memory. Defaults to 100.</li>
+ *   <li>s3.traversalThreads (Int, Optional) : Number of directories listed at once when traversing. Defaults to 1, which
+ *   walks the tree on the connector's thread. With more, directories are listed on a pool of this many threads, and a
+ *   large directory is listed as several key ranges at once.</li>
  *   <li>azure.connectionString (String, Optional) : Azure connection string.</li>
  *   <li>azure.accountName (String, Optional) : Azure account name.</li>
  *   <li>azure.accountKey (String, Optional) : Azure account key.</li>
@@ -112,6 +115,7 @@ public class FileConnector extends AbstractConnector {
   public static final String S3_ACCESS_KEY_ID = "accessKeyId";
   public static final String S3_SECRET_ACCESS_KEY = "secretAccessKey";
   public static final String S3_ANONYMOUS = "anonymous";
+  public static final String S3_TRAVERSAL_THREADS = "traversalThreads";
   public static final String GOOGLE_SERVICE_KEY = "pathToServiceKey";
   public static final String MAX_NUM_OF_PAGES = "maxNumOfPages";
 
@@ -129,7 +133,7 @@ public class FileConnector extends AbstractConnector {
   public static final Spec S3_PARENT_SPEC = SpecBuilder.parent("s3")
       .optionalString("accessKeyId", "secretAccessKey", "region")
       .optionalBoolean("anonymous")
-      .optionalNumber("maxNumOfPages").build();
+      .optionalNumber("maxNumOfPages", "traversalThreads").build();
   public static final Spec AZURE_PARENT_SPEC = SpecBuilder.parent("azure")
       .optionalString("connectionString", "accountName", "accountKey")
       .optionalNumber("maxNumOfPages").build();

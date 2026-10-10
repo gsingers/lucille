@@ -647,6 +647,11 @@
       <artifactId>s3</artifactId>
       <version>${aws-sdk.version}</version>
     </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>apache5-client</artifactId>
+      <version>${aws-sdk.version}</version>
+    </dependency>
     <!-- The following 3 dependencies are needed for the AWS SDK S3Client default credentials provider -->
     <dependency>
         <groupId>software.amazon.awssdk</groupId>

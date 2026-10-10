@@ -4,6 +4,7 @@ import static com.kmwllc.lucille.connector.FileConnector.S3_ACCESS_KEY_ID;
 import static com.kmwllc.lucille.connector.FileConnector.S3_ANONYMOUS;
 import static com.kmwllc.lucille.connector.FileConnector.S3_REGION;
 import static com.kmwllc.lucille.connector.FileConnector.S3_SECRET_ACCESS_KEY;
+import static com.kmwllc.lucille.connector.FileConnector.S3_TRAVERSAL_THREADS;
 
 import com.kmwllc.lucille.connector.FileConnectorStateManager;
 import com.kmwllc.lucille.core.Publisher;
@@ -18,13 +19,16 @@ import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
 /**
@@ -42,8 +46,12 @@ public class S3StorageClient extends BaseStorageClient {
 
   protected S3Client s3;
 
+  // directories listed at once; 1 walks the tree on the calling thread
+  private final int traversalThreads;
+
   public S3StorageClient(Config s3CloudOptions) {
     super(s3CloudOptions);
+    this.traversalThreads = s3CloudOptions.hasPath(S3_TRAVERSAL_THREADS) ? s3CloudOptions.getInt(S3_TRAVERSAL_THREADS) : 1;
   }
 
   @Override
@@ -51,6 +59,10 @@ public class S3StorageClient extends BaseStorageClient {
     if (config.hasPath(S3_ACCESS_KEY_ID) ^ config.hasPath(S3_SECRET_ACCESS_KEY)) {
       throw new IllegalArgumentException("'" + S3_ACCESS_KEY_ID + "' and '" + S3_SECRET_ACCESS_KEY +
           "' must be specified together or omitted together in Config for S3StorageClient.");
+    }
+
+    if (config.hasPath(S3_TRAVERSAL_THREADS) && config.getInt(S3_TRAVERSAL_THREADS) < 1) {
+      throw new IllegalArgumentException("'" + S3_TRAVERSAL_THREADS + "' must be at least 1 in Config for S3StorageClient.");
     }
 
     if (isAnonymous(config) && config.hasPath(S3_ACCESS_KEY_ID)) {
@@ -82,6 +94,11 @@ public class S3StorageClient extends BaseStorageClient {
         builder = builder.credentialsProvider(StaticCredentialsProvider.create(awsCred));
       }
 
+      if (traversalThreads > 1) {
+        // the default pool holds 50 connections, which would cap the listings in flight below the thread count
+        builder = builder.httpClientBuilder(Apache5HttpClient.builder().maxConnections(traversalThreads));
+      }
+
       s3 = builder.build();
     } catch (Exception e) {
       throw new IOException("Error occurred building S3Client", e);
@@ -101,7 +118,43 @@ public class S3StorageClient extends BaseStorageClient {
 
   @Override
   protected void traverseStorageClient(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr) throws Exception {
-    traversePrefix(publisher, params, stateMgr, getStartingDirectory(params));
+    if (traversalThreads == 1) {
+      traversePrefix(publisher, params, stateMgr, getStartingDirectory(params));
+      return;
+    }
+
+    // the state database binds a connection to each thread, so each traversal thread opens its own
+    ParallelTreeWalker.ThreadResource state = stateMgr == null ? ParallelTreeWalker.NO_THREAD_RESOURCE : () -> {
+      stateMgr.openStateForThread();
+      return stateMgr::closeStateForThread;
+    };
+    new ParallelTreeWalker(traversalThreads, "S3Traversal", state).walk(getStartingDirectory(params), lister(params),
+        prefix -> !isSkippedDirectory(uriForDirectory(prefix, params), params),
+        obj -> processAndPublishFileIfValid(publisher, new S3FileReference(obj, params), params, stateMgr));
+  }
+
+  private ParallelTreeWalker.Lister<S3Object> lister(TraversalParams params) {
+    return new ParallelTreeWalker.Lister<>() {
+      @Override
+      public ParallelTreeWalker.Page<S3Object> list(String prefix, String startAfter, String token) {
+        ListObjectsV2Response response = s3.listObjectsV2(ListObjectsV2Request.builder()
+            .bucket(getBucketOrContainerName(params))
+            .prefix(prefix)
+            .delimiter("/")
+            .maxKeys(maxNumOfPages)
+            .startAfter(token == null ? startAfter : null)
+            .continuationToken(token)
+            .build());
+        return new ParallelTreeWalker.Page<>(response.contents(),
+            response.commonPrefixes().stream().map(CommonPrefix::prefix).toList(),
+            Boolean.TRUE.equals(response.isTruncated()) ? response.nextContinuationToken() : null);
+      }
+
+      @Override
+      public String key(S3Object obj) {
+        return obj.key();
+      }
+    };
   }
 
   private void traversePrefix(Publisher publisher, TraversalParams params, FileConnectorStateManager stateMgr, String prefix) {

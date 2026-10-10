@@ -46,8 +46,11 @@ s3 {
   secretAccessKey: "..."
   region: "us-east-1"
   maxNumOfPages: 100
+  traversalThreads: 1
 }
 ```
+
+`traversalThreads` sets how many S3 directories (prefixes) are listed at once. It defaults to 1, which lists one page at a time on the connector's thread. Each listing waits on a round trip to the store, so on a large bucket the traversal's speed is roughly `traversalThreads` divided by the time for one listing; values in the hundreds are reasonable. When more than one thread is set, a directory still truncated after a page is split into key ranges listed at once, so a single very large directory does not have to be paged through one request at a time. Files are then published in no particular order.
 
 For S3 paths, percent-encode special characters in `paths` (e.g., `s3://bucket/folder%20with%20spaces`).
 
