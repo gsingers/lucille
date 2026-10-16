@@ -115,6 +115,39 @@ public class ConcurrentDispatcherTest {
     assertTrue("the outcome must carry the cancellation", processor.errors.get("first") instanceof CancellationException);
   }
 
+  @Test
+  public void testReentrantDispatchDoesNotOvertakeBatchHeldByOuterDispatch() throws Exception {
+    // The outer dispatch() of "held" waits because "held" writes the same id as the in-flight "first". While it waits,
+    // keepAlive runs the revocation hook, which dispatches the newer open batch ("newer", same id) and drains. "held" was
+    // polled before "newer", so it must be sent before it; otherwise an add/delete of one document is applied out of
+    // order (and "held" is sent after the partition has been handed off).
+    processor.blockSendsFor("first");
+    AtomicInteger keepAliveCalls = new AtomicInteger();
+    boolean[] hookRan = {false};
+    dispatcher = new ConcurrentDispatcher(3, "run", processor,
+        docs -> docs.stream().map(d -> d.getString("destId")).collect(Collectors.toSet()),
+        doc -> false,
+        () -> {
+          keepAliveCalls.incrementAndGet();
+          if (!hookRan[0]) {
+            hookRan[0] = true;
+            dispatcher.dispatch(List.of(doc("newer", "sharedId")));
+            dispatcher.drain();
+          }
+        });
+    indexerThread = new Thread(() -> {
+      dispatcher.dispatch(List.of(doc("first", "sharedId")));
+      dispatcher.dispatch(List.of(doc("held", "sharedId")));
+      dispatcher.drain();
+    });
+    indexerThread.start();
+
+    awaitUntil(() -> keepAliveCalls.get() >= 1);
+    processor.release("first");
+    indexerThread.join(TIMEOUT_MS);
+    assertEquals(List.of("first", "held", "newer"), processor.started);
+  }
+
   // Starts the dispatcher and an indexer thread that dispatches "first" (destination id "sharedId") and then drains,
   // so the thread waits on "first" and the dispatcher's keepAlive fires. On its first call, keepAlive runs reentrant,
   // standing in for the revocation hook that a rebalance during the consumer poll would trigger. Later calls (including
