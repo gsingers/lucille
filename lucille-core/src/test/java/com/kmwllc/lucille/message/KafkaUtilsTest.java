@@ -3,6 +3,9 @@ package com.kmwllc.lucille.message;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import java.time.Duration;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.concurrent.ExecutionException;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -198,6 +201,122 @@ public class KafkaUtilsTest {
     // "LIST" is the only invalid type for an arbitrary property... see comment in KafkaUtils
     Config listPropConfig = ConfigFactory.load("KafkaUtilsTest/list-arbitrary.conf");
     assertThrows(IllegalArgumentException.class, () -> KafkaUtils.createProducerProps(listPropConfig));
+  }
+
+  private static final String BASE_KAFKA =
+      "kafka { bootstrapServers: \"localhost:9092\", maxRequestSize: 1048576, maxPollIntervalSecs: 300, consumerGroupId: \"test\" }\n";
+
+  @Test
+  public void testQuotedAndUnquotedDottedKeysProduceSameClientKey() {
+    Config quoted = ConfigFactory.parseString(BASE_KAFKA + "kafka.producer { \"linger.ms\": 7 }");
+    Config unquoted = ConfigFactory.parseString(BASE_KAFKA + "kafka.producer { linger.ms: 7 }");
+    Config nestedObject = ConfigFactory.parseString(BASE_KAFKA + "kafka.producer { linger { ms: 7 } }");
+
+    for (Config config : List.of(quoted, unquoted, nestedObject)) {
+      Properties props = KafkaUtils.createProducerProps(config);
+      assertEquals(7, props.get("linger.ms"));
+      assertFalse(props.containsKey("\"linger.ms\""));
+    }
+  }
+
+  @Test
+  public void testQuotedKeyInsideNestedObject() {
+    Config config = ConfigFactory.parseString(BASE_KAFKA + "kafka.producer { ssl { \"keystore.location\": \"/ks\" } }");
+    Properties props = KafkaUtils.createProducerProps(config);
+    assertEquals("/ks", props.get("ssl.keystore.location"));
+    assertEquals(Set.of(), quotedKeys(props));
+  }
+
+  @Test
+  public void testQuotedKeysForConsumer() {
+    Config config = ConfigFactory.parseString(BASE_KAFKA + "kafka.consumer { \"fetch.min.bytes\": 1024 }");
+    Properties props = KafkaUtils.createConsumerProps(config, "client-1");
+    assertEquals(1024, props.get("fetch.min.bytes"));
+    assertEquals(Set.of(), quotedKeys(props));
+  }
+
+  @Test
+  public void testQuotedKeysForAdmin() throws Exception {
+    try (MockedStatic<Admin> admin = Mockito.mockStatic(Admin.class)) {
+      CreateTopicsResult result = Mockito.mock(CreateTopicsResult.class);
+      Mockito.doReturn(Mockito.mock(KafkaFuture.class)).when(result).all();
+      AdminClient adminClient = Mockito.mock(AdminClient.class);
+      Mockito.doReturn(result).when(adminClient).createTopics(Mockito.any(), Mockito.any());
+      ArgumentCaptor<Properties> captor = ArgumentCaptor.forClass(Properties.class);
+      admin.when(() -> Admin.create(captor.capture())).thenReturn(adminClient);
+
+      Config config = ConfigFactory.parseString(BASE_KAFKA + "kafka.admin { \"request.timeout.ms\": 1234 }");
+      KafkaUtils.createEventTopic(config, "pipeline1", "run1");
+
+      Properties captured = captor.getValue();
+      assertEquals(1234, captured.get("request.timeout.ms"));
+      assertEquals(Set.of(), quotedKeys(captured));
+    }
+  }
+
+  @Test
+  public void testConflictingQuotedAndUnquotedKeysThrow() {
+    Config config = ConfigFactory.parseString(BASE_KAFKA + "kafka.producer { \"linger.ms\": 0, linger.ms: 5 }");
+    IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () -> KafkaUtils.createProducerProps(config));
+    assertTrue(e.getMessage(), e.getMessage().contains("linger.ms"));
+  }
+
+  @Test
+  public void testAgreeingQuotedAndUnquotedKeysAreAccepted() {
+    Config config = ConfigFactory.parseString(BASE_KAFKA + "kafka.producer { \"linger.ms\": 5, linger.ms: 5 }");
+    assertEquals(5, KafkaUtils.createProducerProps(config).get("linger.ms"));
+  }
+
+  @Test
+  public void testSubstitutedStringAndLiteralNumberAreNotAConflict() {
+    Config config = ConfigFactory.parseString(BASE_KAFKA
+        + "kafka.lingerFromEnv: \"5\"\nkafka.producer { \"linger.ms\": ${kafka.lingerFromEnv}, linger.ms: 5 }").resolve();
+    assertEquals("5", String.valueOf(KafkaUtils.createProducerProps(config).get("linger.ms")));
+  }
+
+  private static Set<String> quotedKeys(Properties props) {
+    return props.stringPropertyNames().stream().filter(k -> k.contains("\"")).collect(Collectors.toSet());
+  }
+
+  @Test
+  public void testDocumentConsumerRejectsAutoCommit() {
+    // The indexer commits destination-topic offsets on batch completion; auto-commit would commit them at poll time
+    // (before indexing) and could skip documents on a crash. An override that re-enables it must fail fast rather than
+    // silently undermine the design.
+    Config autoCommitOn = ConfigFactory.parseString(
+        "kafka { bootstrapServers: \"localhost:9092\", maxPollIntervalSecs: 300, consumerGroupId: \"test\", "
+        + "consumer { enable.auto.commit: true } }");
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+        () -> KafkaUtils.createDocumentConsumer(autoCommitOn, "test-client"));
+    assertTrue(e.getMessage().contains("enable.auto.commit"));
+  }
+
+  @Test
+  public void testDocumentConsumerRejectsUnsetAutoCommitFromPropertyFile() {
+    // kafka-clients defaults enable.auto.commit to true, so a consumerPropertyFile that OMITS it would auto-commit at
+    // poll just as surely as one that sets it true. An unset value must be rejected, not treated as safe.
+    Config unsetInFile = ConfigFactory.load("KafkaUtilsTest/consumer-conf/external-no-auto-commit-setting.conf");
+    IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+        () -> KafkaUtils.createDocumentConsumer(unsetInFile, "test-client"));
+    assertTrue(e.getMessage().contains("enable.auto.commit"));
+  }
+
+  @Test
+  public void testDocumentConsumerAllowsExplicitlyDisabledAutoCommit() {
+    // Explicitly setting it to the required value must be accepted (constructing the consumer connects lazily, so this
+    // does not require a running broker).
+    Config autoCommitOff = ConfigFactory.parseString(
+        "kafka { bootstrapServers: \"localhost:9092\", maxPollIntervalSecs: 300, consumerGroupId: \"test\", "
+        + "consumer { enable.auto.commit: false } }");
+    KafkaUtils.createDocumentConsumer(autoCommitOff, "test-client").close();
+  }
+
+  @Test
+  public void testDocumentConsumerAllowsAutoCommitDisabledInPropertyFile() {
+    // A consumerPropertyFile that explicitly sets enable.auto.commit=false is accepted.
+    Config disabledInFile = ConfigFactory.load("KafkaUtilsTest/consumer-conf/external.conf");
+    KafkaUtils.createDocumentConsumer(disabledInFile, "test-client").close();
   }
 
   @Test

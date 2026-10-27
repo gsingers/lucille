@@ -8,8 +8,10 @@ import com.kmwllc.lucille.core.spec.SpecBuilder;
 import com.kmwllc.lucille.util.FileContentFetcher;
 import com.kmwllc.lucille.core.KafkaDocument;
 import com.typesafe.config.Config;
+import com.typesafe.config.ConfigUtil;
 import com.typesafe.config.ConfigValue;
 import com.typesafe.config.ConfigValueType;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import org.apache.kafka.clients.CommonClientConfigs;
@@ -96,34 +98,43 @@ public class KafkaUtils {
    * Merges, into the provided <code>Properties</code>, the key-value pairs that are found in the given <code>config</code>
    * under the provided <code>keyPath</code>. If <code>config</code> has the <code>keyPath</code>, it should map to an object
    * with the arbitrary property mappings.
+   *
+   * <p>Kafka property names contain dots, and HOCON reads an unquoted dotted key (<code>linger.ms: 0</code>) as a nested
+   * object (<code>linger { ms: 0 }</code>), while a quoted key (<code>"linger.ms": 0</code>) stays a single key whose
+   * path expression keeps the quotes. Both forms, and any mix of them, are mapped to the plain dotted property name
+   * the Kafka client expects. Keys are passed through as given; the Kafka client itself logs any it does not use.
+   *
    * @param props Kafka properties.
    * @param config Kafka config.
    * @param keyPath A path in the kafka config ("kafka.consumer", for example) that contains additional, arbitrary properties.
-   * @throws IllegalArgumentException In the event the config at <code>keyPath</code> contains a value list
+   * @throws IllegalArgumentException if a value is a list, or if two spellings of one key (quoted and unquoted)
+   * have different values.
    */
   private static void mergeConfigProps(Properties props, Config config, String keyPath) {
     if (!config.hasPath(keyPath)) {
       return;
     }
 
-    Config propsConfig = config.getConfig(keyPath);
-
-    for (Entry<String, ConfigValue> entry : propsConfig.entrySet()) {
-      String propKey = entry.getKey();
+    Map<String, Object> merged = new HashMap<>();
+    // entrySet() flattens nested objects into leaf paths and omits nulls, so each value is a scalar or a list.
+    for (Entry<String, ConfigValue> entry : config.getConfig(keyPath).entrySet()) {
+      String propKey = String.join(".", ConfigUtil.splitPath(entry.getKey()));
       ConfigValue value = entry.getValue();
 
-      // NOTE: we don't prevent ConfigValueType.OBJECT here, for two reasons:
-      // 1. many Kafka properties include ".", like "security.protocol". With HOCON, writing 'security.protocol: "ssl"'
-      //    is equivalent to writing security: { protocol: "ssl" }
-      // 2. the library does not distinguish between using dot notation / an object - even if we were to use "getParent"
-      //    like we do in Spec.validate(), we would struggle to achieve our desired outcome here.
-      // We also do not include ConfigValueType.NULL here, as entrySet excludes them.
       if (value.valueType() == ConfigValueType.LIST) {
         throw new IllegalArgumentException(String.format("Cannot use list for Kafka property (key %s)", propKey));
       }
 
-      props.put(propKey, value.unwrapped());
+      // compare as strings: a substitution or env var yields a String, a literal an Integer, and Kafka parses both
+      Object previous = merged.putIfAbsent(propKey, value.unwrapped());
+      if (previous != null && !String.valueOf(previous).equals(String.valueOf(value.unwrapped()))) {
+        throw new IllegalArgumentException(String.format(
+            "Kafka property %s is set twice under %s with different values (%s and %s); quoted and unquoted "
+                + "spellings of a dotted key name the same property.", propKey, keyPath, previous, value.unwrapped()));
+      }
     }
+
+    props.putAll(merged);
   }
 
   //access set to public so KafkaConnector can create consumer props from config.
@@ -164,19 +175,47 @@ public class KafkaUtils {
    *               - kafka.bootstrapServers - The bootstrap servers to use for connecting to Kafka.
    *               - kafka.securityProtocol - The security protocol to use when connecting to Kafka.
    *               - kafka.consumerGroupId - The consumer group id to use when subscribing to the event topic.
-   *               - kafka.maxPollIntervalSecs - The maximum amount of time in seconds that the consumer will wait when polling for new messages from Kafka.
+   *               - kafka.maxPollIntervalSecs - The maximum time in seconds allowed between polls before the consumer is evicted from its consumer group (also the rebalance timeout).
    *               - kafka.metadataMaxAgeMs - The maximum amount of time in milliseconds that the consumer will cache metadata about topics and partitions..
    *               - kafka.documentDeserializer - The deserializer class to use when deserializing documents. Defaults to KafkaDocumentDeserializer.
    * @param clientId - The id that will be used by the consumer as the client id when communicating with Kafka.
-   * @return A Kafka consumer for events. The provided Consumer will *not* be configured to commit offsets automatically. The caller is responsible for committing offsets after processing documents.
+   * @return A Kafka consumer for documents. Auto-commit must be disabled: offsets are committed by the caller once a
+   *         batch has completed (at-least-once), not automatically at poll time. This method validates that
+   *         {@code enable.auto.commit} resolves to {@code false} and throws {@link IllegalArgumentException} if it is
+   *         enabled or left unset (kafka-clients defaults it to {@code true}). See {@link #requireAutoCommitDisabled}.
    */
   public static KafkaConsumer<String, KafkaDocument> createDocumentConsumer(Config config, String clientId) {
     Properties consumerProps = createConsumerProps(config, clientId);
+    requireAutoCommitDisabled(consumerProps);
     String deserializerClass = config.hasPath("kafka.documentDeserializer")
         ? config.getString("kafka.documentDeserializer")
         : KafkaDocumentDeserializer.class.getName();
     consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, deserializerClass);
     return new KafkaConsumer<>(consumerProps);
+  }
+
+  /**
+   * Fails fast unless the document consumer has auto-commit explicitly disabled. The indexer commits destination-topic
+   * offsets only once a batch has completed (at-least-once); auto-commit would instead commit at poll time, before the
+   * documents are indexed, so a crash would skip them (at-most-once).
+   *
+   * <p> It is not enough to reject an explicit {@code true}: kafka-clients defaults {@code enable.auto.commit} to
+   * {@code true} when it is unset, so an absent value is just as unsafe as an explicit {@code true}. The non-property-file
+   * path sets it to {@code false} here, but a {@code kafka.consumerPropertyFile} that omits it (or a
+   * {@code kafka.consumer.enable.auto.commit} override) would otherwise auto-commit at poll. So this requires the
+   * resolved value to be present and {@code false}.
+   */
+  private static void requireAutoCommitDisabled(Properties consumerProps) {
+    Object autoCommit = consumerProps.get(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG);
+    // Absent is unsafe: kafka-clients defaults enable.auto.commit to true. Require it to be present and explicitly false.
+    if (autoCommit == null || Boolean.parseBoolean(autoCommit.toString().trim())) {
+      throw new IllegalArgumentException(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG + " must be set to false for the "
+          + "indexer's document consumer: offsets are committed on batch completion, and auto-commit would commit them "
+          + "at poll time (before indexing), which could skip documents on a crash. It is "
+          + (autoCommit == null ? "unset (kafka-clients defaults it to true)" : "set to " + autoCommit)
+          + "; set " + ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG + "=false (e.g. in kafka.consumerPropertyFile or via "
+          + "kafka.consumer." + ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG + ").");
+    }
   }
 
   /**
@@ -189,7 +228,7 @@ public class KafkaUtils {
    *               - kafka.bootstrapServers - The bootstrap servers to use for connecting to Kafka.
    *               - kafka.securityProtocol - The security protocol to use when connecting to Kafka.
    *               - kafka.consumerGroupId - The consumer group id to use when subscribing to the event topic.
-   *               - kafka.maxPollIntervalSecs - The maximum amount of time in seconds that the consumer will wait when polling for new messages from Kafka.
+   *               - kafka.maxPollIntervalSecs - The maximum time in seconds allowed between polls before the consumer is evicted from its consumer group (also the rebalance timeout).
    *               - kafka.metadataMaxAgeMs - The maximum amount of time in milliseconds that the consumer will cache metadata about topics and partitions..
    * @param clientId - The id that will be used by the consumer as the client id when communicating with Kafka.
    * @return A Kafka consumer for events. The provided Consumer will *always* be configured to commit offsets automatically.
